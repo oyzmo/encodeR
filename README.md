@@ -4,6 +4,8 @@ A small GNOME app (Rust, GTK 4, libadwaita) that turns big video files, typicall
 
 App ID: `no.oyzmo.EncodeR` · Version: see `Cargo.toml` (shown in the header bar).
 
+![encodeR with a 1080p HDR10 film queued: Shrink for library preset, 4 GB target, estimated 3.7–4.0 GB](data/screenshots/main.png)
+
 ## Hardware support
 
 encodeR runs on **Linux only**: it's built on VA-API and GTK 4/libadwaita, and targets Fedora with GNOME on Wayland. It isn't tied to RDNA4. At startup it test-encodes each codec on your GPU and turns off whatever the driver can't do, explaining why.
