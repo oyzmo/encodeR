@@ -1,0 +1,16 @@
+# Private, never committed: notes for Claude and local dev helpers
+/CLAUDE.md
+/.claude/
+/dev/
+/target
+/flatpak
+/.flatpak-builder
+/testvideo
+# Never commit video files (test clips live in testvideo/ or dev/media/)
+*.mkv
+*.mp4
+*.mov
+*.m2ts
+*.avi
+*.webm
+*.flatpak

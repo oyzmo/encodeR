@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="#7FA07A"/>
+  <!-- film frame -->
+  <rect x="30" y="38" width="68" height="52" rx="7" fill="none" stroke="#F4E7D3" stroke-width="7"/>
+  <g fill="#F4E7D3">
+    <rect x="22" y="44" width="6" height="7" rx="1.5"/><rect x="22" y="60.5" width="6" height="7" rx="1.5"/><rect x="22" y="77" width="6" height="7" rx="1.5"/>
+    <rect x="100" y="44" width="6" height="7" rx="1.5"/><rect x="100" y="60.5" width="6" height="7" rx="1.5"/><rect x="100" y="77" width="6" height="7" rx="1.5"/>
+  </g>
+  <!-- shrink arrows -->
+  <g fill="none" stroke="#4A3428" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M44 52 L56 60 M56 52 L56 60 L48 60"/>
+    <path d="M84 76 L72 68 M72 76 L72 68 L80 68"/>
+  </g>
+</svg>

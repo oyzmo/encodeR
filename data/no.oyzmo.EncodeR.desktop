@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=encodeR
+GenericName=Video Encoder
+Comment=Shrink large videos with AMD hardware encoding
+Exec=encoder %F
+Icon=no.oyzmo.EncodeR
+Terminal=false
+Categories=AudioVideo;Video;GTK;GNOME;
+MimeType=video/x-matroska;video/mp4;video/quicktime;video/mp2t;video/webm;video/x-msvideo;
+Keywords=ffmpeg;encode;transcode;hevc;av1;vaapi;shrink;
+StartupNotify=true
