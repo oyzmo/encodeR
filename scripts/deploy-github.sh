@@ -38,6 +38,18 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
     echo "error: uncommitted changes; commit (and push to nas) first" >&2
     exit 1
 fi
+# Fail fast, and say why, when GitHub can't be reached over SSH, instead of
+# hanging for minutes on the connect (port 22 is blocked on some networks).
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o ConnectTimeout=10}"
+gh_ssh="$(ssh -o ConnectTimeout=10 -T git@github.com 2>&1 || true)"
+case "$gh_ssh" in
+    *"successfully authenticated"*) ;;
+    *)  echo "GitHub can't be reached over SSH: ${gh_ssh%%$'\n'*}" >&2
+        echo "If port 22 is blocked on this network, use port 443:" >&2
+        echo "  https://docs.github.com/en/authentication/troubleshooting-ssh/using-ssh-over-the-https-port" >&2
+        exit 1 ;;
+esac
+
 git fetch -q nas "$BRANCH"
 if [ "$(git rev-parse "$BRANCH")" != "$(git rev-parse "nas/$BRANCH")" ]; then
     echo "error: $BRANCH differs from nas/$BRANCH; run: git push nas $BRANCH" >&2

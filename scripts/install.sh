@@ -5,6 +5,7 @@
 #   --make-flatpak     build flatpak/no.oyzmo.EncodeR-<version>.flatpak (does not install)
 #   --install-flatpak  install that bundle for this user (makes it first if needed)
 set -euo pipefail
+SELF="$(realpath "$0")"
 cd "$(dirname "$0")/.."
 APP_ID=no.oyzmo.EncodeR
 OLD_IDS=(io.github.oyzmo.Reencoder no.oyzmo.Reencoder)   # IDs from before the renames
@@ -126,20 +127,88 @@ install_flatpak() {
     echo "Installed the Flatpak ($VERSION). Run it from the app grid or with: flatpak run $APP_ID"
 }
 
-menu() {
-    echo "encodeR $VERSION"
-    echo "  1) Install (native, ~/.local)"
-    echo "  2) Uninstall"
-    echo "  3) Make flatpak"
-    echo "  4) Install flatpak"
-    read -rp "Choose [1-4]: " choice
-    case "$choice" in
-        1) install_native ;;
-        2) uninstall ;;
-        3) make_flatpak ;;
-        4) install_flatpak ;;
-        *) echo "Nothing done." ;;
+# ------------------------------------------------------------ release
+# Only in the author's checkout (the one with the NAS remote): bump, back up,
+# and publish the source on GitHub. There is no published Flatpak — it would
+# bundle patent-encumbered codecs (see the README) — so the release steps are
+# Bindle's minus "Make distribution" and flatpak.oyzmo.no, same numbers.
+is_author() { git remote get-url nas >/dev/null 2>&1; }
+
+bump_version() {
+    local level
+    echo "Now at $VERSION."
+    read -rp "Bump which part? [p]atch (fixes) / [m]inor (features) / ma[j]or: " level
+    case "$level" in
+        p|P|patch) level=patch ;;
+        m|M|minor) level=minor ;;
+        j|J|major) level=major ;;
+        *) echo "Cancelled."; return 0 ;;
     esac
+    scripts/bump.sh "$level"
+    local new
+    new=$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' Cargo.toml | head -1)
+    git commit -q -m "encodeR $new" -- Cargo.toml Cargo.lock
+    echo "Committed encodeR $new."
+}
+
+# The GitHub release's notes are the commit subjects since the last deploy
+# (deploy-github.sh writes them), so there is nothing else to prepare.
+release_github() {
+    scripts/deploy-github.sh --dry-run --release
+    read -rp "Publish this to GitHub? [y/N] " answer
+    [[ "$answer" == [yY]* ]] || { echo "Cancelled."; return 0; }
+    scripts/deploy-github.sh --release
+}
+
+full_release() {
+    if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+        echo "error: uncommitted changes; commit them first" >&2
+        exit 1
+    fi
+    echo "Full release of encodeR $VERSION"
+    echo "Backing up to the NAS…"
+    git push -q nas main
+    release_github
+}
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+
+# Each choice runs this script again with its option, so a failing step
+# (set -e) ends that step only, not the menu.
+run_step() {
+    "$SELF" "$1" || printf '\033[31m✘ That step failed (see above).\033[0m\n'
+}
+
+menu() {
+    while true; do
+        VERSION=$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' Cargo.toml | head -1)
+        echo
+        bold "── encodeR $VERSION ─────────────────────────"
+        echo "  1) Install (native, ~/.local)"
+        echo "  2) Uninstall"
+        echo "  3) Make flatpak"
+        echo "  4) Install flatpak"
+        if is_author; then
+            bold "── Release (in this order) ──────────────"
+            echo " 11) Bump version (commits)"
+            echo " 13) Full release: NAS → 9 in one go"
+            echo "     or step by step:"
+            echo "  9)   Release on GitHub (source only, no binaries)"
+        fi
+        echo "  q) Quit"
+        read -rp "Choose: " choice
+        case "$choice" in
+            1) run_step --native ;;
+            2) run_step --uninstall ;;
+            3) run_step --make-flatpak ;;
+            4) run_step --install-flatpak ;;
+            9) if is_author; then run_step --release-github; else echo "Unknown choice."; fi ;;
+            11) if is_author; then run_step --bump; else echo "Unknown choice."; fi ;;
+            13) if is_author; then run_step --full-release; else echo "Unknown choice."; fi ;;
+            q|Q) exit 0 ;;
+            *) echo "Unknown choice." ;;
+        esac
+    done
 }
 
 case "${1:-}" in
@@ -147,9 +216,12 @@ case "${1:-}" in
     --uninstall) uninstall ;;
     --make-flatpak) make_flatpak ;;
     --install-flatpak) install_flatpak ;;
+    --bump) bump_version ;;
+    --release-github) release_github ;;
+    --full-release) full_release ;;
     "")
         if [ -t 0 ]; then menu
-        else sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 1; fi
+        else sed -n '2,6p' "$SELF" | sed 's/^# \{0,1\}//'; exit 1; fi
         ;;
-    *) sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *) sed -n '2,6p' "$SELF" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
