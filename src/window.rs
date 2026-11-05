@@ -1612,7 +1612,12 @@ impl App {
             .website("https://oyzmo.no")
             .license_type(gtk::License::Gpl30)
             .comments("Shrink large videos into library copies with AMD VA-API hardware encoding, tuned for direct play on Apple TV.")
+            .release_notes(crate::changelog::to_release_notes(crate::changelog::MARKDOWN))
             .build();
+        // AdwDialog's content isn't in the widget tree until presented; walk its child.
+        if let Some(child) = about.child() {
+            rename_whats_new(&child);
+        }
         about.present(Some(&self.window));
     }
 
@@ -1665,5 +1670,30 @@ impl State {
             j.active_crop(),
             j.scan_plan()
         )
+    }
+}
+
+/// libadwaita labels the release-notes page "What's New" and covers only the
+/// current version; ours holds the whole history, so call it "Changelog".
+/// Matched by the page tag / row action target, not the (translated) text.
+fn rename_whats_new(w: &gtk::Widget) {
+    if let Some(row) = w.downcast_ref::<adw::ActionRow>()
+        && row
+            .action_target_value()
+            .and_then(|v| v.get::<String>())
+            .as_deref()
+            == Some("whatsnew")
+    {
+        row.set_title("_Changelog");
+    }
+    if let Some(nav) = w.downcast_ref::<adw::NavigationView>()
+        && let Some(page) = nav.find_page("whatsnew")
+    {
+        page.set_title("Changelog");
+    }
+    let mut child = w.first_child();
+    while let Some(c) = child {
+        rename_whats_new(&c);
+        child = c.next_sibling();
     }
 }

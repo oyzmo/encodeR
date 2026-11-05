@@ -1,3 +1,4 @@
+mod changelog;
 mod checks;
 mod cli;
 mod crop;
