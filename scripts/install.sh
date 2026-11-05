@@ -137,7 +137,7 @@ is_author() { git remote get-url nas >/dev/null 2>&1; }
 bump_version() {
     local level
     echo "Now at $VERSION."
-    read -rp "Bump which part? [p]atch (fixes) / [m]inor (features) / ma[j]or: " level
+    read -rp "Bump which part? [p]atch (fixes) / [m]inor (features) / ma[j]or: " level || { echo; level=; }  # Ctrl+D cancels
     case "$level" in
         p|P|patch) level=patch ;;
         m|M|minor) level=minor ;;
@@ -153,11 +153,9 @@ bump_version() {
 
 # The GitHub release's notes are the commit subjects since the last deploy
 # (deploy-github.sh writes them), so there is nothing else to prepare.
+# --confirm shows the dry run and asks before publishing, in one run.
 release_github() {
-    scripts/deploy-github.sh --dry-run --release
-    read -rp "Publish this to GitHub? [y/N] " answer
-    [[ "$answer" == [yY]* ]] || { echo "Cancelled."; return 0; }
-    scripts/deploy-github.sh --release
+    scripts/deploy-github.sh --confirm --release
 }
 
 full_release() {
@@ -196,7 +194,9 @@ menu() {
             echo "  9)   Release on GitHub (source only, no binaries)"
         fi
         echo "  q) Quit"
-        read -rp "Choose: " choice
+        # Ctrl+D on an empty line quits. After typed text it takes two presses to
+        # reach end of input, and then the typed choice still counts.
+        read -rp "Choose: " choice || { echo; [ -n "$choice" ] || exit 0; }
         case "$choice" in
             1) run_step --native ;;
             2) run_step --uninstall ;;

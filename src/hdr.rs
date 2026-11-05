@@ -229,14 +229,15 @@ pub fn dovi_mode(profile: u32) -> Option<&'static str> {
 }
 
 /// ffmpeg half of the RPU extraction pipe: the source video as Annex B on stdout.
-pub fn extract_video_args(input: &Path) -> Vec<OsString> {
+/// `stream` is the probed main video's absolute index (cover art can precede it).
+pub fn extract_video_args(input: &Path, stream: usize) -> Vec<OsString> {
     let mut a: Vec<OsString> = ["-hide_banner", "-v", "error", "-i"]
         .map(OsString::from)
         .to_vec();
     a.push(input.into());
+    a.push("-map".into());
+    a.push(format!("0:{stream}").into());
     for s in [
-        "-map",
-        "0:v:0",
         "-c:v",
         "copy",
         "-bsf:v",

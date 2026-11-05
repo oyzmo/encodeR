@@ -315,7 +315,13 @@ fn encode_dv(
         update(Update::Stage("Dolby Vision · extracting RPU".into()));
         step(
             runner::run_pipe(
-                (&tools.ffmpeg, &hdr::extract_video_args(&req.probe.path)),
+                (
+                    &tools.ffmpeg,
+                    &hdr::extract_video_args(
+                        &req.probe.path,
+                        req.probe.video.as_ref().map_or(0, |v| v.index),
+                    ),
+                ),
                 ("dovi_tool", &hdr::extract_rpu_args(dovi.profile, &rpu)),
                 cancel,
             ),
@@ -437,7 +443,7 @@ pub fn analyze(tools: &Tools, p: &ProbeInfo, cancel: &Cancel) -> Result<Analysis
     for start in crop::sample_starts(p.duration, crop::SAMPLES, crop::SAMPLE_SECONDS) {
         let r = runner::run_capture(
             &tools.ffmpeg,
-            &crop::cropdetect_args(&p.path, start, crop::SAMPLE_SECONDS),
+            &crop::cropdetect_args(&p.path, v.index, start, crop::SAMPLE_SECONDS),
             cancel,
         )?;
         if r.cancelled {
@@ -481,7 +487,7 @@ pub fn preview_frame(
 ) -> Result<(), String> {
     let r = runner::run_capture(
         &tools.ffmpeg,
-        &crop::preview_args(&p.path, at, c, out),
+        &crop::preview_args(&p.path, p.video.as_ref().map_or(0, |v| v.index), at, c, out),
         &Cancel::default(),
     )?;
     if r.success {
@@ -523,6 +529,7 @@ pub fn vmaf_samples(tools: &Tools, req: &Request, cancel: &Cancel) -> Result<Vma
                 distorted: &s.path,
                 distorted_seek: false,
                 reference: &req.probe.path,
+                ref_stream: v.index,
                 start: s.start,
                 secs: s.secs,
                 width: v.width,
@@ -566,6 +573,7 @@ fn vmaf_output(tools: &Tools, req: &Request, cancel: &Cancel) -> Result<VmafResu
             distorted: &req.output,
             distorted_seek: true,
             reference: &req.probe.path,
+            ref_stream: v.index,
             start,
             secs,
             width: v.width,
@@ -801,6 +809,7 @@ mod media_tests {
             distorted: &dist,
             distorted_seek: false,
             reference: &src,
+            ref_stream: 0,
             start: 5.0,
             secs: 3.0,
             width: 1920,

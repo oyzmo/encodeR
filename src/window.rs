@@ -49,6 +49,9 @@ pub struct State {
     next_batch: u64,
     pub running: Option<(u64, Cancel)>,
     pub queue_active: bool,
+    /// Job whose "Replace Existing File?" dialog is open: nothing else starts
+    /// until it's answered, or the same job could be launched twice.
+    replace_pending: Option<u64>,
     est_gen: HashMap<u64, u64>,
     est_cancel: HashMap<u64, Cancel>,
     est_cache: HashMap<String, SizeRange>,
@@ -200,6 +203,8 @@ pub struct App {
     banner: adw::Banner,
     pub state: RefCell<State>,
     rows: RefCell<HashMap<u64, JobRow>>,
+    /// Each row's worst issue, so progress updates don't rerun every check.
+    worst: RefCell<HashMap<u64, Option<(checks::Severity, String)>>>,
     pub editor: RefCell<Option<Rc<Editor>>>,
     pgs_queue: RefCell<VecDeque<(u64, PgsQuestion)>>,
     dialog_open: RefCell<bool>,
@@ -356,6 +361,7 @@ pub fn build(app: &adw::Application, files: Vec<PathBuf>) {
             next_batch: 1,
             running: None,
             queue_active: false,
+            replace_pending: None,
             est_gen: HashMap::new(),
             est_cancel: HashMap::new(),
             est_cache: HashMap::new(),
@@ -365,6 +371,7 @@ pub fn build(app: &adw::Application, files: Vec<PathBuf>) {
             pgs_batch: HashMap::new(),
         }),
         rows: RefCell::new(HashMap::new()),
+        worst: RefCell::new(HashMap::new()),
         editor: RefCell::new(None),
         pgs_queue: RefCell::new(VecDeque::new()),
         dialog_open: RefCell::new(false),
@@ -642,13 +649,30 @@ impl App {
 
     pub fn update_row(&self, id: u64) {
         let st = self.state.borrow();
-        let Some(job) = st.job(id) else { return };
+        let Some(job) = st.job(id) else {
+            self.worst.borrow_mut().remove(&id);
+            return;
+        };
         let worst = st
             .issues(job)
             .into_iter()
             .next()
             .map(|i| (i.severity, i.message));
+        self.worst.borrow_mut().insert(id, worst.clone());
         if let Some(r) = self.rows.borrow().get(&id) {
+            r.update(job, worst);
+        }
+    }
+
+    /// Progress and stage updates: settings haven't changed, so reuse the
+    /// last computed issue instead of rerunning every check.
+    fn update_row_progress(&self, id: u64) {
+        let cached = self.worst.borrow().get(&id).cloned();
+        let Some(worst) = cached else {
+            return self.update_row(id);
+        };
+        let st = self.state.borrow();
+        if let (Some(job), Some(r)) = (st.job(id), self.rows.borrow().get(&id)) {
             r.update(job, worst);
         }
     }
@@ -657,7 +681,8 @@ impl App {
         let st = self.state.borrow();
         let ready = queue::next_pending(&st.jobs).is_some();
         let running = st.running.is_some();
-        self.start_btn.set_sensitive(ready && !running);
+        self.start_btn
+            .set_sensitive(ready && !running && st.replace_pending.is_none());
         self.start_btn
             .set_label(if running { "Encoding…" } else { "Start" });
     }
@@ -709,7 +734,9 @@ impl App {
             Msg::Caps(c) => self.on_caps(c),
             Msg::Probed(id, r) => self.on_probed(id, r),
             Msg::Analyzed(id, r) => {
-                if let Some(j) = self.state.borrow_mut().job_mut(id) {
+                let mut st = self.state.borrow_mut();
+                st.crop_cancel.remove(&id);
+                if let Some(j) = st.job_mut(id) {
                     let (crop, scan) = match r {
                         Ok(a) => (a.crop, a.scan),
                         Err(e) => (Err(e), None),
@@ -721,6 +748,7 @@ impl App {
                     };
                     j.scan_detected = scan;
                 }
+                drop(st);
                 // The scan plan changes the filters, so the estimate and command change too.
                 self.schedule_estimate(id);
                 self.update_row(id);
@@ -734,7 +762,7 @@ impl App {
                     if let Ok(v) = &r {
                         st.est_cache.insert(key.clone(), *v);
                     }
-                    let current = st.job(id).map(estimate_key);
+                    let current = st.job(id).map(|j| st.estimate_key(j));
                     if current.as_deref() == Some(key.as_str()) {
                         let totals = st.job(id).and_then(|j| {
                             j.probe.as_ref().map(|p| {
@@ -775,7 +803,7 @@ impl App {
                 if let Some(j) = self.state.borrow_mut().job_mut(id) {
                     j.progress = Some(p);
                 }
-                self.update_row(id);
+                self.update_row_progress(id);
                 if let Some(ed) = self.editor.borrow().as_ref().filter(|e| e.job == id) {
                     ed.update_progress(&self.state.borrow());
                 }
@@ -784,7 +812,7 @@ impl App {
                 if let Some(j) = self.state.borrow_mut().job_mut(id) {
                     j.stage = Some(s);
                 }
-                self.update_row(id);
+                self.update_row_progress(id);
             }
             Msg::Finished(id, o) => self.on_finished(id, o),
         }
@@ -1081,7 +1109,7 @@ impl App {
                 None => EstimateState::Failed("The audio alone is bigger than the target".into()),
             }
         } else {
-            let key = estimate_key(&job);
+            let key = st.estimate_key(&job);
             if let Some(v) = st.est_cache.get(&key) {
                 EstimateState::Ready(estimate::with_streams(*v, audio, subs))
             } else if !st.caps.as_ref().is_some_and(|c| c.codec(s.codec).available) {
@@ -1223,7 +1251,7 @@ impl App {
     fn run_next(self: &Rc<Self>) {
         let (id, output) = {
             let st = self.state.borrow();
-            if !st.queue_active || st.running.is_some() {
+            if !st.queue_active || st.running.is_some() || st.replace_pending.is_some() {
                 return;
             }
             let Some(id) = queue::next_pending(&st.jobs) else {
@@ -1262,6 +1290,8 @@ impl App {
             )
         };
         if output.exists() {
+            self.state.borrow_mut().replace_pending = Some(id);
+            self.update_start();
             let d = adw::AlertDialog::new(
                 Some("Replace Existing File?"),
                 Some(&format!(
@@ -1274,16 +1304,24 @@ impl App {
             d.set_close_response("skip");
             let a = self.clone();
             d.connect_response(None, move |_, resp| {
-                if resp == "replace" {
+                a.state.borrow_mut().replace_pending = None;
+                // The job may have been removed or edited while the dialog was open.
+                let pending = a
+                    .state
+                    .borrow()
+                    .job(id)
+                    .is_some_and(|j| j.state == JobState::Pending);
+                if resp == "replace" && pending {
                     a.launch(id);
                 } else {
-                    if let Some(j) = a.state.borrow_mut().job_mut(id) {
+                    if pending && let Some(j) = a.state.borrow_mut().job_mut(id) {
                         j.apply(Event::Cancel);
                         j.error = Some("Output file already exists".into());
                     }
                     a.update_row(id);
                     a.run_next();
                 }
+                a.update_start();
             });
             d.present(Some(&self.window));
         } else {
@@ -1294,9 +1332,16 @@ impl App {
     fn launch(self: &Rc<Self>, id: u64) {
         let (req, tools) = {
             let mut st = self.state.borrow_mut();
+            // One encode at a time, and only a job that hasn't started.
+            if st.running.is_some() {
+                return;
+            }
             let Some(job) = st.job(id).cloned() else {
                 return;
             };
+            if job.state != JobState::Pending {
+                return;
+            }
             let Some(req) = st.request(&job) else { return };
             let tools = st.tools.clone();
             let cancel = Cancel::default();
@@ -1455,30 +1500,31 @@ impl App {
 
     /// Copy this job's settings to every other job that hasn't started.
     pub fn apply_to_all(self: &Rc<Self>, id: u64) {
-        let n = {
-            let mut st = self.state.borrow_mut();
+        let (src, targets) = {
+            let st = self.state.borrow();
             let Some(src) = st.job(id).cloned() else {
                 return;
             };
-            let mut n = 0;
-            for j in st
+            let targets: Vec<u64> = st
                 .jobs
-                .iter_mut()
+                .iter()
                 .filter(|j| j.id != id && j.state == JobState::Pending)
-            {
+                .map(|j| j.id)
+                .collect();
+            (src, targets)
+        };
+        // Through `edit`, so each job gets the same follow-up as a hand edit:
+        // Dolby Vision switched off when the new settings rule it out, a stale
+        // VMAF score cleared, a new estimate.
+        let n = targets.len();
+        for t in targets {
+            self.edit(t, |j| {
                 j.settings = src.settings.clone();
                 j.preset = src.preset.clone();
                 if let Some(p) = &j.probe {
                     j.selection.reset_actions(p, &j.settings);
                 }
-                n += 1;
-            }
-            n
-        };
-        let ids: Vec<u64> = self.state.borrow().jobs.iter().map(|j| j.id).collect();
-        for j in ids {
-            self.schedule_estimate(j);
-            self.update_row(j);
+            });
         }
         self.toast(&format!(
             "Applied to {n} other job{}",
@@ -1607,13 +1653,17 @@ impl App {
     }
 }
 
-/// Cache key for sample estimates: file + settings + crop + deinterlace plan.
-pub fn estimate_key(j: &Job) -> String {
-    format!(
-        "{}|{}|{:?}|{:?}",
-        j.input.display(),
-        j.settings.cache_key(),
-        j.active_crop(),
-        j.scan_plan()
-    )
+impl State {
+    /// Cache key for sample estimates: file + video settings + the bitrate a
+    /// target size resolves to (it depends on the kept audio) + crop + scan plan.
+    pub fn estimate_key(&self, j: &Job) -> String {
+        format!(
+            "{}|{}|{:?}|{:?}|{:?}",
+            j.input.display(),
+            j.settings.video_cache_key(),
+            self.video_kbps(j),
+            j.active_crop(),
+            j.scan_plan()
+        )
+    }
 }

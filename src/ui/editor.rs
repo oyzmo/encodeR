@@ -788,7 +788,7 @@ impl Editor {
                         .unwrap_or(0) as u32,
                 );
                 dd.set_valign(gtk::Align::Center);
-                dd.set_tooltip_text(Some("Copy keeps the track as it is; converting makes it smaller or playable on Apple TV"));
+                dd.set_tooltip_text(Some(help::AUDIO_ACTION));
                 {
                     let ap = app.clone();
                     dd.connect_selected_notify(move |d| {

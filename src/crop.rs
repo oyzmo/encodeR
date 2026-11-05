@@ -105,7 +105,8 @@ pub fn sample_starts(duration: f64, n: usize, len: f64) -> Vec<f64> {
 
 /// One analysis segment (software decode): `idet` on every frame for interlace
 /// detection, then `cropdetect` at 4 fps.
-pub fn cropdetect_args(input: &Path, start: f64, len: f64) -> Vec<OsString> {
+/// `stream` is the probed main video's absolute index (cover art can precede it).
+pub fn cropdetect_args(input: &Path, stream: usize, start: f64, len: f64) -> Vec<OsString> {
     let mut a: Vec<OsString> = Vec::new();
     for s in [
         "-hide_banner",
@@ -121,9 +122,9 @@ pub fn cropdetect_args(input: &Path, start: f64, len: f64) -> Vec<OsString> {
         a.push(s.into());
     }
     a.push(input.into());
+    a.push("-map".into());
+    a.push(format!("0:{stream}").into());
     for s in [
-        "-map",
-        "0:v:0",
         "-an",
         "-sn",
         "-dn",
@@ -141,7 +142,13 @@ pub fn cropdetect_args(input: &Path, start: f64, len: f64) -> Vec<OsString> {
 }
 
 /// One preview frame as PNG with the crop area outlined.
-pub fn preview_args(input: &Path, at: f64, crop: Option<&Crop>, out: &Path) -> Vec<OsString> {
+pub fn preview_args(
+    input: &Path,
+    stream: usize,
+    at: f64,
+    crop: Option<&Crop>,
+    out: &Path,
+) -> Vec<OsString> {
     let mut vf = String::new();
     if let Some(c) = crop {
         vf.push_str(&format!(
@@ -165,7 +172,8 @@ pub fn preview_args(input: &Path, at: f64, crop: Option<&Crop>, out: &Path) -> V
         a.push(s.into());
     }
     a.push(input.into());
-    for s in ["-map", "0:v:0", "-frames:v", "1", "-vf", &vf] {
+    let map = format!("0:{stream}");
+    for s in ["-map", &map, "-frames:v", "1", "-vf", &vf] {
         a.push(s.into());
     }
     a.push(out.into());
@@ -179,11 +187,29 @@ mod tests {
     #[test]
     fn cropdetect_limit_scales_with_bit_depth() {
         // An absolute limit (24) is below 10-bit black (64): no bars would be found.
-        let a = cropdetect_args(Path::new("/in.mkv"), 0.0, 4.0);
+        let a = cropdetect_args(Path::new("/in.mkv"), 0, 0.0, 4.0);
         let vf = a
             .iter()
             .find_map(|x| x.to_str().filter(|s| s.contains("cropdetect")));
         assert!(vf.unwrap().contains("cropdetect=limit=0.094:"));
+    }
+
+    #[test]
+    fn maps_the_main_video_not_cover_art() {
+        // Stream 0 is cover art here; the probe found the film at index 2.
+        let has_map = |a: &[OsString]| a.windows(2).any(|w| w[0] == "-map" && w[1] == "0:2");
+        assert!(has_map(&cropdetect_args(Path::new("/in.mkv"), 2, 0.0, 4.0)));
+        assert!(has_map(&preview_args(
+            Path::new("/in.mkv"),
+            2,
+            1.0,
+            None,
+            Path::new("/p.png")
+        )));
+        assert!(has_map(&crate::hdr::extract_video_args(
+            Path::new("/in.mkv"),
+            2
+        )));
     }
 
     #[test]

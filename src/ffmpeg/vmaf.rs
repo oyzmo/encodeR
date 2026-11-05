@@ -10,6 +10,8 @@ pub struct VmafInput<'a> {
     /// Seek into the distorted file too (post-encode check of the full output).
     pub distorted_seek: bool,
     pub reference: &'a Path,
+    /// Absolute index of the main video stream in `reference` (cover art can precede it).
+    pub ref_stream: usize,
     pub start: f64,
     pub secs: f64,
     pub width: u32,
@@ -43,8 +45,9 @@ pub fn args(i: &VmafInput) -> Vec<OsString> {
     // The encode is scaled back to the source resolution for the comparison.
     let graph = format!(
         "[0:v]scale={w}:{h}:flags=bicubic,format={fmt},setpts=PTS-STARTPTS[dist];\
-         [1:v]{pre}format={fmt},setpts=PTS-STARTPTS[ref];\
+         [1:{}]{pre}format={fmt},setpts=PTS-STARTPTS[ref];\
          [dist][ref]libvmaf=model=version={}:n_threads={}",
+        i.ref_stream,
         model_for(i.height),
         i.threads.max(1)
     );
@@ -129,6 +132,7 @@ mod tests {
             distorted: Path::new("/c/s.mkv"),
             distorted_seek: false,
             reference: Path::new("/m/in.mkv"),
+            ref_stream: 0,
             start: 100.0,
             secs: 8.0,
             width: 3840,
@@ -149,7 +153,7 @@ mod tests {
             .collect();
         let g = &a[a.iter().position(|x| x == "-lavfi").unwrap() + 1];
         assert!(g.contains("[0:v]scale=3840:1608:flags=bicubic,format=yuv420p10le"));
-        assert!(g.contains("[1:v]bwdif=mode=send_field:parity=tff:deint=all,crop=3840:1608:0:276,format=yuv420p10le"));
+        assert!(g.contains("[1:0]bwdif=mode=send_field:parity=tff:deint=all,crop=3840:1608:0:276,format=yuv420p10le"));
         assert!(g.contains("version=vmaf_4k_v0.6.1"));
         // Reference is seeked; the sample (already cut) isn't.
         assert_eq!(&a[2..4], ["-i", "/c/s.mkv"]);

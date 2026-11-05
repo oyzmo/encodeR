@@ -287,9 +287,22 @@ impl EncodeSettings {
         self.ten_bit && self.codec.supports_10bit()
     }
 
-    /// Stable key for caching estimates.
-    pub fn cache_key(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
+    /// Stable key for caching sample estimates: only the settings that change the
+    /// video samples. They are encoded video-only, as MKV, without extra arguments,
+    /// so audio, container, metadata and extra-argument edits reuse the cache.
+    /// The target size counts through the resolved bitrate (see `estimate_key`).
+    pub fn video_cache_key(&self) -> String {
+        let s = EncodeSettings {
+            target_gb: 0.0,
+            container: Container::Mkv,
+            apple_tv_audio: false,
+            multichannel_fallback: MultichannelFallback::Eac3,
+            stereo_downmix: false,
+            keep_metadata: false,
+            extra_args: String::new(),
+            ..self.clone()
+        };
+        serde_json::to_string(&s).unwrap_or_default()
     }
 }
 

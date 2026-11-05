@@ -90,6 +90,10 @@ impl CheckInput<'_> {
     fn source_ten_bit(&self) -> bool {
         self.probe.video.as_ref().is_some_and(|v| v.bit_depth > 8)
     }
+    /// HDR (PQ, HLG, Dolby Vision) or BT.2020 colour: 8-bit output washes it out.
+    fn source_wide_gamut(&self) -> bool {
+        self.probe.hdr.is_hdr() || self.probe.hdr.bt2020
+    }
 }
 
 fn source_codec_class(name: &str) -> VideoCodec {
@@ -111,20 +115,30 @@ pub fn eight_to_ten(c: &CheckInput) -> Option<Issue> {
 }
 
 pub fn hdr_to_eight(c: &CheckInput) -> Option<Issue> {
-    let hdr = c.probe.hdr.is_hdr() || c.source_ten_bit();
-    (c.encoding() && hdr && !c.settings.output_ten_bit() && c.settings.codec != VideoCodec::H264)
-        .then_some(())?;
+    let wide = c.source_wide_gamut();
+    (c.encoding() && (wide || c.source_ten_bit()) && !c.settings.output_ten_bit()).then_some(())?;
+    let h264 = c.settings.codec == VideoCodec::H264;
+    if wide {
+        // `hdr264` covers HDR to H.264 with a better fix.
+        (!h264).then_some(())?;
+        return issue(
+            "hdr8",
+            Severity::Strong,
+            "HDR source to 8-bit output: HDR will be lost and colours will look washed out (there is no tone mapping).",
+            Some(Fix::TenBit),
+        );
+    }
+    // A 10-bit SDR source keeps its colours in 8 bits; only gradients suffer.
     issue(
         "hdr8",
-        Severity::Strong,
-        "10-bit/HDR source to 8-bit output: HDR will be lost and colours will look washed out (there is no tone mapping).",
-        Some(Fix::TenBit),
+        Severity::Warning,
+        "10-bit source to 8-bit output: smooth gradients (skies, shadows) may show more banding. Colours stay the same, since the source isn't HDR.",
+        (!h264).then_some(Fix::TenBit),
     )
 }
 
 pub fn hdr_to_h264(c: &CheckInput) -> Option<Issue> {
-    let hdr = c.probe.hdr.is_hdr() || c.source_ten_bit();
-    (hdr && c.settings.codec == VideoCodec::H264).then_some(())?;
+    (c.source_wide_gamut() && c.settings.codec == VideoCodec::H264).then_some(())?;
     issue(
         "hdr264",
         Severity::Strong,
@@ -745,6 +759,29 @@ mod tests {
         assert_eq!(i.fix, Some(Fix::Codec(VideoCodec::Hevc)));
         // Not reported twice.
         assert!(hdr_to_eight(&f.input()).is_none());
+    }
+
+    #[test]
+    fn ten_bit_sdr_is_not_treated_as_hdr() {
+        let mut p = sdr_1080("hevc", 20_000_000);
+        p.video.as_mut().unwrap().bit_depth = 10;
+        let eight = EncodeSettings {
+            ten_bit: false,
+            ..Default::default()
+        };
+        let f = Fx::new(p.clone(), eight);
+        let i = hdr_to_eight(&f.input()).unwrap();
+        assert_eq!((i.severity, i.fix), (Severity::Warning, Some(Fix::TenBit)));
+        let f = Fx::new(
+            p,
+            EncodeSettings {
+                codec: VideoCodec::H264,
+                ..Default::default()
+            },
+        );
+        assert!(super::hdr_to_h264(&f.input()).is_none());
+        let i = hdr_to_eight(&f.input()).unwrap();
+        assert_eq!((i.severity, i.fix), (Severity::Warning, None));
     }
 
     #[test]

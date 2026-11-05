@@ -14,6 +14,7 @@ pub const CONTAINER: &str = "MKV holds every kind of audio and subtitle track an
 pub const APPLE_AUDIO: &str = "Converts audio Apple TV can't play natively (TrueHD, DTS, DTS-HD MA, Opus) so the NAS never has to transcode. Compatible tracks (AAC, AC-3, E-AC-3 incl. Atmos, FLAC) are copied as they are.";
 pub const DOWNMIX: &str = "Converts every multichannel track (5.1, 7.1) to stereo AAC at 224 kb/s, whatever its codec. Small and plays everywhere, good for TV speakers or headphones, but surround and Atmos are lost. Stereo tracks follow the normal rules. You can still change each track below.";
 pub const FALLBACK: &str = "What multichannel TrueHD/DTS becomes. E-AC-3 5.1 at 640 kb/s is small and plays everywhere, but 7.1 is folded to 5.1 and Atmos is lost. AAC 7.1 keeps all channels (lossy). FLAC 7.1 is lossless but large.";
+pub const AUDIO_ACTION: &str = "Copy keeps the track exactly as it is. Converting makes it smaller, or playable on Apple TV when the source is TrueHD or DTS.";
 
 pub const RATE_CONTROL: &str = "How the encoder spends bits. Automatic uses VBR for target size and CQP for constant quality. CBR wastes bits on easy scenes; QVBR is VBR with a quality floor. Only modes your driver accepts are listed.";
 pub const BITRATE: &str = "Average video bitrate for the bitrate modes. As a guide: 1080p HEVC 4–8 Mb/s, 4K HEVC 12–20 Mb/s.";

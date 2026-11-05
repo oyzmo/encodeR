@@ -268,7 +268,8 @@ pub fn build(job: &EncodeJob) -> Result<Vec<OsString>, String> {
     for c in &subs {
         a.kv("-map", format!("0:{}", c.index));
     }
-    if !job.video_only && !mp4 && p.attachments > 0 {
+    let fonts = !job.video_only && !mp4 && p.attachments > 0;
+    if fonts {
         // Fonts for ASS subtitles.
         a.add(&["-map", "0:t?"]);
     }
@@ -381,6 +382,13 @@ pub fn build(job: &EncodeJob) -> Result<Vec<OsString>, String> {
             a.add(&["-map_metadata", "0", "-map_chapters", "0"]);
         } else {
             a.add(&["-map_metadata", "-1", "-map_chapters", "-1"]);
+            // `-1` drops per-stream tags too, but the MKV muxer refuses an
+            // attachment without its filename/mimetype tags, so keep those.
+            if fonts {
+                for i in 0..p.attachments {
+                    a.kv(format!("-map_metadata:s:t:{i}"), format!("0:s:t:{i}"));
+                }
+            }
         }
         // Stats tags (BPS, NUMBER_OF_BYTES…) of re-encoded streams would be wrong;
         // an empty value deletes the copied tag.
@@ -528,6 +536,31 @@ mod tests {
     fn has(args: &[String], seq: &[&str]) -> bool {
         args.windows(seq.len())
             .any(|w| w.iter().zip(seq).all(|(a, b)| a == b))
+    }
+
+    #[test]
+    fn dropped_metadata_keeps_attachment_tags() {
+        let mut p = sample_4k();
+        p.attachments = 2;
+        let s = EncodeSettings {
+            keep_metadata: false,
+            ..Default::default()
+        };
+        let (sel, _, _) = auto_select(&p, &langs(), &s);
+        let out = Path::new("/out/movie-reencoded.mkv");
+        let job = EncodeJob::new(&p, &s, &sel, out, "/dev/dri/renderD128");
+        let a: Vec<String> = build(&job)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect();
+        assert!(has(&a, &["-map", "0:t?"]));
+        assert!(has(&a, &["-map_metadata", "-1"]));
+        assert!(has(&a, &["-map_metadata:s:t:0", "0:s:t:0"]));
+        assert!(has(&a, &["-map_metadata:s:t:1", "0:s:t:1"]));
+        // Kept metadata copies them anyway; no per-stream maps needed.
+        let a = args_for(&EncodeSettings::default(), |_| {});
+        assert!(!a.iter().any(|x| x.starts_with("-map_metadata:s:t")));
     }
 
     #[test]
