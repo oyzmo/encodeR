@@ -91,7 +91,13 @@ pub fn show(app: &Rc<App>) {
     {
         let a = app.clone();
         suffix.connect_changed(move |e| {
-            a.state.borrow_mut().prefs.suffix = e.text().to_string();
+            let clean = crate::queue::sanitize_suffix(&e.text());
+            if clean != e.text().as_str() {
+                // No folder separators in a file name suffix.
+                e.set_text(&clean);
+                return;
+            }
+            a.state.borrow_mut().prefs.suffix = clean;
             a.save_prefs();
         });
     }

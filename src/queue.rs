@@ -122,6 +122,8 @@ pub struct Job {
     /// Lines shown after a finished job (size vs target, HDR check, VMAF…).
     pub report: Vec<String>,
     pub output: Option<PathBuf>,
+    /// Existing output the user agreed to replace (asked when Start is pressed).
+    pub replace_ok: Option<PathBuf>,
 }
 
 impl Job {
@@ -157,6 +159,7 @@ impl Job {
             stderr_tail: Vec::new(),
             report: Vec::new(),
             output: None,
+            replace_ok: None,
         }
     }
 
@@ -199,6 +202,7 @@ impl Job {
         crate::hdr::dv_blocker(
             p.hdr.dovi,
             self.settings.codec == crate::settings::VideoCodec::Hevc,
+            self.settings.output_ten_bit(),
             self.settings
                 .downscale
                 .height()
@@ -218,6 +222,17 @@ impl Job {
 
 /// Output path: `<dir>/<stem><suffix>.<ext>`, never the input itself.
 pub fn output_path(input: &Path, prefs: &Prefs, container: Container) -> PathBuf {
+    output_path_avoiding(input, prefs, container, &[])
+}
+
+/// Like `output_path`, but also never one of `taken` (other jobs' inputs and
+/// outputs). Clashes fall back to `-reencoded`, then `-reencoded-2`, `-3`…
+pub fn output_path_avoiding(
+    input: &Path,
+    prefs: &Prefs,
+    container: Container,
+    taken: &[PathBuf],
+) -> PathBuf {
     let dir = prefs
         .output_dir
         .clone()
@@ -227,11 +242,47 @@ pub fn output_path(input: &Path, prefs: &Prefs, container: Container) -> PathBuf
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "output".into());
-    let mut out = dir.join(format!("{stem}{}.{}", prefs.suffix, container.extension()));
-    if out == input {
-        out = dir.join(format!("{stem}-reencoded.{}", container.extension()));
+    let ext = container.extension();
+    let clash = |p: &Path| same_file(p, input) || taken.iter().any(|t| same_file(p, t));
+    let mut out = dir.join(format!("{stem}{}.{ext}", sanitize_suffix(&prefs.suffix)));
+    if clash(&out) {
+        out = dir.join(format!("{stem}-reencoded.{ext}"));
+    }
+    let mut n = 2;
+    while clash(&out) {
+        out = dir.join(format!("{stem}-reencoded-{n}.{ext}"));
+        n += 1;
     }
     out
+}
+
+/// A file-name suffix can't leave the output folder or name a subfolder.
+pub fn sanitize_suffix(s: &str) -> String {
+    s.chars().filter(|c| !matches!(c, '/' | '\0')).collect()
+}
+
+/// Whether two paths name the same file, whatever the spelling: the same inode
+/// when both exist (symlinks, case-insensitive shares, relative paths),
+/// otherwise the same canonical path (a missing file resolves via its folder).
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if a == b {
+        return true;
+    }
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        (Err(_), Err(_)) => resolve(a).is_some_and(|x| resolve(b) == Some(x)),
+        // One exists and the other doesn't: different files.
+        _ => false,
+    }
+}
+
+fn resolve(p: &Path) -> Option<PathBuf> {
+    let parent = p
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    Some(std::fs::canonicalize(parent).ok()?.join(p.file_name()?))
 }
 
 /// The next job to encode: the first pending one, in queue order.
@@ -290,6 +341,44 @@ mod tests {
         assert_eq!(
             output_path(Path::new("/m/Film.mkv"), &p2, Container::Mkv),
             PathBuf::from("/out/Film.mkv")
+        );
+    }
+
+    #[test]
+    fn output_never_reaches_the_input_by_another_path() {
+        let root = std::env::temp_dir().join(format!("encoder-outpath-{}", std::process::id()));
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = root.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let input = real.join("Film.mkv");
+        std::fs::write(&input, b"x").unwrap();
+        let p = Prefs {
+            suffix: String::new(),
+            output_dir: Some(link.clone()),
+            ..Default::default()
+        };
+        // link/Film.mkv is the input itself.
+        assert!(same_file(&link.join("Film.mkv"), &input));
+        let out = output_path(&input, &p, Container::Mkv);
+        assert_eq!(out, link.join("Film-reencoded.mkv"));
+        // Another queued job's input or output is avoided too.
+        let other = real.join("Film-reencoded.mkv");
+        let out = output_path_avoiding(&input, &p, Container::Mkv, std::slice::from_ref(&other));
+        assert_eq!(out, link.join("Film-reencoded-2.mkv"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn suffix_cannot_leave_the_folder() {
+        let p = Prefs {
+            suffix: "/../../x".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            output_path(Path::new("/m/Film.mkv"), &p, Container::Mkv),
+            PathBuf::from("/m/Film....x.mkv")
         );
     }
 

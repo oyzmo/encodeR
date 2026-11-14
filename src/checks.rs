@@ -4,7 +4,7 @@
 use crate::ffmpeg::estimate::{self, BitrateVerdict, SizeRange};
 use crate::ffmpeg::probe::ProbeInfo;
 use crate::scan::{Scan, ScanType};
-use crate::settings::{Container, Downscale, EncodeSettings, SizeMode, VideoCodec};
+use crate::settings::{Container, Downscale, EncodeSettings, RateControl, SizeMode, VideoCodec};
 use crate::tracks::{self, AudioAction, Selection};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -24,6 +24,14 @@ pub enum Fix {
     DropImageSubtitles,
     Target(f64),
     Downscale(Downscale),
+    ConstantQuality,
+    AutoRateControl,
+    /// HEVC with 10-bit on, in one click.
+    HevcTenBit,
+    /// Convert the tracks MP4 can't hold.
+    ConvertMp4Audio,
+    /// Turn cropping off (job state, handled by the window).
+    NoCrop,
 }
 
 impl Fix {
@@ -38,6 +46,11 @@ impl Fix {
             Fix::DropImageSubtitles => "Drop PGS".into(),
             Fix::Target(gb) => format!("Use {gb:.1} GB"),
             Fix::Downscale(d) => format!("Downscale to {}", d.label()),
+            Fix::ConstantQuality => "Use constant quality".into(),
+            Fix::HevcTenBit => "Switch to HEVC 10-bit".into(),
+            Fix::AutoRateControl => "Use automatic".into(),
+            Fix::ConvertMp4Audio => "Convert those tracks".into(),
+            Fix::NoCrop => "Turn off crop".into(),
         }
     }
 }
@@ -48,6 +61,8 @@ pub struct Issue {
     pub severity: Severity,
     pub message: String,
     pub fix: Option<Fix>,
+    /// A second one-click fix, shown next to the first.
+    pub alt_fix: Option<Fix>,
 }
 
 fn issue(
@@ -61,6 +76,20 @@ fn issue(
         severity,
         message: message.into(),
         fix,
+        alt_fix: None,
+    })
+}
+
+fn issue2(
+    id: &'static str,
+    severity: Severity,
+    message: impl Into<String>,
+    fix: Fix,
+    alt_fix: Fix,
+) -> Option<Issue> {
+    issue(id, severity, message, Some(fix)).map(|i| Issue {
+        alt_fix: Some(alt_fix),
+        ..i
     })
 }
 
@@ -143,7 +172,7 @@ pub fn hdr_to_h264(c: &CheckInput) -> Option<Issue> {
         "hdr264",
         Severity::Strong,
         "HDR source to H.264: HDR is lost and colours will look washed out. Use HEVC 10-bit or AV1 10-bit instead.",
-        Some(Fix::Codec(VideoCodec::Hevc)),
+        Some(Fix::HevcTenBit),
     )
 }
 
@@ -239,11 +268,24 @@ pub fn target_bitrate(c: &CheckInput) -> Option<Issue> {
     (c.encoding() && c.settings.bitrate_from_target()).then_some(())?;
     let (w, h, fps) = scaled_size(c)?;
     let Some(kbps) = c.video_kbps else {
+        if c.probe.duration <= 0.0 {
+            return issue(
+                "targetimpossible",
+                Severity::Strong,
+                "The file's duration is unknown, so the target size can't be turned into a bitrate. Use constant quality.",
+                Some(Fix::ConstantQuality),
+            );
+        }
+        let fix = if lossless_copied(c) {
+            Fix::ConvertLosslessAudio
+        } else {
+            Fix::Target(suggested_target(c, w, h, fps))
+        };
         return issue(
             "targetimpossible",
             Severity::Strong,
-            "The selected audio and subtitles alone are bigger than the target size.",
-            Some(Fix::ConvertLosslessAudio),
+            "The selected audio and subtitles leave no room for the video in this target size. The job won't start until this is fixed.",
+            Some(fix),
         );
     };
     match estimate::bitrate_verdict(kbps, c.settings.codec, w, h, fps) {
@@ -272,10 +314,7 @@ pub fn audio_share(c: &CheckInput) -> Option<Issue> {
     (c.settings.size_mode == SizeMode::TargetSize).then_some(())?;
     let target = c.settings.target_gb * estimate::GB;
     let audio = c.selection.audio_bytes(c.probe) as f64;
-    let lossless = c.selection.selected_audio().any(|ch| {
-        ch.action == AudioAction::Copy && c.probe.audio_by_index(ch.index).is_some_and(is_lossless)
-    });
-    (target > 0.0 && audio / target > 0.25 && lossless).then_some(())?;
+    (target > 0.0 && audio / target > 0.25 && lossless_copied(c)).then_some(())?;
     issue(
         "audioshare",
         Severity::Warning,
@@ -287,16 +326,26 @@ pub fn audio_share(c: &CheckInput) -> Option<Issue> {
     )
 }
 
-fn is_lossless(a: &crate::ffmpeg::probe::AudioStream) -> bool {
-    matches!(a.codec.as_str(), "truehd" | "mlp" | "flac" | "alac")
-        || a.codec.starts_with("pcm_")
-        || (a.codec == "dts" && a.profile.contains("MA"))
+/// A selected track is a lossless copy (what `Fix::ConvertLosslessAudio` changes).
+fn lossless_copied(c: &CheckInput) -> bool {
+    c.selection.selected_audio().any(|ch| {
+        ch.action == AudioAction::Copy
+            && c.probe
+                .audio_by_index(ch.index)
+                .is_some_and(tracks::is_lossless)
+    })
 }
 
 fn output_audio_codec(a: &crate::ffmpeg::probe::AudioStream, action: AudioAction) -> String {
     action
         .target_codec()
         .map_or_else(|| a.codec.clone(), str::to_string)
+}
+
+fn mp4_rejects(codec: &str) -> bool {
+    matches!(codec, "truehd" | "mlp" | "vorbis")
+        || codec.starts_with("pcm_")
+        || codec.starts_with("wma")
 }
 
 pub fn container_conflicts(c: &CheckInput) -> Vec<Issue> {
@@ -318,21 +367,19 @@ pub fn container_conflicts(c: &CheckInput) -> Vec<Issue> {
         .filter_map(|ch| {
             let a = c.probe.audio_by_index(ch.index)?;
             let codec = output_audio_codec(a, ch.action);
-            (matches!(codec.as_str(), "truehd" | "mlp" | "vorbis")
-                || codec.starts_with("pcm_")
-                || codec.starts_with("wma"))
-            .then(|| tracks::codec_name(&codec, ""))
+            mp4_rejects(&codec).then(|| tracks::codec_name(&codec, ""))
         })
         .collect();
     if !bad.is_empty() {
-        v.extend(issue(
+        v.extend(issue2(
             "mp4audio",
             Severity::Strong,
             format!(
                 "MP4 can't hold {} audio. Switch to MKV or convert those tracks.",
                 bad.join(", ")
             ),
-            Some(Fix::Mkv),
+            Fix::Mkv,
+            Fix::ConvertMp4Audio,
         ));
     }
     v
@@ -377,10 +424,33 @@ pub fn apple_tv(c: &CheckInput) -> Vec<Issue> {
             Some(Fix::DropImageSubtitles),
         ));
     }
-    if c.settings.codec == VideoCodec::Av1
-        || (c.settings.codec == VideoCodec::Copy
-            && c.probe.video.as_ref().is_some_and(|v| v.codec == "av1"))
+    let copied = (c.settings.codec == VideoCodec::Copy)
+        .then_some(c.probe.video.as_ref())
+        .flatten();
+    if let Some(src) = copied.filter(|s| !matches!(s.codec.as_str(), "av1" | "hevc"))
+        && !(src.codec == "h264" && src.bit_depth <= 8)
     {
+        let what = if src.codec == "h264" {
+            "10-bit H.264".to_string()
+        } else {
+            src.codec.to_uppercase()
+        };
+        v.extend(issue(
+            "atvvideo",
+            Severity::Warning,
+            format!("Apple TV can't play {what} video natively, so the NAS would have to transcode it. Re-encode to HEVC."),
+            Some(Fix::Codec(VideoCodec::Hevc)),
+        ));
+    }
+    if copied.is_some() && c.probe.hdr.dovi.is_some_and(|d| d.profile == 7) {
+        v.extend(issue(
+            "atvdv7",
+            Severity::Info,
+            "Dolby Vision profile 7 is copied as it is: Apple TV plays it as HDR10, not Dolby Vision.",
+            None,
+        ));
+    }
+    if c.settings.codec == VideoCodec::Av1 || copied.is_some_and(|v| v.codec == "av1") {
         v.extend(issue(
             "atvav1",
             Severity::Warning,
@@ -551,6 +621,67 @@ pub fn interlacing(c: &CheckInput) -> Option<Issue> {
 }
 
 /// All checks, most severe first.
+/// Size mode and an explicit rate-control mode that ignore each other.
+pub fn rate_control_override(c: &CheckInput) -> Option<Issue> {
+    c.encoding().then_some(())?;
+    let s = c.settings;
+    let msg = match (s.size_mode, s.rate_control) {
+        (_, RateControl::Auto) => return None,
+        (SizeMode::TargetSize, rc) if !s.bitrate_from_target() => format!(
+            "Rate control {} (Advanced) overrides the target size: the size picks do nothing and the file can end up much bigger.",
+            rc.label()
+        ),
+        (SizeMode::ConstantQuality, rc @ (RateControl::Vbr | RateControl::Cbr)) => format!(
+            "Rate control {} (Advanced) overrides constant quality: the quality slider does nothing; the manual bitrate is used.",
+            rc.label()
+        ),
+        _ => return None,
+    };
+    issue(
+        "rcoverride",
+        Severity::Warning,
+        msg,
+        Some(Fix::AutoRateControl),
+    )
+}
+
+/// Image subtitles are positioned on the uncropped frame.
+pub fn crop_image_subs(c: &CheckInput) -> Option<Issue> {
+    (c.encoding() && c.active_crop.is_some()).then_some(())?;
+    c.selection
+        .selected_subs()
+        .any(|ch| {
+            c.probe
+                .subtitle_by_index(ch.index)
+                .is_some_and(|s| !tracks::is_text_subtitle(&s.codec))
+        })
+        .then_some(())?;
+    issue2(
+        "cropimgsubs",
+        Severity::Warning,
+        "Cropping with PGS/VobSub subtitles kept: they are drawn for the uncropped picture and often sit in the black bars, so players may place them off the picture or squeeze them.",
+        Fix::DropImageSubtitles,
+        Fix::NoCrop,
+    )
+}
+
+/// A downscale that the crop already made pointless.
+pub fn downscale_after_crop(c: &CheckInput) -> Option<Issue> {
+    let target = c.settings.downscale.height()?;
+    let crop = c.active_crop?;
+    (c.encoding() && target >= crop.h).then_some(())?;
+    issue(
+        "cropscale",
+        Severity::Info,
+        format!(
+            "The cropped picture is already {}px high, so the {} downscale is skipped.",
+            crop.h,
+            c.settings.downscale.label()
+        ),
+        None,
+    )
+}
+
 pub fn run(c: &CheckInput) -> Vec<Issue> {
     let mut v: Vec<Issue> = [
         eight_to_ten(c),
@@ -567,6 +698,9 @@ pub fn run(c: &CheckInput) -> Vec<Issue> {
         vmaf_low(c),
         encoder_size(c),
         interlacing(c),
+        rate_control_override(c),
+        crop_image_subs(c),
+        downscale_after_crop(c),
     ]
     .into_iter()
     .flatten()
@@ -614,7 +748,7 @@ pub fn apply_fix(fix: Fix, p: &ProbeInfo, s: &mut EncodeSettings, sel: &mut Sele
                 .filter(|ch| ch.selected && ch.action == AudioAction::Copy)
             {
                 if let Some(a) = p.audio_by_index(ch.index)
-                    && is_lossless(a)
+                    && tracks::is_lossless(a)
                 {
                     ch.action = if a.channels > 2 {
                         AudioAction::Eac3 { kbps: 640 }
@@ -638,6 +772,36 @@ pub fn apply_fix(fix: Fix, p: &ProbeInfo, s: &mut EncodeSettings, sel: &mut Sele
         }
         Fix::Target(gb) => s.target_gb = gb,
         Fix::Downscale(d) => s.downscale = d,
+        Fix::ConstantQuality => {
+            s.size_mode = SizeMode::ConstantQuality;
+            s.rate_control = RateControl::Auto;
+        }
+        Fix::AutoRateControl => s.rate_control = RateControl::Auto,
+        Fix::HevcTenBit => {
+            if s.codec != VideoCodec::Hevc {
+                s.qp = VideoCodec::Hevc.default_qp();
+            }
+            s.codec = VideoCodec::Hevc;
+            s.ten_bit = true;
+        }
+        Fix::ConvertMp4Audio => {
+            for ch in sel.audio.iter_mut().filter(|ch| ch.selected) {
+                if let Some(a) = p.audio_by_index(ch.index)
+                    && mp4_rejects(&output_audio_codec(a, ch.action))
+                {
+                    ch.action = if a.channels > 2 {
+                        AudioAction::Eac3 { kbps: 640 }
+                    } else {
+                        AudioAction::Aac {
+                            kbps: 224,
+                            stereo: true,
+                        }
+                    };
+                }
+            }
+        }
+        // Job state, not settings: the window turns cropping off.
+        Fix::NoCrop => {}
     }
 }
 
@@ -756,7 +920,7 @@ mod tests {
             },
         );
         let i = super::hdr_to_h264(&f.input()).unwrap();
-        assert_eq!(i.fix, Some(Fix::Codec(VideoCodec::Hevc)));
+        assert_eq!(i.fix, Some(Fix::HevcTenBit));
         // Not reported twice.
         assert!(hdr_to_eight(&f.input()).is_none());
     }
@@ -1037,5 +1201,117 @@ mod tests {
         let v = run(&f.input());
         assert_eq!(v[0].severity, Severity::Strong);
         assert!(v.windows(2).all(|w| w[0].severity >= w[1].severity));
+    }
+
+    #[test]
+    fn explicit_rate_control_overriding_the_size_mode() {
+        let mut f = Fx::new(sample_4k(), EncodeSettings::default());
+        assert!(rate_control_override(&f.input()).is_none());
+        f.s.rate_control = RateControl::Cqp;
+        let i = rate_control_override(&f.input()).unwrap();
+        assert_eq!(i.fix, Some(Fix::AutoRateControl));
+        apply_fix(Fix::AutoRateControl, &f.p, &mut f.s, &mut f.sel);
+        assert!(f.s.bitrate_from_target());
+        f.s.size_mode = SizeMode::ConstantQuality;
+        f.s.rate_control = RateControl::Vbr;
+        assert!(rate_control_override(&f.input()).is_some());
+        f.s.rate_control = RateControl::Qvbr;
+        assert!(rate_control_override(&f.input()).is_none());
+    }
+
+    #[test]
+    fn crop_with_image_subtitles() {
+        let mut f = Fx::new(sample_4k(), EncodeSettings::default());
+        for c in &mut f.sel.subs {
+            c.selected = c.index == 7; // PGS
+        }
+        let crop = crate::crop::Crop {
+            w: 3840,
+            h: 1608,
+            x: 0,
+            y: 276,
+        };
+        let mut c = f.input();
+        assert!(crop_image_subs(&c).is_none());
+        c.active_crop = Some(crop);
+        let i = crop_image_subs(&c).unwrap();
+        assert_eq!(
+            (i.fix, i.alt_fix),
+            (Some(Fix::DropImageSubtitles), Some(Fix::NoCrop))
+        );
+    }
+
+    #[test]
+    fn impossible_target_fixes() {
+        // Huge lossless audio copied: convert it.
+        let mut f = Fx::new(sample_4k(), EncodeSettings::default());
+        for c in &mut f.sel.audio {
+            c.selected = c.index == 1; // TrueHD 7.1, copied
+            c.action = AudioAction::Copy;
+        }
+        f.s.target_gb = 2.0;
+        let i = target_bitrate(&f.input()).unwrap();
+        assert_eq!(
+            (i.id, i.fix),
+            ("targetimpossible", Some(Fix::ConvertLosslessAudio))
+        );
+        // No lossless copy left to convert: a larger target instead.
+        apply_fix(Fix::ConvertLosslessAudio, &f.p, &mut f.s, &mut f.sel);
+        f.s.target_gb = 0.3;
+        let i = target_bitrate(&f.input()).unwrap();
+        assert!(matches!(i.fix, Some(Fix::Target(gb)) if gb > 0.3), "{i:?}");
+        // Unknown duration: constant quality.
+        f.p.duration = 0.0;
+        let i = target_bitrate(&f.input()).unwrap();
+        assert_eq!(i.fix, Some(Fix::ConstantQuality));
+        apply_fix(Fix::ConstantQuality, &f.p, &mut f.s, &mut f.sel);
+        assert!(!f.s.bitrate_from_target());
+    }
+
+    #[test]
+    fn hdr_to_h264_fix_is_one_click() {
+        let mut f = Fx::new(
+            sample_4k(),
+            EncodeSettings {
+                codec: VideoCodec::H264,
+                ten_bit: false,
+                ..Default::default()
+            },
+        );
+        let i = super::hdr_to_h264(&f.input()).unwrap();
+        apply_fix(i.fix.unwrap(), &f.p, &mut f.s, &mut f.sel);
+        let c = f.input();
+        assert!(super::hdr_to_h264(&c).is_none() && hdr_to_eight(&c).is_none());
+    }
+
+    #[test]
+    fn copied_video_apple_tv_cannot_play() {
+        let s = EncodeSettings {
+            codec: VideoCodec::Copy,
+            ..Default::default()
+        };
+        let f = Fx::new(sdr_1080("vc1", 20_000_000), s.clone());
+        assert!(ids(&apple_tv(&f.input())).contains(&"atvvideo"));
+        let f = Fx::new(sdr_1080("h264", 20_000_000), s);
+        assert!(!ids(&apple_tv(&f.input())).contains(&"atvvideo"));
+    }
+
+    #[test]
+    fn mp4_audio_can_be_converted_instead() {
+        let mut f = Fx::new(
+            sample_4k(),
+            EncodeSettings {
+                container: Container::Mp4,
+                apple_tv_audio: false,
+                ..Default::default()
+            },
+        );
+        let i = container_conflicts(&f.input())
+            .into_iter()
+            .find(|i| i.id == "mp4audio")
+            .unwrap();
+        assert_eq!(i.alt_fix, Some(Fix::ConvertMp4Audio));
+        apply_fix(Fix::ConvertMp4Audio, &f.p, &mut f.s, &mut f.sel);
+        assert!(!ids(&container_conflicts(&f.input())).contains(&"mp4audio"));
     }
 }

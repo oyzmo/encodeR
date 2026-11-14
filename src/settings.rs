@@ -278,6 +278,14 @@ impl EncodeSettings {
     }
 
     /// True when the video bitrate comes from the target-size maths.
+    /// Whether the settings that pick each track's default audio action differ.
+    /// Only then may new settings reset hand-picked per-track conversions.
+    pub fn audio_defaults_differ(&self, other: &EncodeSettings) -> bool {
+        self.apple_tv_audio != other.apple_tv_audio
+            || self.stereo_downmix != other.stereo_downmix
+            || self.multichannel_fallback != other.multichannel_fallback
+    }
+
     pub fn bitrate_from_target(&self) -> bool {
         self.size_mode == SizeMode::TargetSize
             && matches!(self.rate_control, RateControl::Auto | RateControl::Vbr)
@@ -366,14 +374,65 @@ pub fn cache_dir() -> PathBuf {
 
 impl Prefs {
     pub fn load() -> Self {
+        Self::load_reporting().0
+    }
+
+    /// Load the preferences. A file that doesn't parse (a value from a newer
+    /// build, a typo from a hand edit) is moved aside to `config.json.bad`
+    /// instead of being overwritten by the next save, its presets are
+    /// recovered one by one, and the second value says so for a toast.
+    pub fn load_reporting() -> (Self, Option<String>) {
         let path = config_dir().join("config.json");
         // Settings saved before the rename to encodeR.
         let old = config_dir().with_file_name("reencoder").join("config.json");
-        std::fs::read_to_string(&path)
-            .or_else(|_| std::fs::read_to_string(old))
+        let (text, from) = match std::fs::read_to_string(&path) {
+            Ok(t) => (t, path),
+            Err(_) => match std::fs::read_to_string(&old) {
+                Ok(t) => (t, old),
+                Err(_) => return (Self::default(), None),
+            },
+        };
+        match Self::parse(&text) {
+            (p, true) => (p, None),
+            (recovered, false) => {
+                let bad = from.with_extension("json.bad");
+                let _ = std::fs::rename(&from, &bad);
+                let n = recovered.user_presets.len();
+                let msg = format!(
+                    "The settings file couldn't be read and was saved as {}. Defaults are used{}.",
+                    bad.display(),
+                    if n > 0 {
+                        format!("; {n} preset{} recovered", if n == 1 { "" } else { "s" })
+                    } else {
+                        String::new()
+                    }
+                );
+                (recovered, Some(msg))
+            }
+        }
+    }
+
+    /// The preferences and whether they parsed cleanly. When not, they are
+    /// what could be recovered: defaults plus each user preset that still
+    /// parses on its own.
+    pub fn parse(text: &str) -> (Self, bool) {
+        if let Ok(p) = serde_json::from_str(text) {
+            return (p, true);
+        }
+        let user_presets = serde_json::from_str::<serde_json::Value>(text)
             .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .and_then(|v| v.get("user_presets")?.as_array().cloned())
             .unwrap_or_default()
+            .into_iter()
+            .filter_map(|p| serde_json::from_value(p).ok())
+            .collect();
+        (
+            Self {
+                user_presets,
+                ..Self::default()
+            },
+            false,
+        )
     }
 
     pub fn save(&self) {
@@ -414,6 +473,18 @@ mod tests {
         let p: Prefs = serde_json::from_str(r#"{"suffix":"-x"}"#).unwrap();
         assert_eq!(p.suffix, "-x");
         assert_eq!(p.last_settings.codec, VideoCodec::Hevc);
+    }
+
+    #[test]
+    fn unknown_value_keeps_the_good_presets() {
+        let text = r#"{ "suffix": "-x", "user_presets": [
+            { "name": "Good", "settings": { "codec": "Hevc" } },
+            { "name": "Bad", "settings": { "codec": "VVC" } } ] }"#;
+        let (r, ok) = Prefs::parse(text);
+        assert!(!ok);
+        assert_eq!(r.user_presets.len(), 1);
+        assert_eq!(r.user_presets[0].name, "Good");
+        assert_eq!(r.suffix, Prefs::default().suffix);
     }
 
     #[test]

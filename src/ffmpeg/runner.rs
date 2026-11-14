@@ -56,7 +56,93 @@ impl Drop for HelperGuard {
     }
 }
 
+/// Caps how many background helpers run at once, so dropping 30 files doesn't
+/// start 30 ffprobes, 30 analyses and 30 sample encodes side by side.
+pub struct Limiter {
+    used: Mutex<usize>,
+    freed: std::sync::Condvar,
+    max: usize,
+}
+
+/// Probing is light: a few at a time.
+pub static PROBES: Limiter = Limiter::new(4);
+/// Crop/interlace analysis, sample encodes and VMAF: CPU/GPU heavy.
+pub static HEAVY: Limiter = Limiter::new(2);
+
+pub struct Slot(&'static Limiter);
+
+impl Limiter {
+    pub const fn new(max: usize) -> Self {
+        Self {
+            used: Mutex::new(0),
+            freed: std::sync::Condvar::new(),
+            max,
+        }
+    }
+
+    /// Wait for a free slot; `None` if `cancel` fires while waiting.
+    pub fn acquire(&'static self, cancel: Option<&Cancel>) -> Option<Slot> {
+        let mut used = self.used.lock().unwrap();
+        while *used >= self.max {
+            if cancel.is_some_and(Cancel::is_cancelled) {
+                return None;
+            }
+            used = self
+                .freed
+                .wait_timeout(used, Duration::from_millis(100))
+                .unwrap()
+                .0;
+        }
+        if cancel.is_some_and(Cancel::is_cancelled) {
+            return None;
+        }
+        *used += 1;
+        Some(Slot(self))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        *self.0.used.lock().unwrap() -= 1;
+        self.0.freed.notify_one();
+    }
+}
+
 pub const STDERR_LINES: usize = 20;
+
+/// A `Command` whose child gets SIGTERM if this process dies (logout, crash,
+/// `kill`), so an encode never carries on as an orphan. The signal follows the
+/// spawning thread, which here always waits for its child.
+fn command(program: &str) -> Command {
+    use std::os::unix::process::CommandExt;
+    unsafe extern "C" {
+        fn prctl(option: i32, ...) -> i32;
+    }
+    const PR_SET_PDEATHSIG: i32 = 1;
+    const SIGTERM: u64 = 15;
+    let mut c = Command::new(program);
+    // SAFETY: prctl is async-signal-safe and touches no memory of ours.
+    unsafe {
+        c.pre_exec(|| {
+            prctl(PR_SET_PDEATHSIG, SIGTERM);
+            Ok(())
+        });
+    }
+    c
+}
+
+/// Lines of a byte stream, decoding invalid UTF-8 lossily: ffmpeg prints
+/// Latin-1 stream titles and file names as raw bytes, and a strict reader
+/// would stop at the first one.
+fn lossy_lines(r: impl Read) -> impl Iterator<Item = String> {
+    BufReader::new(r)
+        .split(b'\n')
+        .map_while(Result::ok)
+        .map(|b| {
+            let s = String::from_utf8_lossy(&b);
+            s.strip_suffix('\r').unwrap_or(&s).to_string()
+        })
+}
 
 #[derive(Debug, Default)]
 pub struct RunResult {
@@ -73,7 +159,7 @@ fn spawn_tail(
     let tail = Arc::new(Mutex::new(VecDeque::new()));
     let t = tail.clone();
     let h = thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        for line in lossy_lines(stderr) {
             let mut q = t.lock().unwrap();
             if q.len() == keep {
                 q.pop_front();
@@ -108,7 +194,7 @@ pub fn run_ffmpeg(
     cancel: &Cancel,
     mut on_progress: impl FnMut(Progress),
 ) -> RunResult {
-    let mut child = match Command::new(program)
+    let mut child = match command(program)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -128,7 +214,7 @@ pub fn run_ffmpeg(
     let (tail, tail_h) = spawn_tail(child.stderr.take().expect("piped"), STDERR_LINES * 2);
     let (tx, rx) = mpsc::channel::<String>();
     let out_h = thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        for line in lossy_lines(stdout) {
             if tx.send(line).is_err() {
                 break;
             }
@@ -176,9 +262,9 @@ pub struct Captured {
 
 fn read_all(r: impl Read + Send + 'static) -> thread::JoinHandle<String> {
     thread::spawn(move || {
-        let mut s = String::new();
-        let _ = BufReader::new(r).read_to_string(&mut s);
-        s
+        let mut b = Vec::new();
+        let _ = BufReader::new(r).read_to_end(&mut b);
+        String::from_utf8_lossy(&b).into_owned()
     })
 }
 
@@ -198,7 +284,7 @@ fn wait_cancellable(child: &mut Child, cancel: &Cancel) -> (Option<ExitStatus>, 
 
 /// Run a short helper command, capturing output; killed on cancel.
 pub fn run_capture(program: &str, args: &[OsString], cancel: &Cancel) -> Result<Captured, String> {
-    let mut child = Command::new(program)
+    let mut child = command(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -222,7 +308,7 @@ pub fn run_pipe(
     b: (&str, &[OsString]),
     cancel: &Cancel,
 ) -> Result<Captured, String> {
-    let mut first = Command::new(a.0)
+    let mut first = command(a.0)
         .args(a.1)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -230,7 +316,7 @@ pub fn run_pipe(
         .spawn()
         .map_err(|e| format!("Could not start {}: {e}", a.0))?;
     let pipe = first.stdout.take().expect("piped");
-    let mut second = match Command::new(b.0)
+    let mut second = match command(b.0)
         .args(b.1)
         .stdin(Stdio::from(pipe))
         .stdout(Stdio::piped())
@@ -321,6 +407,25 @@ pub fn which(program: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limiter_caps_and_cancels() {
+        static L: Limiter = Limiter::new(1);
+        let a = L.acquire(None).unwrap();
+        let c = Cancel::default();
+        c.cancel();
+        // Full and cancelled: gives up instead of waiting.
+        assert!(L.acquire(Some(&c)).is_none());
+        drop(a);
+        assert!(L.acquire(None).is_some());
+    }
+
+    #[test]
+    fn invalid_utf8_lines_survive() {
+        let bytes: &[u8] = b"one\ncaf\xe9 title\r\nthree\n";
+        let lines: Vec<String> = lossy_lines(bytes).collect();
+        assert_eq!(lines, vec!["one", "caf\u{fffd} title", "three"]);
+    }
 
     #[test]
     fn helpers_wait_for_running_threads() {

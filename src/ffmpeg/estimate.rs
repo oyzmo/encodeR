@@ -34,8 +34,13 @@ pub fn target_video_kbps(
     }
     let usable_bits = target_gb * GB * 8.0 * TARGET_FRACTION * (1.0 - CONTAINER_OVERHEAD);
     let video_bits = usable_bits - (audio_bytes + sub_bytes) as f64 * 8.0;
-    (video_bits > 0.0).then(|| (video_bits / duration / 1000.0) as u32)
+    let kbps = video_bits / duration / 1000.0;
+    (kbps >= MIN_VIDEO_KBPS as f64).then_some(kbps as u32)
 }
+
+/// Below this the target is treated as impossible rather than encoding at a
+/// near-zero (or zero) bitrate.
+pub const MIN_VIDEO_KBPS: u32 = 100;
 
 /// Bits per pixel per frame below which the codec starts to look poor.
 pub fn min_bpp(codec: VideoCodec) -> f64 {
@@ -201,10 +206,28 @@ pub fn encode_samples(
 ) -> Result<Vec<Sample>, String> {
     let dir = cache_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    let r = encode_samples_into(ffmpeg, job, cancel, keep, &dir, &mut out);
+    if r.is_err() {
+        // Kept samples (VMAF) the caller will never see.
+        for s in &out {
+            let _ = std::fs::remove_file(&s.path);
+        }
+    }
+    r.map(|()| out)
+}
+
+fn encode_samples_into(
+    ffmpeg: &str,
+    job: &EncodeJob,
+    cancel: &Cancel,
+    keep: bool,
+    dir: &std::path::Path,
+    out: &mut Vec<Sample>,
+) -> Result<(), String> {
     let mut settings = job.settings.clone();
     settings.container = Container::Mkv;
     settings.extra_args.clear();
-    let mut out = Vec::new();
     for (n, (start, secs)) in sample_segments(job.probe.duration).into_iter().enumerate() {
         // Unique per call: estimates for several jobs and VMAF run at the same time.
         let path = dir.join(format!(
@@ -257,12 +280,52 @@ pub fn encode_samples(
             bytes,
         });
     }
-    Ok(out)
+    Ok(())
+}
+
+/// Delete leftovers of dead processes in the cache folder: sample encodes,
+/// crop previews, capability probes and Dolby Vision intermediates (named
+/// `<kind>-<pid>-…`) that a crash or kill left behind.
+pub fn sweep_cache() {
+    let Ok(entries) = std::fs::read_dir(cache_dir()) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(pid) = stale_pid(&name) else {
+            continue;
+        };
+        if pid == std::process::id() || std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            continue;
+        }
+        let path = e.path();
+        let _ = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
+}
+
+fn stale_pid(name: &str) -> Option<u32> {
+    let rest = ["sample-", "preview-", "dv-", "capcrop-"]
+        .iter()
+        .find_map(|p| name.strip_prefix(p))?;
+    rest.split(['-', '.']).next()?.parse().ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_leftovers_are_recognised_by_pid() {
+        assert_eq!(stale_pid("sample-123-4-0.mkv"), Some(123));
+        assert_eq!(stale_pid("preview-77-3-1.png"), Some(77));
+        assert_eq!(stale_pid("dv-9-7200"), Some(9));
+        assert_eq!(stale_pid("capcrop-5.mkv"), Some(5));
+        assert_eq!(stale_pid("config.json"), None);
+    }
 
     #[test]
     fn target_size_maths() {
@@ -274,6 +337,9 @@ mod tests {
         // Audio larger than the target: impossible.
         assert_eq!(target_video_kbps(2.0, 7200.0, 4_050_000_000, 0), None);
         assert_eq!(target_video_kbps(2.0, 0.0, 0, 0), None);
+        // Just above zero room for video: refused, never `-b:v 0k`.
+        assert_eq!(target_video_kbps(2.0, 7200.0, 1_920_000_000, 0), None);
+        assert!(target_video_kbps(2.0, 7200.0, 1_800_000_000, 0).unwrap() >= MIN_VIDEO_KBPS);
     }
 
     #[test]

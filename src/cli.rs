@@ -96,6 +96,7 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
             && crate::hdr::dv_blocker(
                 p.hdr.dovi,
                 settings.codec == VideoCodec::Hevc,
+                settings.output_ten_bit(),
                 p.video
                     .as_ref()
                     .is_some_and(|v| settings.downscale.height().is_some_and(|h| h < v.height)),
@@ -103,7 +104,6 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
             )
             .is_none(),
         mkvpropedit: caps.mkvpropedit,
-        vmaf_after: false,
         settings,
         selection: sel,
         probe: p,
@@ -135,13 +135,18 @@ fn command_line(req: &Request, tools: &Tools) -> Result<String, String> {
     ))
 }
 
-fn print_checks(req: &Request, limits: Option<SizeLimits>, detected: Option<ScanType>) {
+fn print_checks(
+    req: &Request,
+    limits: Option<SizeLimits>,
+    detected: Option<ScanType>,
+    est: Option<SizeRange>,
+) {
     for i in checks::run(&checks::CheckInput {
         probe: &req.probe,
         settings: &req.settings,
         selection: &req.selection,
         video_kbps: req.video_kbps,
-        estimate: None,
+        estimate: est,
         vmaf: None,
         dv_preserve: req.dv_preserve,
         crop: false,
@@ -157,7 +162,7 @@ fn print_checks(req: &Request, limits: Option<SizeLimits>, detected: Option<Scan
 pub fn print_command(o: &Options) -> Result<(), String> {
     let p = prepare(o)?;
     println!("{}", command_line(&p.req, &p.tools)?);
-    print_checks(&p.req, p.limits, p.detected);
+    print_checks(&p.req, p.limits, p.detected, None);
     Ok(())
 }
 
@@ -170,7 +175,6 @@ pub fn encode(o: &Options) -> Result<(), String> {
     } = prepare(o)?;
     println!("input   {}", req.probe.path.display());
     println!("command {}", command_line(&req, &tools)?);
-    print_checks(&req, limits, detected);
     let audio = req.selection.audio_bytes(&req.probe);
     let subs = req.selection.subtitle_bytes(&req.probe);
     let rc = req.settings.effective_rate_control();
@@ -195,6 +199,9 @@ pub fn encode(o: &Options) -> Result<(), String> {
     if let Some(e) = est {
         println!("estimate {}", estimate::describe(e, req.probe.size_bytes));
     }
+    // Like the app: size-dependent checks (output not smaller, same codec)
+    // need the estimate.
+    print_checks(&req, limits, detected, est);
     let started = std::time::Instant::now();
     let mut last = -1i64;
     let out = worker::encode(&tools, &req, &Cancel::default(), |u| match u {

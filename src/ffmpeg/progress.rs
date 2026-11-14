@@ -20,6 +20,7 @@ impl Progress {
 
     /// Seconds remaining, from the remaining media time and the encode speed.
     pub fn eta(&self, duration: f64) -> Option<f64> {
+        (duration > 0.0).then_some(())?;
         let speed = self.speed.filter(|s| *s > 0.0)?;
         let done = self.out_time_us? as f64 / 1e6;
         Some(((duration - done).max(0.0)) / speed)
@@ -61,6 +62,8 @@ impl ProgressParser {
 pub fn format_eta(secs: f64) -> String {
     let s = secs.round() as u64;
     match s {
+        // A stalled encode (speed 0.001x) gives absurd numbers; cap them.
+        360_000.. => "> 99 h".into(),
         0..60 => format!("{s} s"),
         60..3600 => format!("{} min {:02} s", s / 60, s % 60),
         _ => format!("{} h {:02} min", s / 3600, (s % 3600) / 60),
@@ -118,5 +121,17 @@ mod tests {
         assert_eq!(format_eta(42.4), "42 s");
         assert_eq!(format_eta(125.0), "2 min 05 s");
         assert_eq!(format_eta(3725.0), "1 h 02 min");
+    }
+
+    #[test]
+    fn no_eta_without_duration_and_capped_display() {
+        let p = Progress {
+            out_time_us: Some(10_000_000),
+            speed: Some(1.0),
+            ..Default::default()
+        };
+        assert_eq!(p.eta(0.0), None);
+        assert_eq!(p.eta(20.0), Some(10.0));
+        assert_eq!(format_eta(1e7), "> 99 h");
     }
 }

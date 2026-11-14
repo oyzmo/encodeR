@@ -206,6 +206,7 @@ pub fn mkvpropedit_args(file: &Path, info: &HdrInfo) -> Vec<OsString> {
 pub fn dv_blocker(
     dovi: Option<Dovi>,
     codec_is_hevc: bool,
+    ten_bit: bool,
     scaling: bool,
     dovi_tool: bool,
 ) -> Option<&'static str> {
@@ -214,6 +215,8 @@ pub fn dv_blocker(
         Some("dovi_tool is not installed")
     } else if !codec_is_hevc {
         Some("Dolby Vision preservation needs HEVC output")
+    } else if !ten_bit {
+        Some("Dolby Vision preservation needs 10-bit output")
     } else if scaling {
         Some("Dolby Vision preservation can't be combined with downscaling")
     } else if !matches!(d.profile, 5 | 7 | 8) {
@@ -376,11 +379,13 @@ mod tests {
             compat_id: 6,
             el_present: true,
         });
-        assert_eq!(dv_blocker(None, true, false, true), None);
-        assert!(dv_blocker(d, true, false, false).is_some());
-        assert!(dv_blocker(d, false, false, true).is_some());
-        assert!(dv_blocker(d, true, true, true).is_some());
-        assert_eq!(dv_blocker(d, true, false, true), None);
+        assert_eq!(dv_blocker(None, true, true, false, true), None);
+        assert!(dv_blocker(d, true, true, false, false).is_some());
+        assert!(dv_blocker(d, false, true, false, true).is_some());
+        assert!(dv_blocker(d, true, true, true, true).is_some());
+        // 8-bit HEVC output can't carry the RPU's 10-bit base layer.
+        assert!(dv_blocker(d, true, false, false, true).is_some());
+        assert_eq!(dv_blocker(d, true, true, false, true), None);
         assert_eq!(dovi_mode(7), Some("2"));
         assert_eq!(dovi_mode(8), None);
         let a = extract_rpu_args(7, Path::new("/t/rpu.bin"));

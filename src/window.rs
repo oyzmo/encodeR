@@ -15,6 +15,7 @@ use crate::ffmpeg::command;
 use crate::ffmpeg::estimate::{self, SizeRange};
 use crate::ffmpeg::probe::{self, ProbeInfo};
 use crate::ffmpeg::progress::Progress;
+use crate::ffmpeg::runner;
 use crate::ffmpeg::runner::{Cancel, Helpers};
 use crate::ffmpeg::vmaf::VmafResult;
 use crate::presets;
@@ -33,11 +34,17 @@ pub enum Msg {
     Probed(u64, Result<Box<ProbeInfo>, String>),
     Analyzed(u64, Result<worker::Analysis, String>),
     Estimate(u64, String, Result<SizeRange, String>),
-    Vmaf(u64, Result<VmafResult, String>),
+    /// The estimate key the score was measured with, checked on arrival.
+    Vmaf(u64, String, Result<VmafResult, String>),
     Progress(u64, Progress),
     Stage(u64, String),
     Finished(u64, Outcome),
+    /// Post-encode VMAF line for a finished job.
+    PostVmaf(u64, String),
 }
+
+/// Report line shown while the post-encode VMAF runs; replaced by the result.
+const POST_VMAF_PENDING: &str = "VMAF: scoring the output in the background…";
 
 pub struct State {
     pub jobs: Vec<Job>,
@@ -57,6 +64,8 @@ pub struct State {
     est_cache: HashMap<String, SizeRange>,
     pub vmaf_cancel: Option<(u64, Cancel)>,
     crop_cancel: HashMap<u64, Cancel>,
+    /// Post-encode VMAF runs, which never hold up the queue.
+    post_vmaf: HashMap<u64, Cancel>,
     pgs_session: HashMap<String, bool>,
     pgs_batch: HashMap<(u64, String), bool>,
 }
@@ -96,10 +105,29 @@ impl State {
         )
     }
 
+    /// Output path for a job: never its own input, another job's input, or the
+    /// output of a job earlier in the queue.
+    pub fn output_for(&self, job: &Job) -> std::path::PathBuf {
+        let mut taken: Vec<std::path::PathBuf> =
+            self.jobs.iter().map(|j| j.input.clone()).collect();
+        for j in &self.jobs {
+            if j.id == job.id {
+                break;
+            }
+            let written = matches!(j.state, JobState::Running | JobState::Done)
+                .then(|| j.output.clone())
+                .flatten();
+            taken.push(written.unwrap_or_else(|| {
+                queue::output_path_avoiding(&j.input, &self.prefs, j.settings.container, &taken)
+            }));
+        }
+        queue::output_path_avoiding(&job.input, &self.prefs, job.settings.container, &taken)
+    }
+
     pub fn request(&self, job: &Job) -> Option<Request> {
         let probe = job.probe.clone()?;
         Some(Request {
-            output: queue::output_path(&job.input, &self.prefs, job.settings.container),
+            output: self.output_for(job),
             device: self.device(),
             crop: job.active_crop(),
             crop_on_gpu: self.crop_on_gpu(),
@@ -107,8 +135,6 @@ impl State {
             video_kbps: self.video_kbps(job),
             dv_preserve: job.dv_preserve,
             mkvpropedit: self.caps.as_ref().is_some_and(|c| c.mkvpropedit),
-            vmaf_after: self.prefs.vmaf_after_encode
-                && self.caps.as_ref().is_some_and(|c| c.libvmaf),
             settings: job.settings.clone(),
             selection: job.selection.clone(),
             probe,
@@ -159,6 +185,7 @@ impl State {
                         job.settings.codec.label()
                     ),
                     fix: Some(checks::Fix::Codec(alt)),
+                    alt_fix: None,
                 },
             );
         }
@@ -213,11 +240,28 @@ pub struct App {
     quit_pending: RefCell<bool>,
     helpers: Helpers,
     tx: async_channel::Sender<Msg>,
+    /// A debounced preferences save is scheduled.
+    save_pending: std::cell::Cell<bool>,
 }
 
+thread_local! {
+    /// The one window of this process (the application is single-instance).
+    static INSTANCE: std::cell::RefCell<Option<Rc<App>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Show the window, creating it on first use, and queue `files`. A second
+/// launch of the app lands here too (via D-Bus), so two processes never keep
+/// separate copies of the preferences and overwrite each other's presets.
 pub fn build(app: &adw::Application, files: Vec<PathBuf>) {
+    if let Some(a) = INSTANCE.with(|i| i.borrow().clone()) {
+        a.window.present();
+        if !files.is_empty() {
+            a.add_files(files);
+        }
+        return;
+    }
     let (tx, rx) = async_channel::unbounded::<Msg>();
-    let prefs = Prefs::load();
+    let (prefs, prefs_problem) = Prefs::load_reporting();
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -367,6 +411,7 @@ pub fn build(app: &adw::Application, files: Vec<PathBuf>) {
             est_cache: HashMap::new(),
             vmaf_cancel: None,
             crop_cancel: HashMap::new(),
+            post_vmaf: HashMap::new(),
             pgs_session: HashMap::new(),
             pgs_batch: HashMap::new(),
         }),
@@ -379,6 +424,7 @@ pub fn build(app: &adw::Application, files: Vec<PathBuf>) {
         quit_pending: RefCell::new(false),
         helpers: Helpers::default(),
         tx,
+        save_pending: std::cell::Cell::new(false),
     });
 
     install_actions(&app_rc);
@@ -477,6 +523,12 @@ pub fn build(app: &adw::Application, files: Vec<PathBuf>) {
     }
 
     window.present();
+    INSTANCE.with(|i| *i.borrow_mut() = Some(app_rc.clone()));
+    if let Some(msg) = prefs_problem {
+        let t = adw::Toast::new(&msg);
+        t.set_timeout(0);
+        app_rc.toasts.add_toast(t);
+    }
     if !files.is_empty() {
         app_rc.add_files(files);
     }
@@ -509,8 +561,24 @@ impl App {
         self.toasts.add_toast(adw::Toast::new(text));
     }
 
+    /// Save the preferences 500 ms after the last change, so dragging a slider
+    /// or typing doesn't write config.json on every step.
     pub fn save_prefs(&self) {
-        self.state.borrow().prefs.save();
+        if self.save_pending.replace(true) {
+            return;
+        }
+        glib::timeout_add_local_once(Duration::from_millis(500), || {
+            if let Some(a) = INSTANCE.with(|i| i.borrow().clone()) {
+                a.flush_prefs();
+            }
+        });
+    }
+
+    /// Write a pending preferences save now (on quit).
+    pub fn flush_prefs(&self) {
+        if self.save_pending.replace(false) {
+            self.state.borrow().prefs.save();
+        }
     }
 
     fn pick_files(self: &Rc<Self>) {
@@ -594,6 +662,7 @@ impl App {
         };
         let tx = self.tx.clone();
         std::thread::spawn(move || {
+            let _slot = runner::PROBES.acquire(None);
             let r = probe::run(&ffprobe, &path).map(Box::new);
             let _ = tx.send_blocking(Msg::Probed(id, r));
         });
@@ -690,8 +759,9 @@ impl App {
     /// Called after any edit to a job's settings or tracks.
     pub fn changed(self: &Rc<Self>, id: u64) {
         {
-            let mut st = self.state.borrow_mut();
-            if let Some(j) = st.job(id).cloned() {
+            let mut guard = self.state.borrow_mut();
+            let st = &mut *guard;
+            if let Some(j) = st.jobs.iter().find(|j| j.id == id) {
                 st.prefs.last_settings = j.settings.clone();
                 st.prefs.last_preset = j.preset.clone();
             }
@@ -783,14 +853,17 @@ impl App {
                 self.update_row(id);
                 self.refresh_editor(id);
             }
-            Msg::Vmaf(id, r) => {
+            Msg::Vmaf(id, key, r) => {
                 {
                     let mut st = self.state.borrow_mut();
                     if st.vmaf_cancel.as_ref().is_some_and(|(j, _)| *j == id) {
                         st.vmaf_cancel = None;
                     }
+                    // Settings, crop or scan changed while it ran: the score is stale.
+                    let current = st.job(id).is_some_and(|j| st.estimate_key(j) == key);
                     if let Some(j) = st.job_mut(id) {
                         j.vmaf = match r {
+                            _ if !current => VmafState::None,
                             Ok(v) => VmafState::Ready(v),
                             Err(e) => VmafState::Failed(e),
                         };
@@ -815,6 +888,22 @@ impl App {
                 self.update_row_progress(id);
             }
             Msg::Finished(id, o) => self.on_finished(id, o),
+            Msg::PostVmaf(id, line) => {
+                {
+                    let mut st = self.state.borrow_mut();
+                    st.post_vmaf.remove(&id);
+                    if let Some(j) = st.job_mut(id) {
+                        match j.report.iter_mut().find(|l| *l == POST_VMAF_PENDING) {
+                            Some(l) => *l = line,
+                            None => j.report.push(line),
+                        }
+                    }
+                }
+                self.update_row(id);
+                if self.state.borrow().selected == Some(id) {
+                    self.rebuild_editor();
+                }
+            }
         }
     }
 
@@ -1057,7 +1146,10 @@ impl App {
         let guard = self.helpers.enter();
         std::thread::spawn(move || {
             let _guard = guard;
-            let r = worker::analyze(&tools, &probe, &cancel);
+            let r = match runner::HEAVY.acquire(Some(&cancel)) {
+                Some(_slot) => worker::analyze(&tools, &probe, &cancel),
+                None => Err("Cancelled".into()),
+            };
             let _ = tx.send_blocking(Msg::Analyzed(id, r));
         });
     }
@@ -1126,7 +1218,10 @@ impl App {
                 let guard = self.helpers.enter();
                 std::thread::spawn(move || {
                     let _guard = guard;
-                    let r = worker::estimate_video(&tools, &req, &cancel);
+                    let r = match runner::HEAVY.acquire(Some(&cancel)) {
+                        Some(_slot) => worker::estimate_video(&tools, &req, &cancel),
+                        None => Err("Cancelled".into()),
+                    };
                     if !cancel.is_cancelled() {
                         let _ = tx.send_blocking(Msg::Estimate(id, key, r));
                     }
@@ -1154,6 +1249,7 @@ impl App {
             return;
         };
         let Some(req) = st.request(&job) else { return };
+        let key = st.estimate_key(&job);
         let cancel = Cancel::default();
         st.vmaf_cancel = Some((id, cancel.clone()));
         let tools = st.tools.clone();
@@ -1165,10 +1261,13 @@ impl App {
         let guard = self.helpers.enter();
         std::thread::spawn(move || {
             let _guard = guard;
-            let r = worker::vmaf_samples(&tools, &req, &cancel);
+            let r = match runner::HEAVY.acquire(Some(&cancel)) {
+                Some(_slot) => worker::vmaf_samples(&tools, &req, &cancel),
+                None => Err("Cancelled".into()),
+            };
             // A cancelled run's job state was already reset by `stop_vmaf`.
             if !cancel.is_cancelled() {
-                let _ = tx.send_blocking(Msg::Vmaf(id, r));
+                let _ = tx.send_blocking(Msg::Vmaf(id, key, r));
             }
         });
         self.refresh_editor(id);
@@ -1197,10 +1296,16 @@ impl App {
     /// Cancel estimates, crop detection and VMAF (on quit), and give their
     /// threads a moment to kill ffmpeg and delete sample files before exiting.
     fn cancel_background(&self) {
+        self.flush_prefs();
         {
             let mut guard = self.state.borrow_mut();
             let st = &mut *guard;
-            for c in st.est_cancel.values().chain(st.crop_cancel.values()) {
+            for c in st
+                .est_cancel
+                .values()
+                .chain(st.crop_cancel.values())
+                .chain(st.post_vmaf.values())
+            {
                 c.cancel();
             }
             if let Some((_, c)) = st.vmaf_cancel.take() {
@@ -1230,8 +1335,7 @@ impl App {
                 .collect()
         };
         if warnings.is_empty() {
-            self.state.borrow_mut().queue_active = true;
-            self.run_next();
+            self.confirm_replacements();
             return;
         }
         let d = adw::AlertDialog::new(Some("Start Anyway?"), Some(&warnings.join("\n\n")));
@@ -1241,9 +1345,76 @@ impl App {
         let a = self.clone();
         d.connect_response(None, move |_, resp| {
             if resp == "start" {
-                a.state.borrow_mut().queue_active = true;
-                a.run_next();
+                a.confirm_replacements();
             }
+        });
+        d.present(Some(&self.window));
+    }
+
+    /// Ask once, up front, about every queued job whose output already exists,
+    /// so an unattended queue doesn't stop half-way at a "Replace?" dialog.
+    fn confirm_replacements(self: &Rc<Self>) {
+        let existing: Vec<(u64, PathBuf)> = {
+            let st = self.state.borrow();
+            st.jobs
+                .iter()
+                .filter(|j| j.state == JobState::Pending)
+                .map(|j| (j.id, st.output_for(j)))
+                .filter(|(id, out)| {
+                    out.exists() && st.job(*id).and_then(|j| j.replace_ok.as_ref()) != Some(out)
+                })
+                .collect()
+        };
+        let begin = |a: &Rc<Self>| {
+            a.state.borrow_mut().queue_active = true;
+            a.run_next();
+            a.update_start();
+        };
+        if existing.is_empty() {
+            begin(self);
+            return;
+        }
+        let list: Vec<String> = existing
+            .iter()
+            .map(|(_, p)| format!("• {}", p.display()))
+            .collect();
+        let d = adw::AlertDialog::new(
+            Some("Replace Existing Files?"),
+            Some(&format!(
+                "These output files already exist. Replacing overwrites their contents.\n\n{}",
+                list.join("\n")
+            )),
+        );
+        d.add_responses(&[
+            ("cancel", "Cancel"),
+            ("skip", "Skip Those Jobs"),
+            ("replace", "Replace All"),
+        ]);
+        d.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
+        d.set_close_response("cancel");
+        let a = self.clone();
+        d.connect_response(None, move |_, resp| {
+            if resp == "cancel" {
+                return;
+            }
+            let mut skipped = Vec::new();
+            for (id, out) in &existing {
+                let mut st = a.state.borrow_mut();
+                let Some(j) = st.job_mut(*id).filter(|j| j.state == JobState::Pending) else {
+                    continue;
+                };
+                if resp == "replace" {
+                    j.replace_ok = Some(out.clone());
+                } else {
+                    j.apply(Event::Cancel);
+                    j.error = Some("Output file already exists".into());
+                    skipped.push(*id);
+                }
+            }
+            for id in skipped {
+                a.update_row(id);
+            }
+            begin(&a);
         });
         d.present(Some(&self.window));
     }
@@ -1284,12 +1455,15 @@ impl App {
                 self.run_next();
                 return;
             }
-            (
-                id,
-                queue::output_path(&j.input, &st.prefs, j.settings.container),
-            )
+            (id, st.output_for(j))
         };
-        if output.exists() {
+        let approved = self
+            .state
+            .borrow()
+            .job(id)
+            .is_some_and(|j| j.replace_ok.as_ref() == Some(&output));
+        // Fallback for an output that appeared after Start was pressed.
+        if output.exists() && !approved {
             self.state.borrow_mut().replace_pending = Some(id);
             self.update_start();
             let d = adw::AlertDialog::new(
@@ -1405,6 +1579,9 @@ impl App {
             return;
         }
         let state = self.state.borrow().job(id).map(|j| j.state);
+        if state == Some(JobState::Done) {
+            self.start_post_vmaf(id);
+        }
         match state {
             Some(JobState::Failed) => self.toast(&format!("Encoding failed: {name}")),
             Some(JobState::Done) => self.toast(&format!("Finished: {name}")),
@@ -1417,6 +1594,44 @@ impl App {
         }
         self.update_start();
         self.run_next();
+    }
+
+    /// Score the finished output in the background (opt-in), so the next job
+    /// can start straight away.
+    fn start_post_vmaf(self: &Rc<Self>, id: u64) {
+        let mut st = self.state.borrow_mut();
+        let wanted = st.prefs.vmaf_after_encode && st.caps.as_ref().is_some_and(|c| c.libvmaf);
+        let Some(job) = st
+            .job(id)
+            .filter(|j| j.settings.codec != VideoCodec::Copy)
+            .cloned()
+        else {
+            return;
+        };
+        if !wanted {
+            return;
+        }
+        let Some(req) = st.request(&job) else { return };
+        let cancel = Cancel::default();
+        st.post_vmaf.insert(id, cancel.clone());
+        let tools = st.tools.clone();
+        if let Some(j) = st.job_mut(id) {
+            j.report.push(POST_VMAF_PENDING.into());
+        }
+        drop(st);
+        let tx = self.tx.clone();
+        let guard = self.helpers.enter();
+        std::thread::spawn(move || {
+            let _guard = guard;
+            let _slot = runner::HEAVY.acquire(Some(&cancel));
+            let line = match worker::vmaf_output(&tools, &req, &cancel) {
+                Ok(r) => crate::ffmpeg::vmaf::describe(r, req.probe.hdr.is_hdr()),
+                Err(e) => format!("VMAF failed: {e}"),
+            };
+            if !cancel.is_cancelled() {
+                let _ = tx.send_blocking(Msg::PostVmaf(id, line));
+            }
+        });
     }
 
     fn cancel_or_remove(self: &Rc<Self>, id: u64) {
@@ -1442,7 +1657,7 @@ impl App {
         {
             let mut guard = self.state.borrow_mut();
             let st = &mut *guard;
-            for map in [&mut st.est_cancel, &mut st.crop_cancel] {
+            for map in [&mut st.est_cancel, &mut st.crop_cancel, &mut st.post_vmaf] {
                 if let Some(c) = map.remove(&id) {
                     c.cancel();
                 }
@@ -1519,9 +1734,10 @@ impl App {
         let n = targets.len();
         for t in targets {
             self.edit(t, |j| {
+                let reset = j.settings.audio_defaults_differ(&src.settings);
                 j.settings = src.settings.clone();
                 j.preset = src.preset.clone();
-                if let Some(p) = &j.probe {
+                if reset && let Some(p) = &j.probe {
                     j.selection.reset_actions(p, &j.settings);
                 }
             });
@@ -1537,9 +1753,10 @@ impl App {
             return;
         };
         self.edit(id, |j| {
+            let reset = j.settings.audio_defaults_differ(&p.settings);
             j.settings = p.settings.clone();
             j.preset = p.name.clone();
-            if let Some(pr) = &j.probe {
+            if reset && let Some(pr) = &j.probe {
                 j.selection.reset_actions(pr, &j.settings);
             }
         });
@@ -1592,7 +1809,9 @@ impl App {
 
     pub fn apply_fix(self: &Rc<Self>, id: u64, fix: checks::Fix) {
         self.edit(id, |j| {
-            if let Some(p) = j.probe.clone() {
+            if fix == checks::Fix::NoCrop {
+                j.crop_enabled = false;
+            } else if let Some(p) = j.probe.clone() {
                 checks::apply_fix(fix, &p, &mut j.settings, &mut j.selection);
             }
         });

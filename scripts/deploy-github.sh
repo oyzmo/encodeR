@@ -135,8 +135,29 @@ else
         echo
         echo "Source: $(git rev-parse --short "$BRANCH")"
     } >"$INDEX.msg"
+    # The message becomes public too (and the release notes): same check.
+    if [ -s "$LEAKS_FILE" ] && grep -q -i -E -f "$LEAKS_FILE" "$INDEX.msg"; then
+        echo "error: private strings in the commit subjects to publish:" >&2
+        grep -n -i -E -f "$LEAKS_FILE" "$INDEX.msg" >&2
+        exit 1
+    fi
     COMMIT=$(GIT_AUTHOR_NAME=$AUTHOR GIT_AUTHOR_EMAIL=$EMAIL GIT_COMMITTER_NAME=$AUTHOR GIT_COMMITTER_EMAIL=$EMAIL \
         git commit-tree "$TREE" ${PARENT:+-p "$PARENT"} -F "$INDEX.msg")
+fi
+
+# A tag left behind by a half-finished release: reuse it if it's this commit.
+TAG_DONE=0
+if [ "$RELEASE" = 1 ]; then
+    remote_tag=$(git ls-remote --tags github "refs/tags/$TAG" 2>/dev/null | cut -f1)
+    if [ -n "$remote_tag" ]; then
+        if [ "$remote_tag" = "$COMMIT" ]; then
+            TAG_DONE=1
+        else
+            echo "error: GitHub already has tag $TAG on another commit (${remote_tag:0:7})." >&2
+            echo "Bump the version, or delete the tag on GitHub if that release was never finished." >&2
+            exit 1
+        fi
+    fi
 fi
 
 if [ "$COMMIT" = "$PARENT" ] && [ "$RELEASE" = 0 ]; then
@@ -163,7 +184,7 @@ fi
 [ "$COMMIT" = "$PARENT" ] || git push github "$COMMIT:refs/heads/$BRANCH"
 
 if [ "$RELEASE" = 1 ]; then
-    git push github "$COMMIT:refs/tags/$TAG"
+    [ "$TAG_DONE" = 1 ] || git push github "$COMMIT:refs/tags/$TAG"
     gh release create "$TAG" --repo "$REPO" --verify-tag --title "encodeR $VERSION" \
         --notes "$(git log -1 --format=%b "$COMMIT" | sed '/^Source: /d')
 

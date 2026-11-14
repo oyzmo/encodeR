@@ -47,7 +47,6 @@ pub struct Request {
     pub video_kbps: Option<u32>,
     pub dv_preserve: bool,
     pub mkvpropedit: bool,
-    pub vmaf_after: bool,
 }
 
 impl Request {
@@ -160,20 +159,47 @@ fn run_with_fallback(
     }
 }
 
+/// Where an encode writes until it succeeds: `Film-reencoded.part.mkv`. A
+/// crash or power loss then never leaves a truncated file under the final name.
+pub fn partial_path(output: &Path) -> PathBuf {
+    let stem = output.file_stem().unwrap_or_default().to_string_lossy();
+    let name = match output.extension() {
+        Some(ext) => format!("{stem}.part.{}", ext.to_string_lossy()),
+        None => format!("{stem}.part"),
+    };
+    output.with_file_name(name)
+}
+
 pub fn encode(
     tools: &Tools,
     req: &Request,
     cancel: &Cancel,
     mut update: impl FnMut(Update),
 ) -> Outcome {
-    let result = if req.dv_preserve && req.probe.hdr.dovi.is_some() {
-        encode_dv(tools, req, cancel, &mut update)
+    // Last line of defence: the queue picks outputs that aren't the input, but
+    // a failed or cancelled job deletes its output, so check the real file.
+    let part = partial_path(&req.output);
+    if [&req.output, &part]
+        .iter()
+        .any(|o| crate::queue::same_file(o, &req.probe.path))
+    {
+        return fail(
+            "The output file would overwrite the input (same file under another path)",
+            Vec::new(),
+        );
+    }
+    let work = Request {
+        output: part.clone(),
+        ..req.clone()
+    };
+    let result = if work.dv_preserve && work.probe.hdr.dovi.is_some() {
+        encode_dv(tools, &work, cancel, &mut update)
     } else {
         run_with_fallback(
             tools,
-            req,
-            |d| command::build(&req.job(&req.output, d)),
-            &req.output,
+            &work,
+            |d| command::build(&work.job(&work.output, d)),
+            &work.output,
             cancel,
             &mut update,
         )
@@ -182,6 +208,13 @@ pub fn encode(
         Ok(d) => d,
         Err(o) => return o,
     };
+    if let Err(e) = std::fs::rename(&part, &req.output) {
+        let _ = std::fs::remove_file(&part);
+        return fail(
+            format!("Couldn't move the finished file into place: {e}"),
+            Vec::new(),
+        );
+    }
     let encoded = req.settings.codec != VideoCodec::Copy;
     let mut out = Outcome {
         success: true,
@@ -192,14 +225,6 @@ pub fn encode(
     if req.settings.codec != VideoCodec::Copy {
         update(Update::Stage("Checking output".into()));
         out.report.extend(hdr_report(tools, req));
-        if req.vmaf_after {
-            update(Update::Stage("Scoring quality (VMAF)".into()));
-            match vmaf_output(tools, req, cancel) {
-                Ok(r) => out.report.push(vmaf::describe(r, req.probe.hdr.is_hdr())),
-                Err(e) if cancel.is_cancelled() => out.report.push(format!("VMAF skipped: {e}")),
-                Err(e) => out.report.push(format!("VMAF failed: {e}")),
-            }
-        }
     }
     out
 }
@@ -210,8 +235,8 @@ fn size_report(req: &Request) -> String {
     if req.settings.bitrate_from_target() && req.settings.codec != VideoCodec::Copy {
         let target = req.settings.target_gb * estimate::GB;
         s.push_str(&format!(
-            " · target {:.1} GB ({:+.1}%)",
-            req.settings.target_gb,
+            " · target {} ({:+.1}%)",
+            estimate::format_bytes(target as u64),
             (actual as f64 / target - 1.0) * 100.0
         ));
     }
@@ -255,7 +280,9 @@ fn hdr_report(tools: &Tools, req: &Request) -> Vec<String> {
             return vec!["HDR10 mastering metadata was missing; written into the MKV header with mkvpropedit".into()];
         }
     }
-    let fix = if Path::new("/.flatpak-info").exists() {
+    let fix = if req.settings.container != Container::Mkv {
+        "Only MKV outputs can be repaired afterwards; use MKV to keep it."
+    } else if Path::new("/.flatpak-info").exists() {
         "The Flatpak can't repair this; the native install can, with mkvtoolnix installed."
     } else {
         "Install mkvtoolnix to repair MKV files automatically."
@@ -367,15 +394,29 @@ fn encode_dv(
         )?;
         let encoded: Option<u64> = count.stdout.trim().parse().ok();
         let rpu_frames = hdr::parse_rpu_frames(&info.stdout);
-        if let (Some(a), Some(b)) = (encoded, rpu_frames)
-            && a != b
-        {
-            return Err(fail(
-                format!(
-                    "Frame counts differ: encoded {a}, RPU {b}. Dolby Vision can't be injected safely."
-                ),
-                Vec::new(),
-            ));
+        // An unreadable count is a failure too: injecting unverified would put
+        // per-frame metadata on the wrong frames.
+        match (encoded, rpu_frames) {
+            (Some(a), Some(b)) if a == b => {}
+            (Some(a), Some(b)) => {
+                return Err(fail(
+                    format!(
+                        "Frame counts differ: encoded {a}, RPU {b}. Dolby Vision can't be injected safely."
+                    ),
+                    Vec::new(),
+                ));
+            }
+            (a, b) => {
+                let show = |n: Option<u64>| n.map_or("unreadable".to_string(), |n| n.to_string());
+                return Err(fail(
+                    format!(
+                        "Couldn't verify the frame counts (encoded {}, RPU {}), so Dolby Vision can't be injected safely. Turn off Dolby Vision preservation to get HDR10.",
+                        show(a),
+                        show(b)
+                    ),
+                    info.stdout.lines().take(20).map(String::from).collect(),
+                ));
+            }
         }
         update(Update::Stage("Dolby Vision · injecting RPU".into()));
         step(
@@ -402,9 +443,10 @@ fn encode_dv(
             let _ = std::fs::remove_file(&req.output);
             return Err(fail("Muxing failed", r.stderr_tail));
         }
-        // Verify the DV configuration made it into the container.
+        // Verify the DV configuration made it into the container. A failed
+        // check deletes the output like every other failure.
         let expect = if dovi.profile == 5 { 5 } else { 8 };
-        match probe::run(&tools.ffprobe, &req.output)
+        let verdict = match probe::run(&tools.ffprobe, &req.output)
             .ok()
             .and_then(|p| p.hdr.dovi)
         {
@@ -420,7 +462,11 @@ fn encode_dv(
                 "Dolby Vision metadata is missing from the output",
                 Vec::new(),
             )),
+        };
+        if verdict.is_err() {
+            let _ = std::fs::remove_file(&req.output);
         }
+        verdict
     })();
     cleanup();
     result
@@ -565,7 +611,8 @@ pub fn vmaf_samples(tools: &Tools, req: &Request, cancel: &Cancel) -> Result<Vma
 }
 
 /// After encoding: score segments of the finished file at the sample timestamps.
-fn vmaf_output(tools: &Tools, req: &Request, cancel: &Cancel) -> Result<VmafResult, String> {
+/// Runs as a background helper after the job is done, never inside the encode.
+pub fn vmaf_output(tools: &Tools, req: &Request, cancel: &Cancel) -> Result<VmafResult, String> {
     let v = req.probe.video.as_ref().ok_or("No video")?;
     let mut scores = Vec::new();
     for (start, secs) in estimate::sample_segments(req.probe.duration) {
@@ -601,7 +648,10 @@ mod media_tests {
     use crate::tracks::{AudioAction, auto_select};
 
     fn media(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        // Read at run time: the target folder is shared between the VM and the
+        // host under different paths, so a compiled-in path can point nowhere.
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from)
             .join("dev/media")
             .join(name)
     }
@@ -641,7 +691,6 @@ mod media_tests {
             video_kbps: None,
             dv_preserve: false,
             mkvpropedit: false,
-            vmaf_after: false,
         };
         let mut progress = 0;
         let o = encode(&t, &req, &Cancel::default(), |u| {
@@ -848,7 +897,6 @@ mod media_tests {
             video_kbps: None,
             dv_preserve: false,
             mkvpropedit: false,
-            vmaf_after: false,
         };
         assert_eq!(req.first_decode(), DecodeMode::Hardware);
         match estimate_video(&t, &req, &Cancel::default()) {

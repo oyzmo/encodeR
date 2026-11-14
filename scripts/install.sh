@@ -136,6 +136,11 @@ is_author() { git remote get-url nas >/dev/null 2>&1; }
 
 bump_version() {
     local level
+    # The bump commit must hold only the version change.
+    if ! git diff --quiet HEAD -- Cargo.toml Cargo.lock; then
+        echo "Cargo.toml or Cargo.lock has uncommitted changes; commit or revert them first." >&2
+        return 0
+    fi
     echo "Now at $VERSION."
     read -rp "Bump which part? [p]atch (fixes) / [m]inor (features) / ma[j]or: " level || { echo; level=; }  # Ctrl+D cancels
     case "$level" in
@@ -147,7 +152,13 @@ bump_version() {
     scripts/bump.sh "$level"
     local new
     new=$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' Cargo.toml | head -1)
-    git commit -q -m "encodeR $new" -- Cargo.toml Cargo.lock
+    # The app's Changelog page (and a unit test) need an entry for every version.
+    if ! grep -qx "## $new" CHANGELOG.md; then
+        git checkout -q -- Cargo.toml Cargo.lock
+        echo "CHANGELOG.md has no \"## $new\" section. Add it first, then bump again (still at $VERSION)." >&2
+        return 0
+    fi
+    git commit -q -m "encodeR $new" -- Cargo.toml Cargo.lock CHANGELOG.md
     echo "Committed encodeR $new."
 }
 

@@ -149,5 +149,19 @@ done
 if command -v dovi_tool >/dev/null && [ -n "${DV_CLIP:-}" ]; then
     run "$DV_CLIP" "T hevc cq"
 fi
+
+# The app's GPU crop chain must really crop (exiting 0 isn't proof).
+echo "--- GPU crop: crop + scale_vaapi, expect 512,272" | tee -a "$LOG"
+ffmpeg -hide_banner -v error -y -vaapi_device /dev/dri/renderD128 -f lavfi -i testsrc2=size=640x360:rate=25 \
+    -frames:v 2 -vf "format=nv12,hwupload,crop=512:272:0:44,scale_vaapi=w=512:h=272" \
+    -c:v hevc_vaapi -rc_mode CQP -qp 25 "$OUT/gpucrop.mkv" 2>&1 | tee -a "$LOG"
+echo "got $(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$OUT/gpucrop.mkv" 2>/dev/null)" | tee -a "$LOG"
+
+# The real-ffmpeg unit tests (`#[ignore]`d in the VM, which has no VA-API).
+if [ "$FLATPAK" = 0 ] && [ -x dev/make-media.sh ]; then
+    echo "--- Media tests (cargo test -- --ignored)" | tee -a "$LOG"
+    [ -f dev/media/sample.mkv ] || dev/make-media.sh >/dev/null
+    cargo test -q -- --ignored 2>&1 | grep -E -A2 "test result|FAILED|panicked" | tee -a "$LOG"
+fi
 echo
 echo "Full report: $LOG"

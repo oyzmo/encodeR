@@ -159,9 +159,14 @@ fn video_filter(job: &EncodeJob) -> Option<String> {
         }
         DecodeMode::Hardware => {
             let mut fmt_done = false;
+            // On VA-API frames `crop` only sets the frame's crop fields; the
+            // encoders don't promise to honour them, so a GPU crop is always
+            // followed by `scale_vaapi`, whose VPP pass applies it.
+            let mut gpu_crop = None;
             if let Some(c) = job.crop {
                 if job.crop_on_gpu {
                     parts.push(c.filter());
+                    gpu_crop = Some(c);
                 } else {
                     // Round trip through system memory; costs some speed.
                     parts.push(format!(
@@ -172,18 +177,23 @@ fn video_filter(job: &EncodeJob) -> Option<String> {
                 }
             }
             let convert = !fmt_done && src_fmt != out_fmt;
-            match (scale, convert) {
-                (Some(h), true) => parts.push(format!("scale_vaapi=w=-2:h={h}:format={out_fmt}")),
-                (Some(h), false) => parts.push(format!("scale_vaapi=w=-2:h={h}")),
-                (None, true) => parts.push(format!("scale_vaapi=format={out_fmt}")),
-                (None, false) => {}
+            let fmt = if convert {
+                format!(":format={out_fmt}")
+            } else {
+                String::new()
+            };
+            match (scale, gpu_crop) {
+                (Some(h), _) => parts.push(format!("scale_vaapi=w=-2:h={h}{fmt}")),
+                (None, Some(c)) => parts.push(format!("scale_vaapi=w={}:h={}{fmt}", c.w, c.h)),
+                (None, None) if convert => parts.push(format!("scale_vaapi=format={out_fmt}")),
+                (None, None) => {}
             }
         }
     }
     (!parts.is_empty()).then(|| parts.join(","))
 }
 
-fn rate_control(a: &mut Args, job: &EncodeJob) {
+fn rate_control(a: &mut Args, job: &EncodeJob) -> Result<(), String> {
     let s = job.settings;
     let rc = s.effective_rate_control();
     a.kv("-rc_mode", rc.ffmpeg_name());
@@ -194,11 +204,21 @@ fn rate_control(a: &mut Args, job: &EncodeJob) {
     };
     if rc == RateControl::Cqp {
         quality(a);
-        return;
+        return Ok(());
     }
     let from_target = s.bitrate_from_target();
     let kbps = if from_target {
-        job.video_kbps.unwrap_or(s.bitrate_kbps)
+        // Never fall back to the hidden manual bitrate: the target-size UI
+        // doesn't show it, and it would miss the target by gigabytes.
+        job.video_kbps.ok_or_else(|| {
+            if job.probe.duration > 0.0 {
+                "The target size is too small: the selected audio and subtitles leave no room for the video. Pick a larger target or convert the audio."
+                    .to_string()
+            } else {
+                "The file's duration is unknown, so a target size can't be turned into a bitrate. Use constant quality instead."
+                    .to_string()
+            }
+        })?
     } else {
         s.bitrate_kbps
     };
@@ -213,6 +233,7 @@ fn rate_control(a: &mut Args, job: &EncodeJob) {
     a.kv("-b:v", format!("{kbps}k"));
     a.kv("-maxrate", format!("{max}k"));
     a.kv("-bufsize", format!("{}k", max * 2));
+    Ok(())
 }
 
 fn disposition_flags(flags: &[&str]) -> String {
@@ -278,7 +299,7 @@ pub fn build(job: &EncodeJob) -> Result<Vec<OsString>, String> {
         None => a.add(&["-c:v", "copy"]),
         Some(enc) => {
             a.kv("-c:v", enc);
-            rate_control(&mut a, job);
+            rate_control(&mut a, job)?;
             match (s.codec, s.output_ten_bit()) {
                 (VideoCodec::Hevc, true) => a.add(&["-profile:v", "main10"]),
                 (VideoCodec::Hevc, false) => a.add(&["-profile:v", "main"]),
@@ -346,6 +367,9 @@ pub fn build(job: &EncodeJob) -> Result<Vec<OsString>, String> {
             }
             AudioAction::Flac => a.kv(spec("c"), "flac"),
         }
+        // Keep the source's flags, except `default`, which goes to the chosen
+        // main track only.
+        let d = &src.disposition;
         let mut flags = Vec::new();
         if i == 0 {
             flags.push("default");
@@ -355,6 +379,17 @@ pub fn build(job: &EncodeJob) -> Result<Vec<OsString>, String> {
         }
         if is_audio_description(src) {
             flags.push("visual_impaired");
+        }
+        for (on, name) in [
+            (d.original, "original"),
+            (d.dub, "dub"),
+            (d.hearing_impaired, "hearing_impaired"),
+            (d.clean_effects, "clean_effects"),
+            (d.descriptions, "descriptions"),
+        ] {
+            if on {
+                flags.push(name);
+            }
         }
         a.kv(spec("disposition"), disposition_flags(&flags));
     }
@@ -369,12 +404,35 @@ pub fn build(job: &EncodeJob) -> Result<Vec<OsString>, String> {
             "copy"
         };
         a.kv(format!("-c:s:{i}"), codec);
-        let flags: &[&str] = match sub_kind(src) {
-            SubKind::Forced => &["forced"],
-            SubKind::Sdh => &["hearing_impaired"],
-            SubKind::Full => &[],
-        };
-        a.kv(format!("-disposition:s:{i}"), disposition_flags(flags));
+        let kind = sub_kind(src);
+        let d = &src.disposition;
+        let mut flags: Vec<&str> = Vec::new();
+        match kind {
+            // `default+forced` is how players are told to show a forced track
+            // on their own, so a forced track keeps its source `default`.
+            SubKind::Forced => {
+                if d.default {
+                    flags.push("default");
+                }
+                flags.push("forced");
+            }
+            SubKind::Sdh => flags.push("hearing_impaired"),
+            SubKind::Commentary => flags.push("comment"),
+            SubKind::Full => {}
+        }
+        if kind != SubKind::Sdh && d.hearing_impaired {
+            flags.push("hearing_impaired");
+        }
+        for (on, name) in [
+            (d.descriptions, "descriptions"),
+            (d.lyrics, "lyrics"),
+            (d.karaoke, "karaoke"),
+        ] {
+            if on {
+                flags.push(name);
+            }
+        }
+        a.kv(format!("-disposition:s:{i}"), disposition_flags(&flags));
     }
 
     if !job.video_only {
@@ -453,6 +511,9 @@ pub fn build_dv_mux(job: &EncodeJob, raw_video: &Path) -> Result<Vec<OsString>, 
         .unwrap_or_else(|| "24/1".into());
     let mut copy_settings = job.settings.clone();
     copy_settings.codec = VideoCodec::Copy;
+    // Extra arguments are meant for the encode; filters or encoder options
+    // would make this stream-copy mux fail after the whole encode.
+    copy_settings.extra_args.clear();
     let inner = EncodeJob {
         settings: &copy_settings,
         crop: None,
@@ -461,7 +522,8 @@ pub fn build_dv_mux(job: &EncodeJob, raw_video: &Path) -> Result<Vec<OsString>, 
     let mut args = build(&inner)?;
     // Insert the raw stream as input 1 after the source input and remap the video.
     let src_pos = args.iter().position(|x| x == "-i").ok_or("no input")? + 2;
-    let extra: Vec<OsString> = ["-f", "hevc", "-framerate"]
+    // A raw stream has no timestamps; generate them (B-frames reorder frames).
+    let extra: Vec<OsString> = ["-fflags", "+genpts", "-f", "hevc", "-framerate"]
         .iter()
         .map(OsString::from)
         .chain([OsString::from(&fps), "-i".into(), raw_video.into()])
@@ -533,6 +595,12 @@ mod tests {
             .collect()
     }
 
+    /// Target-size jobs need the bitrate the window computes.
+    fn kbps(mut j: EncodeJob) -> EncodeJob {
+        j.video_kbps = Some(4000);
+        j
+    }
+
     fn has(args: &[String], seq: &[&str]) -> bool {
         args.windows(seq.len())
             .any(|w| w.iter().zip(seq).all(|(a, b)| a == b))
@@ -548,7 +616,8 @@ mod tests {
         };
         let (sel, _, _) = auto_select(&p, &langs(), &s);
         let out = Path::new("/out/movie-reencoded.mkv");
-        let job = EncodeJob::new(&p, &s, &sel, out, "/dev/dri/renderD128");
+        let mut job = EncodeJob::new(&p, &s, &sel, out, "/dev/dri/renderD128");
+        job.video_kbps = Some(4000);
         let a: Vec<String> = build(&job)
             .unwrap()
             .into_iter()
@@ -645,7 +714,7 @@ mod tests {
         let s = EncodeSettings::default();
         let (sel, _, _) = auto_select(&p, &langs(), &s);
         let out = Path::new("/o.mkv");
-        let a: Vec<String> = build(&EncodeJob::new(&p, &s, &sel, out, "/d"))
+        let a: Vec<String> = build(&kbps(EncodeJob::new(&p, &s, &sel, out, "/d")))
             .unwrap()
             .into_iter()
             .map(|x| x.into_string().unwrap())
@@ -663,11 +732,17 @@ mod tests {
             c.selected = c.index == 1;
         }
         let out = Path::new("/o.mkv");
-        let a: Vec<String> = build(&EncodeJob::new(&p, &s, &sel, out, "/dev/dri/renderD128"))
-            .unwrap()
-            .into_iter()
-            .map(|x| x.into_string().unwrap())
-            .collect();
+        let a: Vec<String> = build(&kbps(EncodeJob::new(
+            &p,
+            &s,
+            &sel,
+            out,
+            "/dev/dri/renderD128",
+        )))
+        .unwrap()
+        .into_iter()
+        .map(|x| x.into_string().unwrap())
+        .collect();
         assert!(has(
             &a,
             &["-c:a:0", "eac3", "-b:a:0", "640k", "-ac:a:0", "6"]
@@ -677,7 +752,7 @@ mod tests {
             kbps: 256,
             stereo: true,
         };
-        let a: Vec<String> = build(&EncodeJob::new(&p, &s, &sel, out, "/d"))
+        let a: Vec<String> = build(&kbps(EncodeJob::new(&p, &s, &sel, out, "/d")))
             .unwrap()
             .into_iter()
             .map(|x| x.into_string().unwrap())
@@ -1006,6 +1081,7 @@ mod tests {
         let (sel, _, _) = auto_select(&p, &langs(), &s);
         let out = Path::new("/tmp/v.hevc");
         let mut job = EncodeJob::new(&p, &s, &sel, out, "/d");
+        job.video_kbps = Some(4000);
         job.video_only = true;
         job.raw_hevc = true;
         let a: Vec<String> = build(&job)
@@ -1070,5 +1146,87 @@ mod tests {
             output_dimensions(&p, &EncodeSettings::default(), crop),
             Some((3840, 1608))
         );
+    }
+
+    #[test]
+    fn target_mode_without_a_bitrate_refuses() {
+        let p = sample_4k();
+        let s = EncodeSettings::default();
+        let (sel, _, _) = auto_select(&p, &langs(), &s);
+        let out = Path::new("/out/movie-reencoded.mkv");
+        let job = EncodeJob::new(&p, &s, &sel, out, "/dev/dri/renderD128");
+        assert!(job.video_kbps.is_none());
+        let e = build(&job).unwrap_err();
+        assert!(e.contains("target size is too small"), "{e}");
+        let mut p0 = p.clone();
+        p0.duration = 0.0;
+        let job = EncodeJob::new(&p0, &s, &sel, out, "/dev/dri/renderD128");
+        assert!(build(&job).unwrap_err().contains("duration is unknown"));
+    }
+
+    #[test]
+    fn gpu_crop_is_always_applied_by_scale_vaapi() {
+        let crop = Some(Crop {
+            w: 3840,
+            h: 1608,
+            x: 0,
+            y: 276,
+        });
+        let a = args_for(&EncodeSettings::default(), |j| {
+            j.crop = crop;
+            j.crop_on_gpu = true;
+        });
+        assert!(has(
+            &a,
+            &["-vf", "crop=3840:1608:0:276,scale_vaapi=w=3840:h=1608"]
+        ));
+    }
+
+    #[test]
+    fn dv_mux_ignores_extra_args_and_generates_timestamps() {
+        let p = sample_4k();
+        let s = EncodeSettings {
+            extra_args: "-vf eq=contrast=1.1".into(),
+            ..Default::default()
+        };
+        let (sel, _, _) = auto_select(&p, &langs(), &s);
+        let job = EncodeJob::new(&p, &s, &sel, Path::new("/out/x.mkv"), "/d");
+        let m: Vec<String> = build_dv_mux(&job, Path::new("/tmp/v_dv.hevc"))
+            .unwrap()
+            .into_iter()
+            .map(|x| x.into_string().unwrap())
+            .collect();
+        assert!(!m.contains(&"eq=contrast=1.1".to_string()));
+        assert!(has(&m, &["-fflags", "+genpts", "-f", "hevc"]));
+    }
+
+    #[test]
+    fn dispositions_keep_source_flags() {
+        let mut p = sample_4k();
+        // Forced English subtitles flagged default+forced; English audio flagged original.
+        p.subtitles
+            .iter_mut()
+            .find(|s| s.index == 9)
+            .unwrap()
+            .disposition
+            .default = true;
+        p.audio
+            .iter_mut()
+            .find(|a| a.index == 2)
+            .unwrap()
+            .disposition
+            .original = true;
+        let s = EncodeSettings::default();
+        let (sel, _, _) = auto_select(&p, &langs(), &s);
+        let out = Path::new("/out/movie-reencoded.mkv");
+        let mut job = EncodeJob::new(&p, &s, &sel, out, "/dev/dri/renderD128");
+        job.video_kbps = Some(4000);
+        let a: Vec<String> = build(&job)
+            .unwrap()
+            .into_iter()
+            .map(|x| x.into_string().unwrap())
+            .collect();
+        assert!(a.iter().any(|x| x == "default+forced"), "{a:?}");
+        assert!(a.iter().any(|x| x.contains("original")), "{a:?}");
     }
 }

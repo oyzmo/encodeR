@@ -367,18 +367,62 @@ pub fn detect(ffmpeg: &str, ffprobe: &str, configured_device: Option<&str>) -> C
         .into_iter()
         .find(|c| caps.codec(*c).available)
     {
-        let enc = c.encoder().unwrap_or_default();
-        let q = quality_args(c);
-        let args = test_args(
-            &device,
-            enc,
-            "nv12",
-            &["-rc_mode", "CQP", q[0], q[1]],
-            ",crop=512:272:0:44",
-        );
-        caps.crop_on_gpu = runner::run_capture(ffmpeg, &args, &cancel).is_ok_and(|r| r.success);
+        caps.crop_on_gpu = probe_gpu_crop(ffmpeg, ffprobe, &device, c, &cancel);
     }
     caps
+}
+
+/// Encode with the app's GPU crop chain (`crop` + `scale_vaapi`) and check that
+/// the output really is the cropped size: exiting 0 isn't proof the crop applied.
+fn probe_gpu_crop(
+    ffmpeg: &str,
+    ffprobe: &str,
+    device: &str,
+    c: VideoCodec,
+    cancel: &Cancel,
+) -> bool {
+    let enc = c.encoder().unwrap_or_default();
+    let q = quality_args(c);
+    let mut args = test_args(
+        device,
+        enc,
+        "nv12",
+        &["-rc_mode", "CQP", q[0], q[1]],
+        ",crop=512:272:0:44,scale_vaapi=w=512:h=272",
+    );
+    let dir = crate::settings::cache_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let out = dir.join(format!("capcrop-{}.mkv", std::process::id()));
+    // Replace the trailing `-f null -` with a real file to probe.
+    args.truncate(args.len() - 3);
+    args.extend([
+        "-y".into(),
+        "-f".into(),
+        "matroska".into(),
+        out.clone().into(),
+    ]);
+    let ok = runner::run_capture(ffmpeg, &args, cancel).is_ok_and(|r| r.success) && {
+        let probe: Vec<OsString> = [
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+        ]
+        .iter()
+        .map(OsString::from)
+        .chain([out.clone().into()])
+        .collect();
+        runner::run_capture(ffprobe, &probe, cancel)
+            .is_ok_and(|r| r.success && r.stdout.trim() == "512,272")
+    };
+    let _ = std::fs::remove_file(&out);
+    ok
 }
 
 #[cfg(test)]

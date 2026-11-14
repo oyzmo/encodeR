@@ -15,6 +15,11 @@ pub struct Disposition {
     pub comment: bool,
     pub visual_impaired: bool,
     pub descriptions: bool,
+    pub original: bool,
+    pub dub: bool,
+    pub clean_effects: bool,
+    pub lyrics: bool,
+    pub karaoke: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -267,6 +272,11 @@ fn disposition(v: &Value) -> Disposition {
         comment: d("comment"),
         visual_impaired: d("visual_impaired"),
         descriptions: d("descriptions"),
+        original: d("original"),
+        dub: d("dub"),
+        clean_effects: d("clean_effects"),
+        lyrics: d("lyrics"),
+        karaoke: d("karaoke"),
     }
 }
 
@@ -288,12 +298,19 @@ fn bit_depth(pix_fmt: &str, raw: Option<u32>) -> u32 {
     if let Some(b) = raw.filter(|b| *b > 0) {
         return b;
     }
-    if pix_fmt.contains("12") {
-        12
-    } else if pix_fmt.contains("10") || pix_fmt == "p010le" {
-        10
-    } else {
-        8
+    // The depth is the number after the last 'p' ("yuv420p10le" → 10,
+    // "p010le" → 10, "nv12" / "yuv410p" → 8).
+    let f = pix_fmt.trim_end_matches("le").trim_end_matches("be");
+    let digits: String = f
+        .rsplit_once('p')
+        .map(|(_, d)| d)
+        .unwrap_or("")
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    match digits.trim_start_matches('0').parse::<u32>() {
+        Ok(b) if (9..=16).contains(&b) => b,
+        _ => 8,
     }
 }
 
@@ -424,7 +441,7 @@ pub fn parse(json: &str) -> Result<ProbeInfo, String> {
                 layout: s(st, "channel_layout").unwrap_or_default(),
                 bit_rate,
                 size_bytes,
-                language: tag(st, "language").filter(|l| l != "und"),
+                language: tag(st, "language").filter(|l| !l.eq_ignore_ascii_case("und")),
                 title: tag(st, "title"),
                 disposition: disposition(st),
                 stat_tags: stat_tags(st),
@@ -432,7 +449,7 @@ pub fn parse(json: &str) -> Result<ProbeInfo, String> {
             }),
             Some("subtitle") => info.subtitles.push(SubtitleStream {
                 index,
-                language: tag(st, "language").filter(|l| l != "und"),
+                language: tag(st, "language").filter(|l| !l.eq_ignore_ascii_case("und")),
                 title: tag(st, "title"),
                 disposition: disposition(st),
                 size_bytes,
@@ -598,5 +615,16 @@ pub mod tests {
             "format":{"duration":"100","size":"125000000","bit_rate":"10000000"}}"#)
         .unwrap();
         assert_eq!(p.video_bit_rate(), Some(9_872_000));
+    }
+
+    #[test]
+    fn bit_depth_from_pix_fmt_suffix() {
+        assert_eq!(bit_depth("yuv420p10le", None), 10);
+        assert_eq!(bit_depth("p010le", None), 10);
+        assert_eq!(bit_depth("yuv420p12le", None), 12);
+        assert_eq!(bit_depth("nv12", None), 8);
+        assert_eq!(bit_depth("p012", None), 12);
+        assert_eq!(bit_depth("yuv410p", None), 8);
+        assert_eq!(bit_depth("yuv420p", Some(10)), 10);
     }
 }

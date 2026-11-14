@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.1
+
+- The finished-job summary shows the target size in MB or GB with full precision ("target 100 MB", not "target 0.1 GB").
+- The command-line encode prints its sanity checks after the size estimate, so the "won't save space" and "same codec" warnings show up there the same way they do in the app.
+
+## 0.4.0
+
+- The input can no longer be overwritten through a symlink, a case-insensitive share or another spelling of its path; outputs also avoid other queued jobs' files.
+- Encodes write to a `.part` file and rename it when done, and ffmpeg stops if the app dies.
+- An impossible target size or an unknown duration no longer encodes at a hidden 8 Mb/s.
+- Commentary-only languages and commentary subtitles are no longer picked as the main track.
+- Existing outputs are asked about once when you press Start, not mid-queue.
+- "Apply to all" and presets keep hand-picked audio conversions.
+- A broken settings file is set aside (presets recovered) instead of being overwritten.
+- VMAF after encoding runs in the background and no longer holds up the queue.
+- New checks: rate control overriding the size mode, cropping with PGS subtitles, copied video Apple TV can't play; a second fix button where useful.
+- Dolby Vision: needs 10-bit output, refuses unverifiable frame counts, ignores extra arguments in the mux step.
+- GPU cropping always goes through `scale_vaapi`, and the startup check verifies the cropped size.
+- Single instance: opening files again adds them to the open window.
+- Non-UTF-8 text in ffmpeg's output no longer drops the log, crop detection or VMAF.
+- Fewer background jobs at once, debounced settings saves, and leftover cache files are cleaned up.
+- Release scripts: the bump needs a changelog entry, and published commit messages are checked for private strings.
+
 ## 0.3.10
 
 - About dialog: a Changelog page next to Details and Legal.

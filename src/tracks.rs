@@ -62,6 +62,8 @@ const LANGUAGES: &[(&str, &[&str], &str)] = &[
     ("fil", &["tl", "tgl"], "Filipino"),
     ("sme", &["se"], "Northern Sami"),
     ("zxx", &[], "No linguistic content"),
+    ("mul", &[], "Multiple languages"),
+    ("mis", &[], "Uncoded language"),
 ];
 
 pub const ORIGINAL: &str = "original";
@@ -88,9 +90,12 @@ pub fn family(code: &str) -> String {
 }
 
 pub fn language_name(code: Option<&str>) -> String {
-    match code {
-        None | Some("und") | Some("") => "Unknown".into(),
-        Some(c) => entry(c).map_or_else(|| c.to_string(), |e| e.2.to_string()),
+    let c = code
+        .map(|c| c.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    match c.as_str() {
+        "" | "und" => "Unknown".into(),
+        _ => entry(&c).map_or(c, |e| e.2.to_string()),
     }
 }
 
@@ -184,7 +189,9 @@ pub fn channel_label(ch: u32) -> String {
     match ch {
         1 => "Mono".into(),
         2 => "2.0".into(),
-        3 => "2.1".into(),
+        3 => "3.0".into(),
+        4 => "4.0".into(),
+        5 => "5.0".into(),
         6 => "5.1".into(),
         7 => "6.1".into(),
         8 => "7.1".into(),
@@ -192,13 +199,28 @@ pub fn channel_label(ch: u32) -> String {
     }
 }
 
+/// Channel label from ffprobe's `channel_layout` ("5.1(side)" → "5.1",
+/// "quad" → "4.0"), falling back to the channel count.
+pub fn layout_label(a: &AudioStream) -> String {
+    let base = a.layout.split('(').next().unwrap_or("").trim();
+    match base {
+        "mono" => "Mono".into(),
+        "stereo" => "2.0".into(),
+        "quad" => "4.0".into(),
+        "hexagonal" => "6.0".into(),
+        "octagonal" => "8.0".into(),
+        b if b.starts_with(|c: char| c.is_ascii_digit())
+            && b.chars().all(|c| c.is_ascii_digit() || c == '.') =>
+        {
+            b.into()
+        }
+        _ => channel_label(a.channels),
+    }
+}
+
 /// "TrueHD 7.1 Atmos".
 pub fn audio_label(a: &AudioStream) -> String {
-    let mut s = format!(
-        "{} {}",
-        codec_name(&a.codec, &a.profile),
-        channel_label(a.channels)
-    );
+    let mut s = format!("{} {}", codec_name(&a.codec, &a.profile), layout_label(a));
     if is_atmos(a) {
         s.push_str(" Atmos");
     }
@@ -210,11 +232,21 @@ pub fn apple_compatible(codec: &str) -> bool {
     matches!(codec, "aac" | "ac3" | "eac3" | "flac" | "alac" | "mp3") || codec.starts_with("pcm_")
 }
 
+/// PCM flavours Matroska and MP4 can't hold (Blu-ray/DVD LPCM): copying them
+/// fails the mux, so they are converted (losslessly) by default.
+pub fn copy_unsafe(codec: &str) -> bool {
+    matches!(codec, "pcm_bluray" | "pcm_dvd")
+}
+
 pub fn is_text_subtitle(codec: &str) -> bool {
     matches!(
         codec,
         "subrip" | "srt" | "ass" | "ssa" | "webvtt" | "mov_text" | "text"
     )
+}
+
+pub fn is_lossless(a: &AudioStream) -> bool {
+    codec_tier(a) == 4
 }
 
 fn codec_tier(a: &AudioStream) -> u8 {
@@ -237,16 +269,21 @@ fn words(s: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn is_commentary(a: &AudioStream) -> bool {
-    if a.disposition.comment {
-        return true;
-    }
-    let title = a.title.as_deref().unwrap_or("").to_lowercase();
+fn commentary_title(title: Option<&str>) -> bool {
+    let title = title.unwrap_or("").to_lowercase();
     // "Director's Cut" names the main track of that version, not a commentary.
     ["commentary", "kommentar"]
         .iter()
         .any(|k| title.contains(k))
         || (title.contains("director") && !title.contains("cut"))
+}
+
+pub fn is_commentary(a: &AudioStream) -> bool {
+    a.disposition.comment || commentary_title(a.title.as_deref())
+}
+
+pub fn is_commentary_sub(s: &SubtitleStream) -> bool {
+    s.disposition.comment || commentary_title(s.title.as_deref())
 }
 
 pub fn is_audio_description(a: &AudioStream) -> bool {
@@ -263,7 +300,10 @@ pub fn is_audio_description(a: &AudioStream) -> bool {
     ]
     .iter()
     .any(|k| lower.contains(k))
-        || words(title).iter().any(|w| w == "ad")
+        // Upper-case only: "Ad Astra" in a title is not audio description.
+        || title
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| w == "AD")
 }
 
 // ---- Ranking ----
@@ -275,10 +315,16 @@ pub struct Ranked {
     pub reasons: Vec<String>,
 }
 
+/// Sort key, best first. Deliberate deviations from the plain spec order, for
+/// Apple TV mode: copied E-AC-3 Atmos beats `default` when the group also has
+/// an Atmos track Apple TV can't play (same mix, only one keeps Atmos), and an
+/// Apple-compatible track beats a higher codec tier at the same channel count,
+/// since copying it avoids a lossy conversion.
 fn audio_key(
     a: &AudioStream,
     order: usize,
     apple: bool,
+    rival_atmos: bool,
     duration: f64,
 ) -> (
     bool,
@@ -297,7 +343,7 @@ fn audio_key(
     (
         !(is_commentary(a) || is_audio_description(a)),
         // Copying E-AC-3 Atmos is the only way to keep Atmos on Apple TV.
-        apple && atmos && compatible,
+        apple && atmos && compatible && rival_atmos,
         a.disposition.default,
         channels,
         apple && compatible,
@@ -307,15 +353,15 @@ fn audio_key(
     )
 }
 
-fn audio_reasons(a: &AudioStream, apple: bool) -> Vec<String> {
+fn audio_reasons(a: &AudioStream, apple: bool, rival_atmos: bool) -> Vec<String> {
     let mut r = Vec::new();
-    if apple && is_atmos(a) && apple_compatible(&a.codec) {
+    if apple && rival_atmos && is_atmos(a) && apple_compatible(&a.codec) {
         r.push("keeps Atmos on Apple TV".into());
     }
     if a.disposition.default {
         r.push("default".into());
     }
-    r.push(channel_label(a.channels));
+    r.push(layout_label(a));
     if is_commentary(a) {
         r.push("commentary".into());
     } else if is_audio_description(a) {
@@ -331,20 +377,31 @@ fn audio_reasons(a: &AudioStream, apple: bool) -> Vec<String> {
 
 /// Rank audio tracks (best first). `streams` are in input order.
 pub fn rank_audio(streams: &[&AudioStream], apple: bool, duration: f64) -> Vec<Ranked> {
+    let rival_atmos = streams
+        .iter()
+        .any(|a| is_atmos(a) && !apple_compatible(&a.codec));
     let mut v: Vec<(usize, &AudioStream)> = streams.iter().copied().enumerate().collect();
     v.sort_by(|(i, a), (j, b)| {
-        audio_key(b, *j, apple, duration).cmp(&audio_key(a, *i, apple, duration))
+        audio_key(b, *j, apple, rival_atmos, duration).cmp(&audio_key(
+            a,
+            *i,
+            apple,
+            rival_atmos,
+            duration,
+        ))
     });
     v.into_iter()
         .map(|(_, a)| Ranked {
             index: a.index,
-            reasons: audio_reasons(a, apple),
+            reasons: audio_reasons(a, apple, rival_atmos),
         })
         .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SubKind {
+    /// Ranked last and never auto-selected.
+    Commentary,
     Forced,
     Sdh,
     Full,
@@ -353,7 +410,9 @@ pub enum SubKind {
 pub fn sub_kind(s: &SubtitleStream) -> SubKind {
     let title = s.title.as_deref().unwrap_or("");
     let w = words(title);
-    if s.disposition.forced || w.iter().any(|w| w == "forced") {
+    if is_commentary_sub(s) {
+        SubKind::Commentary
+    } else if s.disposition.forced || w.iter().any(|w| w == "forced") {
         SubKind::Forced
     } else if s.disposition.hearing_impaired
         || w.iter().any(|w| w == "sdh" || w == "cc" || w == "hearing")
@@ -369,6 +428,7 @@ pub fn sub_kind_label(k: SubKind) -> &'static str {
         SubKind::Full => "full",
         SubKind::Sdh => "SDH",
         SubKind::Forced => "forced",
+        SubKind::Commentary => "commentary",
     }
 }
 
@@ -475,6 +535,9 @@ impl AudioAction {
 
 /// Default action for a track given the "Apple TV compatible audio only" setting.
 pub fn default_action(a: &AudioStream, s: &EncodeSettings) -> AudioAction {
+    if copy_unsafe(&a.codec) && !(s.stereo_downmix && a.channels > 2) {
+        return AudioAction::Flac;
+    }
     if s.stereo_downmix && a.channels > 2 {
         return AudioAction::Aac {
             kbps: 224,
@@ -545,8 +608,20 @@ pub fn output_audio_bytes(a: &AudioStream, action: AudioAction, duration: f64) -
         AudioAction::Eac3 { kbps } | AudioAction::Aac { kbps, .. } => {
             kbps as f64 * 1000.0 * duration
         }
-        // FLAC from a lossy source is ~ the PCM size halved; from lossless ~ the source size.
-        AudioAction::Flac => 300_000.0 * action.output_channels(a.channels) as f64 * duration,
+        // FLAC from a lossy source is ~ the PCM size halved; from lossless at
+        // least the source size (24-bit sources run well over the guess).
+        AudioAction::Flac => {
+            let guess = 300_000.0 * action.output_channels(a.channels) as f64 * duration;
+            if is_lossless(a) {
+                let src = a.size_bytes.map_or_else(
+                    || audio_bitrate_guess(a, duration) as f64 * duration,
+                    |b| b as f64 * 8.0,
+                );
+                guess.max(src)
+            } else {
+                guess
+            }
+        }
     };
     (bits / 8.0) as u64
 }
@@ -719,9 +794,12 @@ pub fn auto_select(
         let preferred = fams.contains(&g.family);
         for (rank, r) in g.audio.iter().enumerate() {
             let a = p.audio_by_index(r.index).expect("ranked from probe");
+            // A language with only commentary/description tracks gets nothing;
+            // the fallback below still covers files that have nothing else.
+            let main = !(is_commentary(a) || is_audio_description(a));
             sel.audio.push(AudioChoice {
                 index: r.index,
-                selected: preferred && rank == 0,
+                selected: preferred && rank == 0 && main,
                 action: default_action(a, s),
             });
         }
@@ -1009,5 +1087,121 @@ mod tests {
             output_audio_bytes(&p.audio[0], AudioAction::Eac3 { kbps: 640 }, p.duration),
             576_000_000
         );
+    }
+
+    fn probe_json(streams: &str) -> ProbeInfo {
+        crate::ffmpeg::probe::parse(&format!(
+            r#"{{"streams":[{{"index":0,"codec_type":"video","codec_name":"hevc","width":1920,"height":1080,"pix_fmt":"yuv420p","avg_frame_rate":"24/1"}},{streams}],"format":{{"duration":"6000","size":"5000000000"}}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn lone_commentary_in_a_preferred_language_is_not_selected() {
+        let p = probe_json(
+            r#"{"index":1,"codec_type":"audio","codec_name":"ac3","channels":6,"tags":{"language":"jpn"}},
+               {"index":2,"codec_type":"audio","codec_name":"ac3","channels":2,"tags":{"language":"eng","title":"Director's Commentary"}}"#,
+        );
+        let (sel, _, _) = auto_select(
+            &p,
+            &prefs(&["nor", "eng", "original"]),
+            &EncodeSettings::default(),
+        );
+        let chosen: Vec<usize> = sel.selected_audio().map(|c| c.index).collect();
+        assert_eq!(chosen, vec![1]);
+        // The film's own track is output audio 0, so it gets `default`.
+        assert_eq!(sel.audio.iter().find(|c| c.selected).unwrap().index, 1);
+    }
+
+    #[test]
+    fn commentary_subtitles_rank_last_and_are_never_auto_selected() {
+        let p = probe_json(
+            r#"{"index":1,"codec_type":"audio","codec_name":"ac3","channels":6,"tags":{"language":"eng"}},
+               {"index":2,"codec_type":"subtitle","codec_name":"hdmv_pgs_subtitle","disposition":{"default":1},"tags":{"language":"eng","title":"English"}},
+               {"index":3,"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"eng","title":"Director's Commentary"}}"#,
+        );
+        let (sel, groups, qs) = auto_select(&p, &prefs(&["eng"]), &EncodeSettings::default());
+        assert_eq!(groups[0].subs[0].index, 2);
+        assert!(!sel.subs.iter().any(|c| c.index == 3 && c.selected));
+        // The real (PGS) subtitles are asked about instead of silently replaced.
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].indices, vec![2]);
+        assert_eq!(
+            sub_kind(p.subtitle_by_index(3).unwrap()),
+            SubKind::Commentary
+        );
+    }
+
+    #[test]
+    fn ad_keyword_needs_capitals() {
+        let mut t = a(1, "ac3", 6, "eng");
+        t.title = Some("Ad Astra - English 5.1".into());
+        assert!(!is_audio_description(&t));
+        t.title = Some("English AD".into());
+        assert!(is_audio_description(&t));
+    }
+
+    #[test]
+    fn odd_language_codes() {
+        assert_eq!(language_name(Some("UND")), "Unknown");
+        assert_eq!(language_name(Some("mul")), "Multiple languages");
+        assert_eq!(language_name(Some("ENG")), "English");
+        assert_eq!(language_name(Some("xyz")), "xyz");
+    }
+
+    #[test]
+    fn bluray_pcm_is_converted_not_copied() {
+        let t = a(1, "pcm_bluray", 6, "eng");
+        assert_eq!(
+            default_action(&t, &EncodeSettings::default()),
+            AudioAction::Flac
+        );
+        let t = a(1, "pcm_s24le", 6, "eng");
+        assert_eq!(
+            default_action(&t, &EncodeSettings::default()),
+            AudioAction::Copy
+        );
+    }
+
+    #[test]
+    fn channel_labels_follow_the_layout() {
+        let mut t = a(1, "ac3", 3, "eng");
+        t.layout = "3.0".into();
+        assert_eq!(layout_label(&t), "3.0");
+        t.layout = "5.1(side)".into();
+        assert_eq!(layout_label(&t), "5.1");
+        t.layout = "quad".into();
+        assert_eq!(layout_label(&t), "4.0");
+        t.layout = String::new();
+        t.channels = 5;
+        assert_eq!(layout_label(&t), "5.0");
+    }
+
+    #[test]
+    fn flac_from_lossless_is_at_least_the_source_size() {
+        let mut t = a(1, "truehd", 8, "eng");
+        t.size_bytes = Some(4_000_000_000);
+        assert!(output_audio_bytes(&t, AudioAction::Flac, 7200.0) >= 4_000_000_000);
+        let lossy = a(2, "ac3", 6, "eng");
+        assert_eq!(
+            output_audio_bytes(&lossy, AudioAction::Flac, 100.0),
+            (300_000.0 * 6.0 * 100.0 / 8.0) as u64
+        );
+    }
+
+    #[test]
+    fn atmos_boost_only_against_another_atmos_track() {
+        let mut dts = a(1, "dts", 8, "eng");
+        dts.profile = "DTS-HD MA".into();
+        dts.disposition.default = true;
+        let mut eac3 = a(2, "eac3", 6, "eng");
+        eac3.profile = "Dolby Digital Plus + Dolby Atmos".into();
+        // Different mixes: the default DTS-HD MA 7.1 stays on top.
+        assert_eq!(rank_audio(&[&dts, &eac3], true, 100.0)[0].index, 1);
+        let mut thd = a(3, "truehd", 8, "eng");
+        thd.profile = "Dolby TrueHD + Dolby Atmos".into();
+        thd.disposition.default = true;
+        // Same Atmos mix twice: the copyable one wins.
+        assert_eq!(rank_audio(&[&thd, &eac3], true, 100.0)[0].index, 2);
     }
 }

@@ -104,13 +104,18 @@ pub fn show(app: &Rc<App>, id: u64) {
                     &out2,
                 ));
             });
-            let (picture, spinner) = (picture.clone(), spinner.clone());
+            let (picture, spinner, index) = (picture.clone(), spinner.clone(), index.clone());
             glib::spawn_future_local(async move {
                 if let Ok(r) = rx.recv().await {
-                    spinner.set_visible(false);
-                    if r.is_ok() {
-                        picture.set_filename(Some(&out));
+                    // A slower earlier click must not replace the newer sample.
+                    if index.get() == i {
+                        spinner.set_visible(false);
+                        if r.is_ok() {
+                            // Loads the file at once, so it can go straight away.
+                            picture.set_filename(Some(&out));
+                        }
                     }
+                    let _ = std::fs::remove_file(&out);
                 }
             });
         })

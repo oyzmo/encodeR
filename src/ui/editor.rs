@@ -1266,10 +1266,10 @@ impl Editor {
                     .title_lines(0)
                     .build();
                 row.add_prefix(&severity_icon(i.severity));
-                if let Some(fix) = i.fix {
+                for (n, fix) in [i.fix, i.alt_fix].into_iter().flatten().enumerate() {
                     let b = gtk::Button::with_label(&fix.label());
                     b.set_valign(gtk::Align::Center);
-                    if i.severity == Severity::Strong {
+                    if i.severity == Severity::Strong && n == 0 {
                         b.add_css_class("suggested-action");
                     }
                     let a = app.clone();

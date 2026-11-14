@@ -67,7 +67,8 @@ fn main() -> gtk::glib::ExitCode {
 
     let app = adw::Application::builder()
         .application_id(window::APP_ID)
-        .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+        // Single instance: a second launch passes its files to the open window.
+        .flags(gtk::gio::ApplicationFlags::HANDLES_OPEN)
         .build();
     app.connect_startup(|_| {
         gtk::Window::set_default_icon_name(window::APP_ID);
@@ -77,8 +78,15 @@ fn main() -> gtk::glib::ExitCode {
                 .add_search_path(concat!(env!("CARGO_MANIFEST_DIR"), "/data/icons"));
         }
         theme::install();
+        std::thread::spawn(ffmpeg::estimate::sweep_cache);
     });
-    app.connect_activate(move |app| window::build(app, files.clone()));
-    // GTK must not see our own arguments.
-    app.run_with_args(&args[..1])
+    app.connect_activate(|app| window::build(app, Vec::new()));
+    app.connect_open(|app, files, _| {
+        window::build(app, files.iter().filter_map(|f| f.path()).collect());
+    });
+    // Options are handled above; only the file names go to GApplication,
+    // which forwards them to a running instance.
+    let mut gargs = vec![args[0].clone()];
+    gargs.extend(files.iter().map(|f| f.to_string_lossy().into_owned()));
+    app.run_with_args(&gargs)
 }

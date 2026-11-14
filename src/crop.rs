@@ -61,11 +61,15 @@ pub fn aggregate(crops: &[Crop], width: u32, height: u32) -> Option<Crop> {
     }
     x1 = x1.min(width);
     y1 = y1.min(height);
+    // A rectangle wholly outside the frame (or a frame without dimensions).
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
     // Round the offset down and the size up to even numbers (never cuts picture).
     let x = x0 & !1;
     let y = y0 & !1;
-    let w = ((x1 - x + 1) & !1).min(width - x);
-    let h = ((y1 - y + 1) & !1).min(height - y);
+    let w = ((x1 - x + 1) & !1).min(width.saturating_sub(x));
+    let h = ((y1 - y + 1) & !1).min(height.saturating_sub(y));
     let crop = Crop { w, h, x, y };
     (saving(&crop, width, height) >= MIN_SAVING).then_some(crop)
 }
@@ -339,5 +343,23 @@ mod tests {
         let s = sample_starts(700.0, 6, 4.0);
         assert_eq!(s.len(), 6);
         assert!((s[0] - 100.0).abs() < 1e-9 && (s[5] - 600.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn out_of_frame_input_does_not_underflow() {
+        let c = Crop {
+            w: 100,
+            h: 100,
+            x: 4000,
+            y: 0,
+        };
+        assert_eq!(aggregate(&[c], 3840, 2160), None);
+        let c = Crop {
+            w: 1920,
+            h: 800,
+            x: 0,
+            y: 140,
+        };
+        assert_eq!(aggregate(&[c], 0, 0), None);
     }
 }
