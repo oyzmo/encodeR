@@ -326,6 +326,7 @@ impl Editor {
         if let crate::subs::JobMode::Fix(target) = job.mode {
             settings_box.append(&audio_timing_group(app, id, &job, &probe, target));
             settings_box.append(&crate::ui::subs::externals_group(app, id, &job, alass));
+            settings_box.append(&crate::ui::cover::cover_group(app, id, &job, &probe));
             let (cmd_group, buffer) = command_group(app);
             content.append(&cmd_group);
             let clamp = adw::Clamp::builder()
@@ -994,6 +995,7 @@ impl Editor {
             }
             settings_box.append(&pg);
         }
+        settings_box.append(&crate::ui::cover::cover_group(app, id, &job, &probe));
 
         // ---- Quality check ----
         let mut vmaf_row = None;

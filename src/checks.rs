@@ -849,17 +849,19 @@ pub fn external_issues(
     settings: &EncodeSettings,
     mode: crate::subs::JobMode,
     externals: &[crate::subs::ExternalSub],
-    delays: bool,
+    work: crate::subs::FixWork,
     alass: bool,
 ) -> Vec<Issue> {
     use crate::subs::{self, JobMode, SubsTarget};
     let selected: Vec<_> = externals.iter().filter(|e| e.selected).collect();
     let mut v: Vec<Option<Issue>> = Vec::new();
     if let JobMode::Fix(target) = mode {
-        if let Err(e) = subs::fix_problem(video, target, externals, delays) {
+        if let Err(e) = subs::fix_problem(video, target, externals, work) {
             let id = match target {
                 _ if e == subs::NOTHING_TO_FIX => "nosubs",
-                SubsTarget::Sidecar if delays => "sidecardelay",
+                _ if e == crate::ffmpeg::command::MOV_COVER => "movcover",
+                SubsTarget::Sidecar if work.delays => "sidecardelay",
+                SubsTarget::Sidecar if work.cover => "sidecarcover",
                 SubsTarget::Sidecar => "sidecarclash",
                 _ => "embedcontainer",
             };
@@ -1442,7 +1444,7 @@ mod tests {
         use std::path::Path;
         let v = Path::new("/nonexistent/Film.mkv");
         let ids = |mode, ext: &[ExternalSub], alass, s: &EncodeSettings| -> Vec<&'static str> {
-            external_issues(v, s, mode, ext, false, alass)
+            external_issues(v, s, mode, ext, false.into(), alass)
                 .iter()
                 .map(|i| i.id)
                 .collect()
@@ -1471,17 +1473,25 @@ mod tests {
             &s,
             JobMode::Fix(SubsTarget::Embed),
             std::slice::from_ref(&no),
-            false,
+            false.into(),
             true,
         );
         assert_eq!(embed[0].id, "embedcontainer");
         // A new file from an AVI becomes an MKV, so that's fine.
         assert!(
-            external_issues(avi, &s, JobMode::Fix(SubsTarget::NewFile), &[], true, true).is_empty()
+            external_issues(
+                avi,
+                &s,
+                JobMode::Fix(SubsTarget::NewFile),
+                &[],
+                true.into(),
+                true
+            )
+            .is_empty()
         );
         // Audio delays alone are enough to fix, but not next to the video.
         let delay = |t| -> Vec<&'static str> {
-            external_issues(v, &s, JobMode::Fix(t), &[], true, true)
+            external_issues(v, &s, JobMode::Fix(t), &[], true.into(), true)
                 .iter()
                 .map(|i| i.id)
                 .collect()
@@ -1490,8 +1500,58 @@ mod tests {
         assert!(delay(SubsTarget::NewFile).is_empty());
         assert_eq!(delay(SubsTarget::Sidecar), vec!["sidecardelay"]);
         // A delay-only replace of an AVI points at the new-file result.
-        let avi_delay = external_issues(avi, &s, JobMode::Fix(SubsTarget::Embed), &[], true, true);
+        let avi_delay = external_issues(
+            avi,
+            &s,
+            JobMode::Fix(SubsTarget::Embed),
+            &[],
+            true.into(),
+            true,
+        );
         assert!(avi_delay[0].message.contains("Write a new file"));
+        // Cover art: a new embedded cover needs a remux; a poster alone is work.
+        let cover = crate::subs::FixWork {
+            cover: true,
+            ..Default::default()
+        };
+        let poster = crate::subs::FixWork {
+            poster: true,
+            ..Default::default()
+        };
+        let fix = |t, w| external_issues(v, &s, JobMode::Fix(t), &[], w, true);
+        assert_eq!(fix(SubsTarget::Sidecar, cover)[0].id, "sidecarcover");
+        assert!(fix(SubsTarget::Embed, cover).is_empty());
+        assert!(fix(SubsTarget::Sidecar, poster).is_empty());
+        assert!(fix(SubsTarget::Embed, poster).is_empty());
+        // A new cover can't go into a .mov in place.
+        let new_cover = crate::subs::FixWork {
+            cover: true,
+            new_cover: true,
+            ..Default::default()
+        };
+        let mov = Path::new("/m/Clip.mov");
+        let w = external_issues(
+            mov,
+            &s,
+            JobMode::Fix(SubsTarget::Embed),
+            &[],
+            new_cover,
+            true,
+        );
+        assert_eq!(w[0].id, "movcover");
+        let w = external_issues(
+            mov,
+            &s,
+            JobMode::Fix(SubsTarget::NewFile),
+            &[],
+            new_cover,
+            true,
+        );
+        assert!(w.is_empty());
+        // A poster alone never remuxes, so an AVI can't get in the way.
+        let w = external_issues(avi, &s, JobMode::Fix(SubsTarget::Embed), &[], poster, true);
+        assert!(w.is_empty());
+        assert_eq!(fix(SubsTarget::Embed, Default::default())[0].id, "nosubs");
         // A new file has another name, so the sidecars don't double up.
         assert!(
             ids(

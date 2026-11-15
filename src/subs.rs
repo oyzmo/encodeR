@@ -177,20 +177,64 @@ pub fn audio_delays(sel: &Selection) -> Vec<(usize, i64)> {
 }
 
 /// Why a fix-tracks job can't run, if it can't.
+/// What a fix-tracks job does besides subtitle files.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FixWork {
+    /// An audio track has a delay.
+    pub delays: bool,
+    /// The embedded cover art changes.
+    pub cover: bool,
+    /// A new picture goes in as the cover.
+    pub new_cover: bool,
+    /// A poster is saved next to the video.
+    pub poster: bool,
+}
+
+impl From<bool> for FixWork {
+    /// Audio delays only.
+    fn from(delays: bool) -> Self {
+        Self {
+            delays,
+            ..Self::default()
+        }
+    }
+}
+
+impl FixWork {
+    /// Something to remux besides subtitles.
+    pub fn remux(self) -> bool {
+        self.delays || self.cover
+    }
+}
+
 pub fn fix_problem(
     video: &Path,
     target: SubsTarget,
     externals: &[ExternalSub],
-    delays: bool,
+    work: FixWork,
 ) -> Result<(), String> {
     let subs = externals.iter().any(|e| e.selected);
     match target {
-        SubsTarget::Sidecar if delays => Err(
+        SubsTarget::Sidecar if work.delays => Err(
             "Audio delays need the file to be remuxed: pick “Replace the original file” or “Write a new file”.".into(),
         ),
-        SubsTarget::Sidecar if !subs => Err(NOTHING_TO_FIX.into()),
+        SubsTarget::Sidecar if work.cover => Err(
+            "Changing the embedded cover art needs the file to be remuxed: pick “Replace the original file” or “Write a new file”.".into(),
+        ),
+        SubsTarget::Sidecar if !subs && !work.poster => Err(NOTHING_TO_FIX.into()),
+        SubsTarget::Sidecar if !subs => Ok(()),
         SubsTarget::Sidecar => sidecar_outputs(video, externals).map(|_| ()),
-        _ if !subs && !delays => Err(NOTHING_TO_FIX.into()),
+        SubsTarget::Embed
+            if work.new_cover
+                && video
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("mov")) =>
+        {
+            Err(crate::ffmpeg::command::MOV_COVER.into())
+        }
+        _ if !subs && !work.remux() && !work.poster => Err(NOTHING_TO_FIX.into()),
+        // A poster alone is saved without remuxing.
+        _ if !subs && !work.remux() => Ok(()),
         SubsTarget::Embed if !subs && fix_container(video, target).is_err() => Err(format!(
             "A .{} file can't be remuxed in place here. Pick “Write a new file” (it becomes an MKV).",
             video.extension().unwrap_or_default().to_string_lossy()
@@ -199,7 +243,7 @@ pub fn fix_problem(
     }
 }
 
-pub const NOTHING_TO_FIX: &str = "Nothing to fix: add subtitle files (or put files like Movie.no.srt next to the video), or set an audio delay on a track.";
+pub const NOTHING_TO_FIX: &str = "Nothing to fix: add subtitle files (or put files like Movie.no.srt next to the video), set an audio delay on a track, or change the cover art.";
 
 /// Container for a fix-tracks remux: the input's own, or MKV for a new file
 /// from a container that can't hold text subtitles.

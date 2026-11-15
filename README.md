@@ -60,6 +60,13 @@ If the source itself is out of sync, each audio track can get a delay (clock but
 </details>
 
 <details>
+<summary><b>Cover art:</b> Keeps, replaces or removes the embedded cover, and can save it as a poster for Plex.</summary>
+
+Choose a picture or drop one on the window. It's converted to a JPEG of at most 1000 pixels on the long side (never enlarged), optionally centre-cropped to the 2:3 poster shape. In MKV it's stored as a `cover.jpg` attachment, and in MP4 as a cover stream. GNOME Files, VLC and Kodi show it, but Plex ignores embedded art for movies. For Plex, turn on *Also save as poster*: it writes `Movie.jpg` next to the video, which Plex uses when local assets are on. An existing poster is kept as `Movie.jpg.orig`. *Fix tracks only* can change just the cover or save just the poster, without re-encoding.
+
+</details>
+
+<details>
 <summary><b>Apple TV audio:</b> Converts audio the Apple TV can't play (TrueHD, DTS, Opus) and copies the rest untouched.</summary>
 
 TrueHD, DTS and Opus tracks are converted (by default to E-AC-3 5.1 at 640 kb/s, or AAC 7.1 or FLAC 7.1). Compatible tracks are copied, so E-AC-3 Atmos stays Atmos. Each converted track shows exactly what is lost.

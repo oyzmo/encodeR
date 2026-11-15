@@ -2,6 +2,7 @@ mod alass;
 mod changelog;
 mod checks;
 mod cli;
+mod cover;
 mod crop;
 mod ffmpeg;
 mod hdr;

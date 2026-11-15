@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.0
+
+- New **Cover Art** group on every job: keep the source's cover, choose a new picture (*Choose…*, or drop an image on the window), or remove it. A new picture is converted to a JPEG of at most 1000 pixels on the long side and is never enlarged.
+- *Crop to poster shape* cuts a wide picture to 2:3, keeping the middle.
+- *Also save as poster* writes the picture next to the result as `Movie.jpg`, which Plex uses as the poster when local assets are on. Plex ignores embedded cover art for movies. A poster that's already there is kept as `Movie.jpg.orig`.
+- Fix tracks only can change just the cover art, or just save a poster, without touching anything else.
+- Re-encodes keep the source's cover art. Before, it was dropped.
+
 ## 0.8.2
 
 - Fix tracks only keeps cover art as cover art in MKV files. Before, the remux turned it into an ordinary one-frame video track. The picture is copied out unchanged and put back as an attachment with its file name and type. MP4 covers already stayed covers.

@@ -85,3 +85,7 @@ Or put the downloaded file, made executable, at
 
 Restart encodeR afterwards.";
 pub const SUB_OFFSET: &str = "Moves every subtitle by this much, after syncing. Positive = later (subtitles show up too early), negative = earlier.";
+
+pub const COVER: &str = "The picture players show for the file: GNOME Files thumbnails, VLC, Kodi. Plex ignores embedded art for movies; use “Also save as poster” for Plex. A new picture is converted to a JPEG of at most 1000 pixels on the long side (never enlarged).";
+pub const SAVE_POSTER: &str = "Writes the cover as a JPEG with the video's name next to it (Movie.mkv → Movie.jpg). Plex picks that up as the poster when “Use local assets” is on, instead of its downloaded one. A different poster already there is kept first, as Movie.jpg.orig (then .orig2, …).";
+pub const POSTER_CROP: &str = "Cuts a wide picture (a screenshot, a banner) to the 2:3 shape of a film poster, keeping the middle. Leave it off for pictures that are already poster-shaped or should stay whole.";

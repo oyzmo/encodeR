@@ -333,6 +333,10 @@ pub struct Prefs {
     pub subs_target: crate::subs::SubsTarget,
     /// Sync external subtitles with alass by default (when it's installed).
     pub sync_subs: bool,
+    /// New jobs save their cover art next to the result as a poster.
+    pub save_poster: bool,
+    /// New jobs crop new cover art and posters to 2:3.
+    pub poster_crop: bool,
 }
 
 impl Default for Prefs {
@@ -348,6 +352,8 @@ impl Default for Prefs {
             user_presets: Vec::new(),
             subs_target: crate::subs::SubsTarget::default(),
             sync_subs: true,
+            save_poster: false,
+            poster_crop: false,
         }
     }
 }

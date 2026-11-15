@@ -147,6 +147,17 @@ impl State {
         )
     }
 
+    /// Where job `id`'s poster goes: next to the file it writes, or next to
+    /// the video when a fix-tracks job leaves it in place.
+    pub fn poster_for(&self, job: &Job) -> std::path::PathBuf {
+        let video = if job.writes_output() {
+            self.output_for(job)
+        } else {
+            job.input.clone()
+        };
+        crate::cover::poster_path(&video)
+    }
+
     /// Output path for a job: never its own input, another job's input, or the
     /// output of a job earlier in the queue.
     pub fn output_for(&self, job: &Job) -> std::path::PathBuf {
@@ -188,6 +199,8 @@ impl State {
             externals: job.externals.clone(),
             mode: job.mode,
             alass: self.caps.as_ref().and_then(|c| c.alass.clone()),
+            cover: job.cover.clone(),
+            covers: Vec::new(),
             settings: job.settings.clone(),
             selection: job.selection.clone(),
             probe,
@@ -199,13 +212,12 @@ impl State {
             return Vec::new();
         };
         let alass = self.caps.as_ref().is_none_or(|c| c.alass.is_some());
-        let delays = !subs::audio_delays(&job.selection).is_empty();
         let mut sub_issues = checks::external_issues(
             &job.input,
             &job.settings,
             job.mode,
             &job.externals,
-            delays,
+            job.fix_work(),
             alass,
         );
         checks::offer_alass_install(&mut sub_issues, crate::alass::installable());
@@ -270,21 +282,42 @@ impl State {
 
     /// The exact command line for display.
     pub fn command_text(&self, job: &Job) -> String {
-        let Some(req) = self.request(job) else {
+        let Some(mut req) = self.request(job) else {
             return String::new();
+        };
+        // Cover pictures are extracted and converted to a temp folder at run time.
+        let temp = std::path::Path::new("<temp>");
+        let poster_note = |video: &std::path::Path| {
+            if job.cover.wants_poster(&req.probe) {
+                format!(
+                    "\n# saves the poster {}",
+                    crate::cover::poster_path(video).display()
+                )
+            } else {
+                String::new()
+            }
         };
         match job.mode {
             JobMode::Fix(SubsTarget::Sidecar) => {
-                return match subs::sidecar_outputs(&job.input, &job.externals) {
-                    Ok(v) => v
-                        .iter()
-                        .map(|p| format!("# saves {}", p.display()))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    Err(e) => format!("# {e}"),
+                let mut text = if job.externals.iter().any(|e| e.selected) {
+                    match subs::sidecar_outputs(&job.input, &job.externals) {
+                        Ok(v) => v
+                            .iter()
+                            .map(|p| format!("# saves {}", p.display()))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        Err(e) => format!("# {e}"),
+                    }
+                } else {
+                    String::new()
                 };
+                text.push_str(&poster_note(&job.input));
+                return text.trim_start().to_string();
             }
             JobMode::Fix(t) => {
+                if !job.remuxes() && job.fix_work().poster {
+                    return poster_note(&job.input).trim_start().to_string();
+                }
                 let c =
                     subs::fix_container(&job.input, t).unwrap_or(crate::settings::Container::Mkv);
                 let dest = if t == SubsTarget::Embed {
@@ -294,31 +327,34 @@ impl State {
                 };
                 let part = worker::partial_path(&dest);
                 let delays = subs::audio_delays(&job.selection);
-                // Covers are extracted to the job's temp folder at run time.
-                let covers = command::cover_files(&req.probe, std::path::Path::new("<temp>"));
+                let plan = crate::cover::plan(&req.probe, &job.cover, c, true, temp);
                 return match command::build_fix(
                     &req.probe,
                     &job.externals,
                     &delays,
-                    &covers,
+                    &plan,
                     c,
                     &part,
                 ) {
                     Ok(a) => format!(
-                        "{}\n# then the checked file {} {}",
+                        "{}\n# then the checked file {} {}{}",
                         command::display_command(&self.tools.ffmpeg, &a),
                         if t == SubsTarget::Embed {
                             "replaces"
                         } else {
                             "is renamed to"
                         },
-                        dest.display()
+                        dest.display(),
+                        poster_note(&dest)
                     ),
                     Err(e) => format!("# {e}"),
                 };
             }
             JobMode::Encode => {}
         }
+        let note = poster_note(&req.output);
+        req.covers =
+            crate::cover::plan(&req.probe, &job.cover, job.settings.container, false, temp).embed;
         // The same job the encode will run, so the shown command can't drift.
         let j = req.job(&req.output, req.first_decode());
         let mut text = match command::build(&j) {
@@ -330,7 +366,7 @@ impl State {
                 "# Dolby Vision pipeline: ffmpeg | dovi_tool extract-rpu → encode to raw HEVC → dovi_tool inject-rpu → mux.\n# The final mux keeps these audio/subtitle settings:\n{text}"
             );
         }
-        text
+        text + &note
     }
 }
 
@@ -752,6 +788,8 @@ impl App {
         }
         let (srts, paths): (Vec<PathBuf>, Vec<PathBuf>) =
             paths.into_iter().partition(|p| subs::is_srt(p));
+        let (images, paths): (Vec<PathBuf>, Vec<PathBuf>) =
+            paths.into_iter().partition(|p| crate::cover::is_image(p));
         let mut new_ids = Vec::new();
         {
             let mut st = self.state.borrow_mut();
@@ -759,6 +797,7 @@ impl App {
             st.next_batch += 1;
             let preset = st.prefs.last_preset.clone();
             let settings = st.prefs.last_settings.clone();
+            let (save_poster, poster_crop) = (st.prefs.save_poster, st.prefs.poster_crop);
             for p in paths {
                 if st.jobs.iter().any(|j| {
                     j.input == p && !matches!(j.state, JobState::Done | JobState::Cancelled)
@@ -770,6 +809,8 @@ impl App {
                 let mut job = Job::new(id, batch, p, settings.clone(), preset.clone());
                 // Sidecars next to the video arrive with the probe result.
                 job.mode = mode;
+                job.cover.save_poster = save_poster;
+                job.cover.poster_crop = poster_crop;
                 st.jobs.push(job);
                 new_ids.push(id);
             }
@@ -786,6 +827,24 @@ impl App {
             self.rows.borrow_mut().insert(*id, row);
             self.update_row(*id);
             self.probe(*id);
+        }
+        // A picture dropped with videos becomes their cover art; dropped on
+        // its own, the selected job's.
+        if let Some(img) = images.into_iter().next() {
+            let targets = if new_ids.is_empty() {
+                self.state.borrow().selected.into_iter().collect()
+            } else {
+                new_ids.clone()
+            };
+            if targets.is_empty() {
+                self.toast("Select a job first, then drop the picture to use it as cover art");
+            }
+            for id in targets {
+                self.set_cover_image(id, img.clone());
+            }
+        }
+        if self.state.borrow().jobs.is_empty() {
+            return;
         }
         self.stack.set_visible_child_name("jobs");
         if let Some(first) = new_ids.first()
@@ -939,6 +998,72 @@ impl App {
                 a.expand_zips(paths, AfterUnzip::Attach(id));
             }
         });
+    }
+
+    /// Pick a picture to use as job `id`'s cover art.
+    pub fn pick_cover(self: &Rc<Self>, id: u64) {
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Images"));
+        filter.add_mime_type("image/*");
+        for ext in crate::cover::IMAGE_SUFFIXES {
+            filter.add_suffix(ext);
+        }
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        let folder = self
+            .state
+            .borrow()
+            .job(id)
+            .and_then(|j| j.input.parent().map(gio::File::for_path));
+        let dialog = gtk::FileDialog::builder()
+            .title("Choose Cover Art")
+            .modal(true)
+            .filters(&filters)
+            .build();
+        if let Some(f) = folder {
+            dialog.set_initial_folder(Some(&f));
+        }
+        let a = self.clone();
+        dialog.open(Some(&self.window), None::<&gio::Cancellable>, move |res| {
+            if let Some(path) = res.ok().and_then(|f| f.path()) {
+                a.set_cover_image(id, path);
+            }
+        });
+    }
+
+    fn set_cover_image(self: &Rc<Self>, id: u64, path: PathBuf) {
+        let editable = self
+            .state
+            .borrow()
+            .job(id)
+            .is_some_and(|j| j.state.editable() || j.state == JobState::Probing);
+        if !editable {
+            self.toast("That job can't be changed any more");
+            return;
+        }
+        self.edit_cover(id, |c| c.action = crate::cover::CoverAction::Replace(path));
+    }
+
+    /// Change job `id`'s cover art choice, then rebuild the editor. Unlike
+    /// `edit`, this keeps the quality score: the picture doesn't change it.
+    /// The poster switches are remembered for new jobs.
+    pub fn edit_cover(self: &Rc<Self>, id: u64, f: impl FnOnce(&mut crate::cover::CoverChoice)) {
+        {
+            let mut st = self.state.borrow_mut();
+            let Some(j) = st
+                .job_mut(id)
+                .filter(|j| j.state.editable() || j.state == JobState::Probing)
+            else {
+                return;
+            };
+            f(&mut j.cover);
+            let (save, crop) = (j.cover.save_poster, j.cover.poster_crop);
+            st.prefs.save_poster = save;
+            st.prefs.poster_crop = crop;
+        }
+        self.save_prefs();
+        self.changed(id);
+        self.rebuild_editor();
     }
 
     /// File dialog for videos that get the "subtitles only" treatment.
@@ -1862,7 +1987,7 @@ impl App {
             let st = self.state.borrow();
             st.jobs
                 .iter()
-                .filter(|j| j.state == JobState::Pending && !j.mode.in_place())
+                .filter(|j| j.state == JobState::Pending && j.writes_output())
                 .map(|j| (j.id, st.output_for(j)))
                 .filter(|(id, out)| {
                     out.exists() && st.job(*id).and_then(|j| j.replace_ok.as_ref()) != Some(out)
@@ -1971,7 +2096,8 @@ impl App {
             let Some(j) = st.job(id) else { return };
             let list = if j.mode.in_place() {
                 j.unapproved_replacements()
-            } else if output.exists() && j.replace_ok.as_ref() != Some(&output) {
+            } else if j.writes_output() && output.exists() && j.replace_ok.as_ref() != Some(&output)
+            {
                 vec![output.clone()]
             } else {
                 Vec::new()
@@ -2058,7 +2184,9 @@ impl App {
             j.error = None;
             j.stderr_tail.clear();
             j.report.clear();
-            j.output = Some(req.output.clone());
+            // A new-file fix job that only saves a poster writes no file.
+            let unused = j.mode == JobMode::Fix(SubsTarget::NewFile) && !j.writes_output();
+            j.output = (!unused).then(|| req.output.clone());
             (req, tools)
         };
         let cancel = self

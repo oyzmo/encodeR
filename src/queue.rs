@@ -128,6 +128,8 @@ pub struct Job {
     pub mode: JobMode,
     /// SRT files added to the job, muxed in or saved next to the video.
     pub externals: Vec<ExternalSub>,
+    /// Keep, replace or remove the cover art; save a poster.
+    pub cover: crate::cover::CoverChoice,
     /// Files a subtitles-only job may replace, as the user approved them.
     /// Anything the job would replace that isn't listed is asked about again.
     pub subs_ok: Vec<PathBuf>,
@@ -169,6 +171,7 @@ impl Job {
             replace_ok: None,
             mode: JobMode::Encode,
             externals: Vec::new(),
+            cover: Default::default(),
             subs_ok: Vec::new(),
         }
     }
@@ -181,6 +184,33 @@ impl Job {
             }
             None => false,
         }
+    }
+
+    /// What a fix-tracks run of this job does besides subtitle files.
+    pub fn fix_work(&self) -> crate::subs::FixWork {
+        let p = self.probe.as_ref();
+        crate::subs::FixWork {
+            delays: !crate::subs::audio_delays(&self.selection).is_empty(),
+            cover: p.is_some_and(|p| self.cover.changes_embedded(p)),
+            new_cover: matches!(self.cover.action, crate::cover::CoverAction::Replace(_)),
+            poster: p.is_some_and(|p| self.cover.wants_poster(p)),
+        }
+    }
+
+    /// Does this job write a video file? A fix-tracks job that only saves
+    /// sidecars or a poster leaves the video alone.
+    pub fn remuxes(&self) -> bool {
+        use crate::subs::{JobMode, SubsTarget};
+        match self.mode {
+            JobMode::Encode => true,
+            JobMode::Fix(SubsTarget::Sidecar) => false,
+            JobMode::Fix(_) => self.externals.iter().any(|e| e.selected) || self.fix_work().remux(),
+        }
+    }
+
+    /// Does this job write a new file in the output folder?
+    pub fn writes_output(&self) -> bool {
+        !self.mode.in_place() && self.remuxes()
     }
 
     pub fn file_name(&self) -> String {
@@ -256,7 +286,8 @@ impl Job {
         use crate::subs::{JobMode, SubsTarget};
         match self.mode {
             JobMode::Encode | JobMode::Fix(SubsTarget::NewFile) => Vec::new(),
-            JobMode::Fix(SubsTarget::Embed) => vec![self.input.clone()],
+            JobMode::Fix(SubsTarget::Embed) if self.remuxes() => vec![self.input.clone()],
+            JobMode::Fix(SubsTarget::Embed) => Vec::new(),
             JobMode::Fix(SubsTarget::Sidecar) => {
                 let Ok(outs) = crate::subs::sidecar_outputs(&self.input, &self.externals) else {
                     return Vec::new();

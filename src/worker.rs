@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::checks;
+use crate::cover;
 use crate::crop::{self, Crop};
 use crate::ffmpeg::command::{self, DecodeMode, EncodeJob};
 use crate::ffmpeg::estimate::{self, SizeRange};
@@ -53,6 +54,9 @@ pub struct Request {
     pub mode: JobMode,
     /// alass program, when installed.
     pub alass: Option<String>,
+    pub cover: crate::cover::CoverChoice,
+    /// Cover art files ready to embed (filled in by the worker).
+    pub covers: Vec<crate::cover::EmbedCover>,
 }
 
 impl Request {
@@ -70,6 +74,7 @@ impl Request {
         j.scan = self.scan;
         j.video_kbps = self.video_kbps;
         j.externals = &self.externals;
+        j.covers = &self.covers;
         j
     }
 
@@ -206,11 +211,16 @@ pub fn encode(
     } else {
         None
     };
+    let cover = match prepare_cover(tools, req, req.settings.container, false, cancel) {
+        Ok(c) => c,
+        Err(o) => return o,
+    };
     let work = Request {
         output: part.clone(),
         externals: prepared
             .as_ref()
             .map_or_else(|| req.externals.clone(), |p| p.externals.clone()),
+        covers: cover.plan.embed.clone(),
         ..req.clone()
     };
     let result = if work.dv_preserve && work.probe.hdr.dovi.is_some() {
@@ -246,6 +256,9 @@ pub fn encode(
     if let Some(p) = &prepared {
         out.report.extend(p.report.iter().cloned());
     }
+    out.report.extend(cover.report.iter().cloned());
+    out.report
+        .extend(save_poster(&cover, &req.output).map(|r| r.unwrap_or_else(|e| e)));
     if req.settings.codec != VideoCodec::Copy {
         update(Update::Stage("Checking output".into()));
         out.report.extend(hdr_report(tools, req));
@@ -266,6 +279,162 @@ impl Drop for PreparedSubs {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// Cover art made ready for ffmpeg: extracted and converted pictures in a
+/// private temp folder that is removed when this is dropped.
+struct PreparedCover {
+    plan: cover::Plan,
+    report: Vec<String>,
+    dir: Option<PathBuf>,
+}
+
+impl Drop for PreparedCover {
+    fn drop(&mut self) {
+        if let Some(d) = &self.dir {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+}
+
+/// Extract the source covers and convert new pictures, as `cover::plan`
+/// says. A picture the user chose that can't be read fails the job before
+/// anything is encoded; a source cover or poster that fails is reported.
+fn prepare_cover(
+    tools: &Tools,
+    req: &Request,
+    container: crate::settings::Container,
+    fix: bool,
+    cancel: &Cancel,
+) -> Result<PreparedCover, Outcome> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let dir = cache_dir().join(format!("cover-{}-{nanos}", std::process::id()));
+    let plan = cover::plan(&req.probe, &req.cover, container, fix, &dir);
+    let mut out = PreparedCover {
+        dir: None,
+        report: plan
+            .skipped
+            .iter()
+            .map(|n| format!("⚠ Left out cover art {n}: MP4 only holds JPEG, PNG and BMP covers"))
+            .collect(),
+        plan: cover::Plan::default(),
+    };
+    if plan.extract.is_empty() && plan.convert.is_empty() {
+        out.plan = plan;
+        return Ok(out);
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| fail(format!("Couldn't create a temp folder: {e}"), Vec::new()))?;
+    out.dir = Some(dir);
+    out.plan = plan;
+    for (i, file) in out.plan.extract.clone() {
+        let args = command::build_cover_extract(&req.probe, i, &file);
+        let ok = runner::run_capture(&tools.ffmpeg, &args, cancel).is_ok_and(|r| r.success);
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        if !(ok && file.exists()) {
+            out.plan.extract_failed(i);
+            let _ = std::fs::remove_file(&file);
+        }
+    }
+    let chosen = match &req.cover.action {
+        cover::CoverAction::Replace(f) => Some(f.clone()),
+        _ => None,
+    };
+    for (from, to) in out.plan.convert.clone() {
+        let args = cover::convert_args(&from, &to, req.cover.poster_crop);
+        let r = if from.exists() {
+            runner::run_capture(&tools.ffmpeg, &args, cancel).ok()
+        } else {
+            None
+        };
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        if r.as_ref().is_some_and(|r| r.success) && to.exists() {
+            continue;
+        }
+        let why = r
+            .map(|r| runner::error_summary(&r.stderr))
+            .unwrap_or_else(|| "the file is missing".into());
+        if chosen.as_ref() == Some(&from) {
+            let name = from.file_name().unwrap_or_default().to_string_lossy();
+            return Err(fail(
+                format!("Couldn't read the cover image {name}: {why}"),
+                Vec::new(),
+            ));
+        }
+        out.plan.poster = None;
+        out.report.push(format!(
+            "⚠ Couldn't make the poster from the cover art: {why}"
+        ));
+    }
+    Ok(out)
+}
+
+/// Copy the prepared poster next to `video` (`Movie.jpg`). A different
+/// poster already there is backed up first (`Movie.jpg.orig`, then
+/// `Movie.jpg.orig2`, …) unless a backup already holds the same picture.
+/// `Err` is a report line for a poster that couldn't be saved.
+fn save_poster(cover: &PreparedCover, video: &Path) -> Option<Result<String, String>> {
+    let src = cover.plan.poster.as_ref()?;
+    let dest = cover::poster_path(video);
+    let name = dest
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let mut part = dest.as_os_str().to_owned();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    // Ok((written, backup made))
+    let r = (|| -> std::io::Result<(bool, Option<PathBuf>)> {
+        let new = std::fs::read(src)?;
+        let mut backup = None;
+        if let Ok(old) = std::fs::read(&dest) {
+            if old == new {
+                return Ok((false, None));
+            }
+            let first = subs::backup_path(&dest);
+            let mut n = 1;
+            loop {
+                let b = if n == 1 {
+                    first.clone()
+                } else {
+                    let mut s = first.as_os_str().to_owned();
+                    s.push(n.to_string());
+                    PathBuf::from(s)
+                };
+                match std::fs::read(&b) {
+                    Ok(kept) if kept == old => break,
+                    Ok(_) => n += 1,
+                    Err(_) => {
+                        std::fs::write(&b, &old)?;
+                        backup = Some(b);
+                        break;
+                    }
+                }
+            }
+        }
+        std::fs::write(&part, &new)?;
+        std::fs::rename(&part, &dest)?;
+        Ok((true, backup))
+    })();
+    Some(match r {
+        Ok((_, Some(b))) => Ok(format!(
+            "Saved poster {name} (the one that was there is kept as {})",
+            b.file_name().unwrap_or_default().to_string_lossy()
+        )),
+        Ok((true, None)) => Ok(format!("Saved poster {name}")),
+        Ok((false, _)) => Ok(format!("Poster {name} is already this picture")),
+        Err(e) => {
+            let _ = std::fs::remove_file(&part);
+            Err(format!("⚠ Couldn't save poster {name}: {e}"))
+        }
+    })
 }
 
 fn cancelled() -> Outcome {
@@ -453,27 +622,82 @@ fn fix_tracks(
     update: &mut impl FnMut(Update),
 ) -> Outcome {
     let video = &req.probe.path;
-    let delays = subs::audio_delays(&req.selection);
+    let work = subs::FixWork {
+        delays: !subs::audio_delays(&req.selection).is_empty(),
+        cover: req.cover.changes_embedded(&req.probe),
+        new_cover: matches!(req.cover.action, cover::CoverAction::Replace(_)),
+        poster: req.cover.wants_poster(&req.probe),
+    };
     // Fail on a bad job before spending time on syncing.
-    if let Err(e) = subs::fix_problem(video, target, &req.externals, !delays.is_empty()) {
+    if let Err(e) = subs::fix_problem(video, target, &req.externals, work) {
         return fail(e, Vec::new());
     }
     let prepared = match prepare_externals(tools, req, cancel, update) {
         Ok(p) => p,
         Err(o) => return o,
     };
+    let remux = target != SubsTarget::Sidecar && (!prepared.externals.is_empty() || work.remux());
+    // Without a remux only the poster is made, and an MP4 plan extracts
+    // nothing but the picture for it.
+    let container = match target {
+        _ if !remux => crate::settings::Container::Mp4,
+        _ => subs::fix_container(video, target).unwrap_or(crate::settings::Container::Mkv),
+    };
+    let cover = match prepare_cover(tools, req, container, true, cancel) {
+        Ok(c) => c,
+        Err(o) => return o,
+    };
+    let done = || Outcome {
+        success: true,
+        ..Default::default()
+    };
     let mut out = match target {
+        SubsTarget::Sidecar if prepared.externals.is_empty() => done(),
         SubsTarget::Sidecar => save_sidecars(video, &prepared),
-        SubsTarget::Embed => remux_fix(tools, req, &prepared, &delays, video, cancel, update),
+        _ if !remux => done(),
+        SubsTarget::Embed => remux_fix(tools, req, &prepared, &cover.plan, video, cancel, update),
         SubsTarget::NewFile => {
             if crate::queue::same_file(&req.output, video) {
                 return fail("The output file would overwrite the input", Vec::new());
             }
-            remux_fix(tools, req, &prepared, &delays, &req.output, cancel, update)
+            remux_fix(
+                tools,
+                req,
+                &prepared,
+                &cover.plan,
+                &req.output,
+                cancel,
+                update,
+            )
         }
     };
     if out.success {
         out.report.extend(prepared.report.iter().cloned());
+        out.report.extend(cover.report.iter().cloned());
+        let beside = if target == SubsTarget::NewFile && remux {
+            &req.output
+        } else {
+            video
+        };
+        // A job that only makes a poster has failed when there is none.
+        let poster_only = !remux && prepared.externals.is_empty();
+        match save_poster(&cover, beside) {
+            Some(Ok(line)) => out.report.push(line),
+            Some(Err(e)) if poster_only => return fail(e.trim_start_matches("⚠ "), Vec::new()),
+            Some(Err(e)) => out.report.push(e),
+            None if poster_only => {
+                let why = cover.report.join("\n");
+                return fail(
+                    if why.is_empty() {
+                        "Couldn't make the poster".to_string()
+                    } else {
+                        why.trim_start_matches("⚠ ").to_string()
+                    },
+                    Vec::new(),
+                );
+            }
+            None => {}
+        }
     }
     out
 }
@@ -549,12 +773,13 @@ fn remux_fix(
     tools: &Tools,
     req: &Request,
     prepared: &PreparedSubs,
-    delays: &[(usize, i64)],
+    cover: &cover::Plan,
     dest: &Path,
     cancel: &Cancel,
     update: &mut impl FnMut(Update),
 ) -> Outcome {
     let video = &req.probe.path;
+    let delays = &subs::audio_delays(&req.selection);
     let in_place = dest == video.as_path();
     let target = if in_place {
         SubsTarget::Embed
@@ -566,26 +791,11 @@ fn remux_fix(
         Err(e) => return fail(e, Vec::new()),
     };
     let part = partial_path(dest);
-    // Cover art goes back into an MKV as an attachment; one that can't be
-    // extracted is copied as a stream instead (it loses its cover flag).
-    let mut covers = Vec::new();
-    if container == crate::settings::Container::Mkv {
-        for (i, file) in command::cover_files(&req.probe, &prepared.dir) {
-            let args = command::build_cover_extract(&req.probe, i, &file);
-            let ok = runner::run_capture(&tools.ffmpeg, &args, cancel).is_ok_and(|r| r.success);
-            if cancel.is_cancelled() {
-                return cancelled();
-            }
-            if ok && file.exists() {
-                covers.push((i, file));
-            }
-        }
-    }
     let args = match command::build_fix(
         &req.probe,
         &prepared.externals,
         delays,
-        &covers,
+        cover,
         container,
         &part,
     ) {
@@ -593,10 +803,12 @@ fn remux_fix(
         Err(e) => return fail(e, Vec::new()),
     };
     update(Update::Stage(
-        if prepared.externals.is_empty() {
+        if !prepared.externals.is_empty() {
+            "Adding subtitles"
+        } else if !delays.is_empty() {
             "Shifting audio"
         } else {
-            "Adding subtitles"
+            "Updating cover art"
         }
         .into(),
     ));
@@ -662,6 +874,16 @@ fn remux_fix(
                 ms
             ));
         }
+    }
+    match &req.cover.action {
+        cover::CoverAction::Replace(_) if req.probe.covers.is_empty() => {
+            done.push("added the cover art".into())
+        }
+        cover::CoverAction::Replace(_) => done.push("replaced the cover art".into()),
+        cover::CoverAction::Remove if !req.probe.covers.is_empty() => {
+            done.push("removed the cover art".into())
+        }
+        _ => {}
     }
     let mut line = done.join(", ");
     if let Some(c) = line.get(..1) {
@@ -1335,6 +1557,8 @@ mod media_tests {
                 externals,
                 mode: JobMode::Fix(SubsTarget::NewFile),
                 alass: None,
+                cover: Default::default(),
+                covers: Vec::new(),
             };
             let o = encode(&t, &req, &Cancel::default(), |_| {});
             assert!(o.success, "{:?} {:?}", o.error, o.stderr_tail);
@@ -1348,6 +1572,287 @@ mod media_tests {
             let videos = r.streams.iter().filter(|(_, k)| k == "video").count();
             assert_eq!(videos, 1);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Replace, keep and remove cover art in fix-tracks remuxes and in
+    /// stream-copy encodes (no VA-API needed), and save posters.
+    #[test]
+    #[ignore]
+    fn cover_art_choices_and_posters() {
+        use crate::cover::{CoverAction, CoverChoice};
+        use crate::settings::Container;
+        let t = tools();
+        let dir = std::env::temp_dir().join("encoder-test-cover-choice");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ff = |args: &[&str]| {
+            let ok = std::process::Command::new(&t.ffmpeg)
+                .args(["-v", "error", "-y"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "{args:?}");
+        };
+        let d = |n: &str| dir.join(n).to_string_lossy().into_owned();
+        // A wide 1920×1080 picture, and an MKV whose cover is a small JPEG.
+        ff(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=1920x1080",
+            "-frames:v",
+            "1",
+            &d("wide.png"),
+        ]);
+        ff(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=s=64x64",
+            "-frames:v",
+            "1",
+            &d("old.jpg"),
+        ]);
+        ff(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=d=2:s=64x64:r=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=d=2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-attach",
+            &d("old.jpg"),
+            "-metadata:s:t:0",
+            "mimetype=image/jpeg",
+            "-metadata:s:t:0",
+            "filename=cover.jpg",
+            &d("src.mkv"),
+        ]);
+        let p = probe::run(&t.ffprobe, &dir.join("src.mkv")).unwrap();
+        assert_eq!(p.covers.len(), 1);
+        let (sel, _, _) = auto_select(&p, &[], &EncodeSettings::default());
+        let size = |f: &Path| ffprobe_line(f, "stream=width,height");
+        let replace = CoverChoice {
+            action: CoverAction::Replace(dir.join("wide.png")),
+            poster_crop: true,
+            save_poster: true,
+        };
+        let run = |mode, settings: EncodeSettings, cover: CoverChoice, out: &str| {
+            let req = Request {
+                probe: p.clone(),
+                settings,
+                selection: sel.clone(),
+                output: dir.join(out),
+                device: "/dev/dri/renderD128".into(),
+                crop: None,
+                crop_on_gpu: false,
+                scan: Scan::Progressive,
+                video_kbps: None,
+                dv_preserve: false,
+                mkvpropedit: false,
+                externals: Vec::new(),
+                mode,
+                alass: None,
+                cover,
+                covers: Vec::new(),
+            };
+            let o = encode(&t, &req, &Cancel::default(), |_| {});
+            assert!(o.success, "{out}: {:?} {:?}", o.error, o.stderr_tail);
+            o
+        };
+        let copy = |container| EncodeSettings {
+            codec: VideoCodec::Copy,
+            container,
+            ..Default::default()
+        };
+
+        // Fix tracks, new file: the new cover alone is the job, cropped to 2:3
+        // and scaled to 1000 px high; the poster sits next to the new file.
+        let o = run(
+            JobMode::Fix(SubsTarget::NewFile),
+            EncodeSettings::default(),
+            replace.clone(),
+            "fix.mkv",
+        );
+        assert!(
+            o.report
+                .iter()
+                .any(|l| l.starts_with("Replaced the cover art")),
+            "{:?}",
+            o.report
+        );
+        let r = probe::run(&t.ffprobe, &dir.join("fix.mkv")).unwrap();
+        assert_eq!(r.covers.len(), 1);
+        assert_eq!(r.covers[0].mimetype.as_deref(), Some("image/jpeg"));
+        let videos = r.streams.iter().filter(|(_, k)| k == "video").count();
+        assert_eq!(videos, 1);
+        assert_eq!(size(&dir.join("fix.jpg")), "667,1000");
+
+        // Remove: no cover, no poster.
+        let rm = CoverChoice {
+            action: CoverAction::Remove,
+            save_poster: true,
+            ..Default::default()
+        };
+        run(
+            JobMode::Fix(SubsTarget::NewFile),
+            EncodeSettings::default(),
+            rm.clone(),
+            "rm.mkv",
+        );
+        assert!(
+            probe::run(&t.ffprobe, &dir.join("rm.mkv"))
+                .unwrap()
+                .covers
+                .is_empty()
+        );
+        assert!(!dir.join("rm.jpg").exists());
+
+        // Sidecar with only a poster: nothing remuxed, the poster from the
+        // source's cover (uncropped, 64×64) next to the video.
+        let keep_poster = CoverChoice {
+            save_poster: true,
+            ..Default::default()
+        };
+        let o = run(
+            JobMode::Fix(SubsTarget::Sidecar),
+            EncodeSettings::default(),
+            keep_poster.clone(),
+            "unused.mkv",
+        );
+        assert!(
+            o.report.iter().any(|l| l.contains("Saved poster src.jpg")),
+            "{:?}",
+            o.report
+        );
+        assert_eq!(size(&dir.join("src.jpg")), "64,64");
+        // Again: the same picture, so nothing is written or backed up.
+        let again = |n: &str| {
+            run(
+                JobMode::Fix(SubsTarget::Sidecar),
+                EncodeSettings::default(),
+                keep_poster.clone(),
+                n,
+            )
+        };
+        let o = again("unused.mkv");
+        assert!(o.report.iter().any(|l| l.contains("already this picture")));
+        assert!(!dir.join("src.jpg.orig").exists());
+        // The user's own poster is backed up before it's replaced, every time
+        // a different one is there, without overwriting an older backup.
+        std::fs::write(dir.join("src.jpg"), b"poster A").unwrap();
+        again("unused.mkv");
+        assert_eq!(
+            std::fs::read(dir.join("src.jpg.orig")).unwrap(),
+            b"poster A"
+        );
+        std::fs::write(dir.join("src.jpg"), b"poster B").unwrap();
+        let o = again("unused.mkv");
+        assert_eq!(
+            std::fs::read(dir.join("src.jpg.orig")).unwrap(),
+            b"poster A"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("src.jpg.orig2")).unwrap(),
+            b"poster B"
+        );
+        assert!(o.report.iter().any(|l| l.contains("kept as src.jpg.orig2")));
+        // Poster A back again: its backup already exists, no third copy.
+        std::fs::write(dir.join("src.jpg"), b"poster A").unwrap();
+        again("unused.mkv");
+        assert!(!dir.join("src.jpg.orig3").exists());
+        assert_eq!(size(&dir.join("src.jpg")), "64,64");
+
+        // Encode (stream copy) to MKV keeps the source's cover; it used to be lost.
+        run(
+            JobMode::Encode,
+            copy(Container::Mkv),
+            CoverChoice::default(),
+            "keep.mkv",
+        );
+        let r = probe::run(&t.ffprobe, &dir.join("keep.mkv")).unwrap();
+        assert_eq!(r.covers.len(), 1);
+        assert_eq!(r.covers[0].filename.as_deref(), Some("cover.jpg"));
+
+        // Encode to MP4 with a new cover: an attached_pic stream, not a track.
+        run(JobMode::Encode, copy(Container::Mp4), replace, "new.mp4");
+        let r = probe::run(&t.ffprobe, &dir.join("new.mp4")).unwrap();
+        assert_eq!(r.covers.len(), 1, "{:?}", r.streams);
+        assert_eq!(r.covers[0].codec, "mjpeg");
+        assert_eq!(r.video.as_ref().unwrap().codec, "h264");
+        assert_eq!(size(&dir.join("new.jpg")), "667,1000");
+
+        // Remuxing that MP4 again keeps its cover as a flagged stream.
+        let p4 = probe::run(&t.ffprobe, &dir.join("new.mp4")).unwrap();
+        let req = Request {
+            probe: p4,
+            settings: EncodeSettings::default(),
+            selection: sel.clone(),
+            output: dir.join("again.mp4"),
+            device: String::new(),
+            crop: None,
+            crop_on_gpu: false,
+            scan: Scan::Progressive,
+            video_kbps: None,
+            dv_preserve: false,
+            mkvpropedit: false,
+            externals: Vec::new(),
+            mode: JobMode::Fix(SubsTarget::NewFile),
+            alass: None,
+            cover: rm,
+            covers: Vec::new(),
+        };
+        let o = encode(&t, &req, &Cancel::default(), |_| {});
+        assert!(o.success, "{:?} {:?}", o.error, o.stderr_tail);
+        assert!(
+            probe::run(&t.ffprobe, &dir.join("again.mp4"))
+                .unwrap()
+                .covers
+                .is_empty()
+        );
+
+        // A picture that can't be read fails the job before any work.
+        std::fs::write(dir.join("bad.png"), b"not a picture").unwrap();
+        let bad = CoverChoice {
+            action: CoverAction::Replace(dir.join("bad.png")),
+            ..Default::default()
+        };
+        let req = Request {
+            probe: p.clone(),
+            settings: copy(Container::Mkv),
+            selection: sel.clone(),
+            output: dir.join("bad.mkv"),
+            device: String::new(),
+            crop: None,
+            crop_on_gpu: false,
+            scan: Scan::Progressive,
+            video_kbps: None,
+            dv_preserve: false,
+            mkvpropedit: false,
+            externals: Vec::new(),
+            mode: JobMode::Encode,
+            alass: None,
+            cover: bad,
+            covers: Vec::new(),
+        };
+        let o = encode(&t, &req, &Cancel::default(), |_| {});
+        assert!(!o.success);
+        assert!(
+            o.error
+                .unwrap()
+                .contains("Couldn't read the cover image bad.png")
+        );
+        assert!(!dir.join("bad.mkv").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1384,6 +1889,8 @@ mod media_tests {
             externals: Vec::new(),
             mode: JobMode::Fix(SubsTarget::NewFile),
             alass: None,
+            cover: Default::default(),
+            covers: Vec::new(),
         };
         let o = encode(&t, &req, &Cancel::default(), |_| {});
         assert!(o.success, "{:?} {:?}", o.error, o.stderr_tail);
@@ -1450,6 +1957,8 @@ mod media_tests {
             externals: Vec::new(),
             mode: JobMode::Encode,
             alass: None,
+            cover: Default::default(),
+            covers: Vec::new(),
         };
         let mut progress = 0;
         let o = encode(&t, &req, &Cancel::default(), |u| {
@@ -1659,6 +2168,8 @@ mod media_tests {
             externals: Vec::new(),
             mode: JobMode::Encode,
             alass: None,
+            cover: Default::default(),
+            covers: Vec::new(),
         };
         assert_eq!(req.first_decode(), DecodeMode::Hardware);
         match estimate_video(&t, &req, &Cancel::default()) {

@@ -103,25 +103,30 @@ pub struct Cover {
 }
 
 impl Cover {
+    /// Extension and MIME type for the picture codec (ffprobe names).
+    fn kind(&self) -> (&'static str, &'static str) {
+        match self.codec.as_str() {
+            "png" => ("png", "image/png"),
+            "bmp" => ("bmp", "image/bmp"),
+            "gif" => ("gif", "image/gif"),
+            "tiff" => ("tif", "image/tiff"),
+            "webp" => ("webp", "image/webp"),
+            _ => ("jpg", "image/jpeg"),
+        }
+    }
+
     /// File name to write it back as an MKV attachment.
     pub fn file_name(&self) -> String {
         self.filename
             .clone()
             .filter(|f| !f.is_empty() && !f.contains('/'))
-            .unwrap_or_else(|| {
-                let ext = if self.codec == "png" { "png" } else { "jpg" };
-                format!("cover.{ext}")
-            })
+            .unwrap_or_else(|| format!("cover.{}", self.kind().0))
     }
 
     pub fn mime(&self) -> String {
-        self.mimetype.clone().unwrap_or_else(|| {
-            if self.codec == "png" {
-                "image/png".into()
-            } else {
-                "image/jpeg".into()
-            }
-        })
+        self.mimetype
+            .clone()
+            .unwrap_or_else(|| self.kind().1.to_string())
     }
 }
 
@@ -676,5 +681,28 @@ pub mod tests {
         assert_eq!(bit_depth("p012", None), 12);
         assert_eq!(bit_depth("yuv410p", None), 8);
         assert_eq!(bit_depth("yuv420p", Some(10)), 10);
+    }
+
+    #[test]
+    fn cover_names_follow_the_picture_codec() {
+        let c = |codec: &str| Cover {
+            codec: codec.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            (c("bmp").file_name(), c("bmp").mime()),
+            ("cover.bmp".into(), "image/bmp".into())
+        );
+        assert_eq!(c("mjpeg").file_name(), "cover.jpg");
+        assert_eq!(c("png").mime(), "image/png");
+        let named = Cover {
+            filename: Some("poster.gif".into()),
+            mimetype: Some("image/gif".into()),
+            ..c("gif")
+        };
+        assert_eq!(
+            (named.file_name(), named.mime()),
+            ("poster.gif".into(), "image/gif".into())
+        );
     }
 }
