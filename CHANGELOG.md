@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.1
+
+- Subtitles-only jobs always ask before replacing a file, including jobs added while the queue is running and jobs edited after you approved them.
+- Saving subtitles next to a video is all or nothing, and any existing subtitle file that gets replaced is kept as `.orig` (also with `encoder --add-subs`). Retrying a failed job no longer shifts the timing twice.
+- Subtitles for `Blade.Runner.2049.mkv` are no longer picked up by `Blade.Runner.mkv` in the same folder. A subtitle file dropped while its video is encoding is no longer handed to another job.
+- Subtitle files you add yourself stay selected after the video is read. Only files found next to the video are limited to your preferred languages.
+- Embedding subtitles into `.m4v` files works (HEVC and files with chapters failed before).
+- Titles like "Dr. No" or "The Day It…" are no longer read as a language code.
+- SRT text after a blank line inside a subtitle is kept. UTF-16 files without a byte-order mark are read correctly, and the report says when a file was read as Windows-1252.
+- The "only PGS" question comes back when you switch a job from subtitles-only to re-encode, or remove the SRT that covered that language.
+- Folders are scanned for subtitle files in the background, so a slow NAS no longer freezes the window. No VMAF run after subtitles-only jobs.
+
+## 0.5.0
+
+- External SRT subtitles: files next to the video are found automatically (`Movie.no.srt`, `Movie.en.forced.srt`, `Movie.en.sdh.srt`), and more can be dropped on the window or added per job. Language and kind come from the file name and can be changed.
+- Subtitle sync with alass (optional): each file is lined up against an embedded text subtitle, or the speech in the audio, before use. A manual offset is available too. The finished job reports what changed, e.g. "shifted −1.80 s" or "framerate corrected".
+- Subtitles only, no re-encode: save the synced subtitles next to the video for Plex, or embed them into the MKV/MP4. An embed writes a new copy, checks it, and only then replaces the original. *Add Subtitles to Videos…* in the menu, or `encoder --add-subs`.
+- Windows-1252 subtitle files are converted to UTF-8, and an external SRT replaces an embedded PGS track of the same language.
+
 ## 0.4.1
 
 - The finished-job summary shows the target size in MB or GB with full precision ("target 100 MB", not "target 0.1 GB").

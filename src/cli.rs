@@ -9,6 +9,7 @@ use crate::ffmpeg::runner::Cancel;
 use crate::ffmpeg::{capabilities, command, probe};
 use crate::scan::{self, ScanOverride, ScanType};
 use crate::settings::{EncodeSettings, Prefs, RateControl, VideoCodec};
+use crate::subs::{self, ExternalSub, JobMode, SubsTarget};
 use crate::worker::{self, Request, Tools, Update};
 use crate::{checks, presets, queue, tracks};
 
@@ -16,6 +17,8 @@ pub struct Options {
     pub file: PathBuf,
     pub preset: Option<String>,
     pub out_dir: Option<PathBuf>,
+    /// External SRT files to mux in (`--subs`).
+    pub subs: Vec<PathBuf>,
 }
 
 struct Prepared {
@@ -40,7 +43,13 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
     };
     let tools = Tools::default();
     let p = probe::run(&tools.ffprobe, &o.file)?;
-    let (sel, _, questions) = tracks::auto_select(&p, &prefs.preferred_languages, &settings);
+    let (mut sel, _, questions) = tracks::auto_select(&p, &prefs.preferred_languages, &settings);
+    let externals: Vec<ExternalSub> = o
+        .subs
+        .iter()
+        .map(|s| ExternalSub::from_path(&o.file, s.clone(), prefs.sync_subs))
+        .collect();
+    subs::prefer_externals(&mut sel, &p, &externals);
     for q in &questions {
         eprintln!(
             "note: only PGS subtitles for {}; the app would ask (left out here)",
@@ -104,6 +113,9 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
             )
             .is_none(),
         mkvpropedit: caps.mkvpropedit,
+        externals,
+        mode: JobMode::Encode,
+        alass: caps.alass.clone(),
         settings,
         selection: sel,
         probe: p,
@@ -243,10 +255,12 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
     let mut file = None;
     let mut preset = None;
     let mut out_dir = None;
+    let mut subs = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--preset" => preset = Some(it.next().ok_or("--preset needs a name")?.clone()),
+            "--subs" => subs.push(PathBuf::from(it.next().ok_or("--subs needs a file")?)),
             "--out" => out_dir = Some(PathBuf::from(it.next().ok_or("--out needs a folder")?)),
             f if !f.starts_with("--") && file.is_none() => file = Some(PathBuf::from(f)),
             other => return Err(format!("Unexpected argument {other}")),
@@ -260,5 +274,83 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
         file,
         preset,
         out_dir,
+        subs,
     })
+}
+
+/// `--add-subs VIDEO [SRT…] [--embed] [--no-sync]`: the subtitles-only job.
+/// Without SRT files, the video's sidecars are used.
+pub fn add_subs(args: &[String]) -> Result<(), String> {
+    let mut video: Option<PathBuf> = None;
+    let mut files = Vec::new();
+    let mut target = SubsTarget::Sidecar;
+    let mut sync = true;
+    for a in args {
+        match a.as_str() {
+            "--embed" => target = SubsTarget::Embed,
+            "--no-sync" => sync = false,
+            f if f.starts_with("--") => return Err(format!("Unexpected argument {f}")),
+            f if video.is_none() => video = Some(PathBuf::from(f)),
+            f => files.push(PathBuf::from(f)),
+        }
+    }
+    let video = video.ok_or("Missing VIDEO")?;
+    if files.is_empty() {
+        files = subs::discover(&video);
+    }
+    if files.is_empty() {
+        return Err("No subtitle files given or found next to the video".into());
+    }
+    let prefs = Prefs::load();
+    let tools = Tools::default();
+    let p = probe::run(&tools.ffprobe, &video)?;
+    let settings = prefs.last_settings.clone();
+    let (sel, _, _) = tracks::auto_select(&p, &prefs.preferred_languages, &settings);
+    let externals: Vec<ExternalSub> = files
+        .into_iter()
+        .map(|f| ExternalSub::from_path(&video, f, sync))
+        .collect();
+    let alass = ["alass", "alass-cli"]
+        .into_iter()
+        .find(|p| crate::ffmpeg::runner::which(p))
+        .map(String::from);
+    for e in &externals {
+        println!(
+            "subs    {} · {} · {}",
+            e.file_name(),
+            e.language_name(),
+            e.kind.short()
+        );
+    }
+    let req = Request {
+        output: video.clone(),
+        device: String::new(),
+        crop: None,
+        crop_on_gpu: false,
+        scan: crate::scan::Scan::Progressive,
+        video_kbps: None,
+        dv_preserve: false,
+        mkvpropedit: false,
+        externals,
+        mode: JobMode::Subtitles(target),
+        alass,
+        settings,
+        selection: sel,
+        probe: p,
+    };
+    let out = worker::encode(&tools, &req, &Cancel::default(), |u| {
+        if let Update::Stage(s) = u {
+            eprintln!("· {s}");
+        }
+    });
+    if !out.success {
+        for l in &out.stderr_tail {
+            eprintln!("  | {l}");
+        }
+        return Err(out.error.unwrap_or_else(|| "cancelled".into()));
+    }
+    for line in &out.report {
+        println!("result  {line}");
+    }
+    Ok(())
 }

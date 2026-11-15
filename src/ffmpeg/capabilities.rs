@@ -64,6 +64,8 @@ pub struct Capabilities {
     pub missing_filters: Vec<String>,
     pub dovi_tool: bool,
     pub mkvpropedit: bool,
+    /// Subtitle sync tool (`alass`, or `alass-cli` from `cargo install`).
+    pub alass: Option<String>,
 }
 
 impl Capabilities {
@@ -301,6 +303,10 @@ pub fn detect(ffmpeg: &str, ffprobe: &str, configured_device: Option<&str>) -> C
         ffprobe: runner::which(ffprobe),
         dovi_tool: runner::which("dovi_tool"),
         mkvpropedit: runner::which("mkvpropedit"),
+        alass: ["alass", "alass-cli"]
+            .into_iter()
+            .find(|p| runner::which(p))
+            .map(String::from),
         devices: render_devices(),
         ..Default::default()
     };

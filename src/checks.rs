@@ -805,6 +805,83 @@ pub fn apply_fix(fix: Fix, p: &ProbeInfo, s: &mut EncodeSettings, sel: &mut Sele
     }
 }
 
+/// Checks for external subtitle files and subtitles-only jobs.
+pub fn external_issues(
+    video: &std::path::Path,
+    settings: &EncodeSettings,
+    mode: crate::subs::JobMode,
+    externals: &[crate::subs::ExternalSub],
+    alass: bool,
+) -> Vec<Issue> {
+    use crate::subs::{self, JobMode, SubsTarget};
+    let selected: Vec<_> = externals.iter().filter(|e| e.selected).collect();
+    let mut v: Vec<Option<Issue>> = Vec::new();
+    if let JobMode::Subtitles(target) = mode {
+        if selected.is_empty() {
+            v.push(issue(
+                "nosubs",
+                Severity::Strong,
+                "No subtitle files to add. Use “Add Subtitle File…” or put files like Movie.no.srt next to the video.",
+                None,
+            ));
+        }
+        match target {
+            SubsTarget::Sidecar => {
+                if let Err(e) = subs::sidecar_outputs(video, externals) {
+                    v.push(issue("sidecarclash", Severity::Strong, e, None));
+                }
+            }
+            SubsTarget::Embed => match subs::embed_container(video) {
+                Err(e) => v.push(issue("embedcontainer", Severity::Strong, e, None)),
+                Ok(_) => {
+                    if selected.iter().any(|e| e.is_sidecar_of(video)) {
+                        v.push(issue(
+                            "sidecarstays",
+                            Severity::Info,
+                            "The .srt files next to the video stay where they are after embedding; Plex will list those subtitles twice until you remove them.",
+                            None,
+                        ));
+                    }
+                }
+            },
+        }
+    } else if !selected.is_empty() && settings.container == Container::Mp4 {
+        v.push(issue(
+            "mp4movtext",
+            Severity::Info,
+            "External subtitles are stored as MP4 text subtitles (mov_text), which Apple TV plays; styling is lost.",
+            None,
+        ));
+    }
+    if !alass && selected.iter().any(|e| e.sync) {
+        v.push(issue(
+            "noalass",
+            Severity::Info,
+            "alass isn't installed, so subtitles can't be synced automatically; only the manual offset is applied.",
+            None,
+        ));
+    }
+    let unknown: Vec<String> = selected
+        .iter()
+        .filter(|e| e.language.is_none())
+        .map(|e| e.file_name())
+        .collect();
+    if !unknown.is_empty() {
+        v.push(issue(
+            "sublang",
+            Severity::Warning,
+            format!(
+                "Language unknown for {}. Pick one, or Plex shows the subtitles as “Unknown”.",
+                unknown.join(", ")
+            ),
+            None,
+        ));
+    }
+    let mut out: Vec<Issue> = v.into_iter().flatten().collect();
+    out.sort_by_key(|i| std::cmp::Reverse(i.severity));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1313,5 +1390,63 @@ mod tests {
         assert_eq!(i.alt_fix, Some(Fix::ConvertMp4Audio));
         apply_fix(Fix::ConvertMp4Audio, &f.p, &mut f.s, &mut f.sel);
         assert!(!ids(&container_conflicts(&f.input())).contains(&"mp4audio"));
+    }
+
+    #[test]
+    fn external_subtitle_checks() {
+        use crate::subs::{ExtKind, ExternalSub, JobMode, SubsTarget};
+        use std::path::Path;
+        let v = Path::new("/nonexistent/Film.mkv");
+        let ids = |mode, ext: &[ExternalSub], alass, s: &EncodeSettings| -> Vec<&'static str> {
+            external_issues(v, s, mode, ext, alass)
+                .iter()
+                .map(|i| i.id)
+                .collect()
+        };
+        let s = EncodeSettings::default();
+        let sidecar = JobMode::Subtitles(SubsTarget::Sidecar);
+        assert_eq!(ids(sidecar, &[], true, &s), vec!["nosubs"]);
+        let no = ExternalSub::from_path(v, "/nonexistent/Film.no.srt".into(), true);
+        assert!(ids(sidecar, std::slice::from_ref(&no), true, &s).is_empty());
+        assert_eq!(
+            ids(sidecar, std::slice::from_ref(&no), false, &s),
+            vec!["noalass"]
+        );
+        let mut twin = no.clone();
+        twin.path = "/x/other.srt".into();
+        assert_eq!(
+            ids(sidecar, &[no.clone(), twin.clone()], true, &s),
+            vec!["sidecarclash"]
+        );
+        twin.kind = ExtKind::Forced;
+        twin.language = None;
+        assert_eq!(ids(sidecar, &[no.clone(), twin], true, &s), vec!["sublang"]);
+        let avi = Path::new("/x/Film.avi");
+        let embed = external_issues(
+            avi,
+            &s,
+            JobMode::Subtitles(SubsTarget::Embed),
+            std::slice::from_ref(&no),
+            true,
+        );
+        assert_eq!(embed[0].id, "embedcontainer");
+        // Embedding the video's own sidecar: it stays on disk (decided from
+        // the names, without reading the folder).
+        let embed = JobMode::Subtitles(SubsTarget::Embed);
+        assert_eq!(
+            ids(embed, std::slice::from_ref(&no), true, &s),
+            vec!["sidecarstays"]
+        );
+        let elsewhere = ExternalSub::from_path(v, "/downloads/Film.no.srt".into(), true);
+        assert!(ids(embed, &[elsewhere], true, &s).is_empty());
+        let mp4 = EncodeSettings {
+            container: Container::Mp4,
+            ..Default::default()
+        };
+        assert_eq!(
+            ids(JobMode::Encode, std::slice::from_ref(&no), true, &mp4),
+            vec!["mp4movtext"]
+        );
+        assert!(ids(JobMode::Encode, &[no], true, &s).is_empty());
     }
 }

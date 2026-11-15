@@ -8,6 +8,7 @@ use crate::crop::Crop;
 use crate::ffmpeg::probe::ProbeInfo;
 use crate::scan::Scan;
 use crate::settings::{Container, EncodeSettings, RateControl, VideoCodec, av1_qindex};
+use crate::subs::ExternalSub;
 use crate::tracks::{
     AudioAction, Selection, SubKind, is_audio_description, is_commentary, sub_kind,
 };
@@ -52,6 +53,8 @@ pub struct EncodeJob<'a> {
     /// Write a raw Annex B HEVC stream (Dolby Vision pipeline).
     pub raw_hevc: bool,
     pub progress: bool,
+    /// SRT files muxed in after the embedded subtitles (inputs 1, 2, …).
+    pub externals: &'a [ExternalSub],
 }
 
 impl<'a> EncodeJob<'a> {
@@ -77,6 +80,7 @@ impl<'a> EncodeJob<'a> {
             video_only: false,
             raw_hevc: false,
             progress: true,
+            externals: &[],
         }
     }
 }
@@ -266,6 +270,15 @@ pub fn build(job: &EncodeJob) -> Result<Vec<OsString>, String> {
         a.kv("-t", format!("{len:.3}"));
     }
     a.kv("-i", &p.path);
+    let externals: Vec<&ExternalSub> = if job.video_only || job.raw_hevc {
+        Vec::new()
+    } else {
+        job.externals.iter().filter(|e| e.selected).collect()
+    };
+    for e in &externals {
+        a.add(&["-f", "srt"]);
+        a.kv("-i", &e.path);
+    }
 
     if encode && let Some(vf) = video_filter(job) {
         a.kv("-vf", vf);
@@ -288,6 +301,9 @@ pub fn build(job: &EncodeJob) -> Result<Vec<OsString>, String> {
     }
     for c in &subs {
         a.kv("-map", format!("0:{}", c.index));
+    }
+    for k in 1..=externals.len() {
+        a.kv("-map", format!("{k}:0"));
     }
     let fonts = !job.video_only && !mp4 && p.attachments > 0;
     if fonts {
@@ -434,6 +450,12 @@ pub fn build(job: &EncodeJob) -> Result<Vec<OsString>, String> {
         }
         a.kv(format!("-disposition:s:{i}"), disposition_flags(&flags));
     }
+    // External SRTs: MP4 holds text subtitles only as mov_text.
+    for (j, e) in externals.iter().enumerate() {
+        let i = subs.len() + j;
+        a.kv(format!("-c:s:{i}"), if mp4 { "mov_text" } else { "srt" });
+        a.kv(format!("-disposition:s:{i}"), e.kind.disposition());
+    }
 
     if !job.video_only {
         if s.keep_metadata {
@@ -482,6 +504,9 @@ pub fn build(job: &EncodeJob) -> Result<Vec<OsString>, String> {
                 tags("s", i, &src.language, &src.title);
             }
         }
+        for (j, e) in externals.iter().enumerate() {
+            tags("s", subs.len() + j, &e.language, &None);
+        }
     }
 
     if mp4 {
@@ -520,8 +545,10 @@ pub fn build_dv_mux(job: &EncodeJob, raw_video: &Path) -> Result<Vec<OsString>, 
         ..job.clone()
     };
     let mut args = build(&inner)?;
-    // Insert the raw stream as input 1 after the source input and remap the video.
-    let src_pos = args.iter().position(|x| x == "-i").ok_or("no input")? + 2;
+    // Insert the raw stream after the last input (the source, then any external
+    // subtitles) and remap the video to it.
+    let inputs = args.iter().filter(|x| *x == "-i").count();
+    let src_pos = args.iter().rposition(|x| x == "-i").ok_or("no input")? + 2;
     // A raw stream has no timestamps; generate them (B-frames reorder frames).
     let extra: Vec<OsString> = ["-fflags", "+genpts", "-f", "hevc", "-framerate"]
         .iter()
@@ -531,9 +558,69 @@ pub fn build_dv_mux(job: &EncodeJob, raw_video: &Path) -> Result<Vec<OsString>, 
     args.splice(src_pos..src_pos, extra);
     let v_index = job.probe.video.as_ref().map(|v| v.index).unwrap_or(0);
     if let Some(m) = args.iter().position(|x| *x == *format!("0:{v_index}")) {
-        args[m] = "1:v:0".into();
+        args[m] = format!("{inputs}:v:0").into();
     }
     Ok(args)
+}
+
+/// Subtitles-only embed: every stream of the source copied as it is, plus the
+/// external SRTs. Global metadata, chapters and attachments come along.
+pub fn build_embed(
+    p: &ProbeInfo,
+    externals: &[ExternalSub],
+    container: Container,
+    output: &Path,
+) -> Result<Vec<OsString>, String> {
+    if output == p.path.as_path() {
+        return Err("The output file would overwrite the input".into());
+    }
+    let ext: Vec<&ExternalSub> = externals.iter().filter(|e| e.selected).collect();
+    if ext.is_empty() {
+        return Err("No subtitle files selected".into());
+    }
+    let mut a = Args(Vec::new());
+    a.add(&["-hide_banner", "-y", "-i"]);
+    a.0.push(p.path.as_os_str().into());
+    for e in &ext {
+        a.add(&["-f", "srt", "-i"]);
+        a.0.push(e.path.as_os_str().into());
+    }
+    a.add(&["-map", "0"]);
+    for k in 1..=ext.len() {
+        a.kv("-map", format!("{k}:0"));
+    }
+    a.add(&["-c", "copy", "-map_metadata", "0", "-map_chapters", "0"]);
+    let mp4 = container == Container::Mp4;
+    let first = p.subtitles.len();
+    for (j, e) in ext.iter().enumerate() {
+        let i = first + j;
+        a.kv(format!("-c:s:{i}"), if mp4 { "mov_text" } else { "srt" });
+        a.kv(format!("-disposition:s:{i}"), e.kind.disposition());
+        if let Some(l) = &e.language {
+            a.kv(format!("-metadata:s:s:{i}"), format!("language={l}"));
+        }
+    }
+    if mp4 {
+        a.add(&["-movflags", "+faststart"]);
+    } else {
+        // Don't let the muxer make a subtitle track default on its own: players
+        // would then show subtitles nobody asked for.
+        a.add(&["-default_mode", "infer_no_subs"]);
+    }
+    // Name the muxer: from a `.part.m4v` name ffmpeg would pick `ipod`, which
+    // refuses HEVC and chapter tracks.
+    let mov = p
+        .path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("mov"));
+    let muxer = match container {
+        Container::Mkv => "matroska",
+        Container::Mp4 if mov => "mov",
+        Container::Mp4 => "mp4",
+    };
+    a.add(&["-progress", "pipe:1", "-nostats", "-f", muxer]);
+    a.0.push(output.into());
+    Ok(a.0)
 }
 
 /// Size of the encoded picture after cropping and downscaling (`scale_vaapi=w=-2`).
@@ -1228,5 +1315,159 @@ mod tests {
             .collect();
         assert!(a.iter().any(|x| x == "default+forced"), "{a:?}");
         assert!(a.iter().any(|x| x.contains("original")), "{a:?}");
+    }
+
+    fn ext(path: &str, lang: Option<&str>, kind: crate::subs::ExtKind) -> ExternalSub {
+        ExternalSub {
+            path: path.into(),
+            language: lang.map(Into::into),
+            kind,
+            selected: true,
+            sync: false,
+            offset_ms: 0,
+            auto: false,
+            bytes: 0,
+        }
+    }
+
+    fn strings(v: Vec<OsString>) -> Vec<String> {
+        v.into_iter().map(|x| x.into_string().unwrap()).collect()
+    }
+
+    #[test]
+    fn external_subtitles_are_extra_inputs_after_embedded_ones() {
+        use crate::subs::ExtKind;
+        let mut unused = ext("/s/off.srt", Some("swe"), ExtKind::Full);
+        unused.selected = false;
+        // `args_for` builds its own job, so the slice has to outlive it.
+        let externals: &'static [ExternalSub] = Vec::leak(vec![
+            ext("/s/F.no.srt", Some("nor"), ExtKind::Full),
+            unused,
+            ext("/s/F.en.forced.srt", Some("eng"), ExtKind::Forced),
+        ]);
+        let a = args_for(&EncodeSettings::default(), |j| j.externals = externals);
+        assert!(has(
+            &a,
+            &[
+                "-f",
+                "srt",
+                "-i",
+                "/s/F.no.srt",
+                "-f",
+                "srt",
+                "-i",
+                "/s/F.en.forced.srt"
+            ]
+        ));
+        assert!(!a.contains(&"/s/off.srt".to_string()));
+        let embedded = a.iter().filter(|x| x.starts_with("-c:s:")).count() - 2;
+        let (i, k) = (embedded, embedded + 1);
+        assert!(has(&a, &["-map", "1:0", "-map", "2:0"]));
+        assert!(has(
+            &a,
+            &[
+                &format!("-c:s:{i}"),
+                "srt",
+                &format!("-disposition:s:{i}"),
+                "0"
+            ]
+        ));
+        assert!(has(
+            &a,
+            &[
+                &format!("-c:s:{k}"),
+                "srt",
+                &format!("-disposition:s:{k}"),
+                "forced"
+            ]
+        ));
+        assert!(has(&a, &[&format!("-metadata:s:s:{i}"), "language=nor"]));
+        assert!(has(&a, &[&format!("-metadata:s:s:{k}"), "language=eng"]));
+        // The external inputs come after the source and before the output options.
+        let src = a.iter().position(|x| x == "/s/F.no.srt").unwrap();
+        assert!(a.iter().position(|x| x == "-c:v").unwrap() > src);
+    }
+
+    #[test]
+    fn external_subtitles_in_mp4_become_mov_text() {
+        use crate::subs::ExtKind;
+        let externals: &'static [ExternalSub] =
+            Vec::leak(vec![ext("/s/F.no.srt", Some("nor"), ExtKind::Full)]);
+        let s = EncodeSettings {
+            container: Container::Mp4,
+            ..Default::default()
+        };
+        let a = args_for(&s, |j| j.externals = externals);
+        // Embedded subtitles are dropped for MP4, so the external one is s:0.
+        assert!(has(&a, &["-map", "1:0"]));
+        assert!(has(&a, &["-c:s:0", "mov_text"]));
+        // Video-only runs (estimates, VMAF, raw DV) never read them.
+        let a = args_for(&EncodeSettings::default(), |j| {
+            j.externals = externals;
+            j.video_only = true;
+        });
+        assert!(!a.contains(&"/s/F.no.srt".to_string()));
+    }
+
+    #[test]
+    fn dv_mux_with_external_subtitles_numbers_inputs_right() {
+        use crate::subs::ExtKind;
+        let p = sample_4k();
+        let s = EncodeSettings::default();
+        let (sel, _, _) = auto_select(&p, &langs(), &s);
+        let externals = vec![ext("/s/F.no.srt", Some("nor"), ExtKind::Full)];
+        let mut job = EncodeJob::new(&p, &s, &sel, Path::new("/out/x.mkv"), "/d");
+        job.externals = &externals;
+        let m = strings(build_dv_mux(&job, Path::new("/tmp/v_dv.hevc")).unwrap());
+        // Source = 0, subtitle = 1, raw video = 2.
+        assert!(has(&m, &["-i", "/s/F.no.srt", "-fflags", "+genpts"]));
+        assert!(has(&m, &["-map", "2:v:0"]));
+        assert!(has(&m, &["-map", "1:0"]));
+        let raw = m.iter().position(|x| x == "/tmp/v_dv.hevc").unwrap();
+        assert_eq!(m.iter().take(raw).filter(|x| *x == "-i").count(), 3);
+    }
+
+    #[test]
+    fn embed_copies_everything_and_appends_subtitles() {
+        use crate::subs::ExtKind;
+        let p = sample_4k();
+        let embedded = p.subtitles.len();
+        let externals = vec![
+            ext("/s/F.no.srt", Some("nor"), ExtKind::Full),
+            ext("/s/F.en.sdh.srt", None, ExtKind::Sdh),
+        ];
+        let out = Path::new("/lib/F.part.mkv");
+        let a = strings(build_embed(&p, &externals, Container::Mkv, out).unwrap());
+        assert!(has(
+            &a,
+            &["-map", "0", "-map", "1:0", "-map", "2:0", "-c", "copy"]
+        ));
+        assert!(has(&a, &["-map_metadata", "0", "-map_chapters", "0"]));
+        let i = embedded;
+        assert!(has(
+            &a,
+            &[
+                &format!("-c:s:{i}"),
+                "srt",
+                &format!("-disposition:s:{i}"),
+                "0"
+            ]
+        ));
+        assert!(has(&a, &[&format!("-metadata:s:s:{i}"), "language=nor"]));
+        let k = embedded + 1;
+        assert!(has(
+            &a,
+            &[&format!("-disposition:s:{k}"), "hearing_impaired"]
+        ));
+        assert!(!a.contains(&format!("-metadata:s:s:{k}")));
+        assert!(has(&a, &["-default_mode", "infer_no_subs"]));
+        assert!(has(&a, &["-f", "matroska", "/lib/F.part.mkv"]));
+        assert_eq!(a.last().unwrap(), "/lib/F.part.mkv");
+        let a = strings(build_embed(&p, &externals, Container::Mp4, out).unwrap());
+        assert!(has(&a, &[&format!("-c:s:{i}"), "mov_text"]));
+        assert!(has(&a, &["-movflags", "+faststart"]));
+        assert!(has(&a, &["-f", "mp4"]));
+        assert!(build_embed(&p, &externals, Container::Mkv, &p.path).is_err());
+        assert!(build_embed(&p, &[], Container::Mkv, out).is_err());
     }
 }

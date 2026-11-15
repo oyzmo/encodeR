@@ -9,6 +9,7 @@ mod presets;
 mod queue;
 mod scan;
 mod settings;
+mod subs;
 mod theme;
 mod tracks;
 mod ui;
@@ -20,11 +21,21 @@ use std::path::PathBuf;
 use adw::prelude::*;
 
 const USAGE: &str = "Usage: encoder [FILE…]
-       encoder --print-command FILE [--preset NAME] [--out DIR]
-       encoder --encode FILE [--preset NAME] [--out DIR]
+       encoder --print-command FILE [--preset NAME] [--out DIR] [--subs SRT]…
+       encoder --encode FILE [--preset NAME] [--out DIR] [--subs SRT]…
+       encoder --add-subs VIDEO [SRT…] [--embed] [--no-sync]
        encoder --version";
 
 fn run_cli(mode: &str, rest: &[String]) -> gtk::glib::ExitCode {
+    if mode == "--add-subs" {
+        return match cli::add_subs(rest) {
+            Ok(()) => gtk::glib::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                gtk::glib::ExitCode::FAILURE
+            }
+        };
+    }
     let result = cli::parse_options(rest).and_then(|o| {
         if mode == "--encode" {
             cli::encode(&o)
@@ -55,7 +66,9 @@ fn main() -> gtk::glib::ExitCode {
                 println!("{USAGE}");
                 return gtk::glib::ExitCode::SUCCESS;
             }
-            "--print-command" | "--encode" => return run_cli(&args[i], &args[i + 1..]),
+            "--print-command" | "--encode" | "--add-subs" => {
+                return run_cli(&args[i], &args[i + 1..]);
+            }
             a if a.starts_with('-') => {
                 eprintln!("Unknown option {a}\n{USAGE}");
                 return gtk::glib::ExitCode::FAILURE;

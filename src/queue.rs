@@ -10,6 +10,7 @@ use crate::ffmpeg::progress::Progress;
 use crate::ffmpeg::vmaf::VmafResult;
 use crate::scan::{self, Scan, ScanOverride, ScanType};
 use crate::settings::{Container, EncodeSettings, Prefs};
+use crate::subs::{ExternalSub, JobMode};
 use crate::tracks::{LangGroup, PgsQuestion, Selection};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +125,12 @@ pub struct Job {
     pub output: Option<PathBuf>,
     /// Existing output the user agreed to replace (asked when Start is pressed).
     pub replace_ok: Option<PathBuf>,
+    pub mode: JobMode,
+    /// SRT files added to the job, muxed in or saved next to the video.
+    pub externals: Vec<ExternalSub>,
+    /// Files a subtitles-only job may replace, as the user approved them.
+    /// Anything the job would replace that isn't listed is asked about again.
+    pub subs_ok: Vec<PathBuf>,
 }
 
 impl Job {
@@ -160,6 +167,9 @@ impl Job {
             report: Vec::new(),
             output: None,
             replace_ok: None,
+            mode: JobMode::Encode,
+            externals: Vec::new(),
+            subs_ok: Vec::new(),
         }
     }
 
@@ -209,6 +219,54 @@ impl Job {
                 .is_some_and(|h| h < v.height),
             dovi_tool,
         )
+    }
+
+    /// After external subtitles change: an SRT replaces the embedded PGS of
+    /// its language and kind, and answers that language's PGS question.
+    pub fn externals_changed(&mut self) {
+        if let Some(p) = &self.probe {
+            crate::subs::prefer_externals(&mut self.selection, p, &self.externals);
+        }
+        let ext = self.externals.clone();
+        self.pgs_pending
+            .retain(|q| !crate::subs::covers_language(&ext, &q.family));
+    }
+
+    /// Bytes of the selected external subtitle files.
+    pub fn external_bytes(&self) -> u64 {
+        self.externals
+            .iter()
+            .filter(|e| e.selected)
+            .map(|e| e.bytes)
+            .sum()
+    }
+
+    /// Existing files a subtitles-only job would replace right now: the video
+    /// for an embed, or sidecars already there that aren't their own source.
+    pub fn subs_replacements(&self) -> Vec<PathBuf> {
+        use crate::subs::{JobMode, SubsTarget};
+        match self.mode {
+            JobMode::Encode => Vec::new(),
+            JobMode::Subtitles(SubsTarget::Embed) => vec![self.input.clone()],
+            JobMode::Subtitles(SubsTarget::Sidecar) => {
+                let Ok(outs) = crate::subs::sidecar_outputs(&self.input, &self.externals) else {
+                    return Vec::new();
+                };
+                outs.into_iter()
+                    .zip(self.externals.iter().filter(|e| e.selected))
+                    .filter(|(o, e)| o.exists() && !same_file(o, &e.path))
+                    .map(|(o, _)| o)
+                    .collect()
+            }
+        }
+    }
+
+    /// Of [`Self::subs_replacements`], the files the user hasn't approved.
+    pub fn unapproved_replacements(&self) -> Vec<PathBuf> {
+        self.subs_replacements()
+            .into_iter()
+            .filter(|p| !self.subs_ok.contains(p))
+            .collect()
     }
 
     /// The crop that will actually be applied.

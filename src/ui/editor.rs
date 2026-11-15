@@ -94,6 +94,42 @@ fn video_summary(job: &Job) -> String {
     parts.join(" · ")
 }
 
+/// Read-only, copyable view of the exact command.
+fn command_group(app: &Rc<App>) -> (adw::PreferencesGroup, gtk::TextBuffer) {
+    let cmd_group = group("Command", "");
+    cmd_group.set_tooltip_text(Some(help::COMMAND));
+    let buffer = gtk::TextBuffer::new(None);
+    let view = gtk::TextView::builder()
+        .buffer(&buffer)
+        .editable(false)
+        .monospace(true)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .top_margin(12)
+        .bottom_margin(12)
+        .left_margin(12)
+        .right_margin(12)
+        .build();
+    view.add_css_class("command-view");
+    let frame = gtk::Frame::new(None);
+    frame.set_child(Some(&view));
+    frame.add_css_class("card");
+    let copy = gtk::Button::from_icon_name("edit-copy-symbolic");
+    copy.add_css_class("flat");
+    copy.set_tooltip_text(Some("Copy command"));
+    {
+        let buffer = buffer.clone();
+        let a = app.clone();
+        copy.connect_clicked(move |b| {
+            let (s, e) = buffer.bounds();
+            b.clipboard().set_text(&buffer.text(&s, &e, false));
+            a.toast("Command copied");
+        });
+    }
+    cmd_group.set_header_suffix(Some(&copy));
+    cmd_group.add(&frame);
+    (cmd_group, buffer)
+}
+
 impl Editor {
     pub fn scroll_position(&self) -> f64 {
         self.scroller
@@ -285,6 +321,40 @@ impl Editor {
         let settings_box = gtk::Box::new(gtk::Orientation::Vertical, 24);
         settings_box.set_sensitive(editable);
         content.append(&settings_box);
+        settings_box.append(&crate::ui::subs::mode_group(app, id, &job));
+        let alass = caps.as_ref().is_none_or(|c| c.alass.is_some());
+        if job.mode.subtitles_only() {
+            settings_box.append(&crate::ui::subs::externals_group(app, id, &job, alass));
+            let (cmd_group, buffer) = command_group(app);
+            content.append(&cmd_group);
+            let clamp = adw::Clamp::builder()
+                .maximum_size(820)
+                .tightening_threshold(600)
+                .child(&content)
+                .build();
+            let scroller = gtk::ScrolledWindow::builder()
+                .child(&clamp)
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .vexpand(true)
+                .build();
+            let ed = Rc::new(Editor {
+                job: id,
+                root: scroller.clone().upcast(),
+                scroller: Some(scroller),
+                issues: Some(issues),
+                estimate_row: None,
+                audio_usage: None,
+                tracks: RefCell::new(Vec::new()),
+                crop_row: None,
+                scan_row: None,
+                vmaf_row: None,
+                command: Some(buffer),
+                progress,
+            });
+            ed.refresh(app);
+            ed.update_progress(&app.state.borrow());
+            return ed;
+        }
         let s = job.settings.clone();
         let v = probe.video.clone().unwrap_or_default();
 
@@ -725,6 +795,8 @@ impl Editor {
         audio.add(&usage);
         settings_box.append(&audio);
 
+        settings_box.append(&crate::ui::subs::externals_group(app, id, &job, alass));
+
         // ---- Tracks, grouped by language ----
         let track_rows = RefCell::new(Vec::new());
         for g in &job.groups {
@@ -1146,37 +1218,7 @@ impl Editor {
         settings_box.append(&adv);
 
         // ---- Command ----
-        let cmd_group = group("Command", "");
-        cmd_group.set_tooltip_text(Some(help::COMMAND));
-        let buffer = gtk::TextBuffer::new(None);
-        let view = gtk::TextView::builder()
-            .buffer(&buffer)
-            .editable(false)
-            .monospace(true)
-            .wrap_mode(gtk::WrapMode::WordChar)
-            .top_margin(12)
-            .bottom_margin(12)
-            .left_margin(12)
-            .right_margin(12)
-            .build();
-        view.add_css_class("command-view");
-        let frame = gtk::Frame::new(None);
-        frame.set_child(Some(&view));
-        frame.add_css_class("card");
-        let copy = gtk::Button::from_icon_name("edit-copy-symbolic");
-        copy.add_css_class("flat");
-        copy.set_tooltip_text(Some("Copy command"));
-        {
-            let buffer = buffer.clone();
-            let a = app.clone();
-            copy.connect_clicked(move |b| {
-                let (s, e) = buffer.bounds();
-                b.clipboard().set_text(&buffer.text(&s, &e, false));
-                a.toast("Command copied");
-            });
-        }
-        cmd_group.set_header_suffix(Some(&copy));
-        cmd_group.add(&frame);
+        let (cmd_group, buffer) = command_group(app);
         content.append(&cmd_group);
 
         // ---- Actions ----

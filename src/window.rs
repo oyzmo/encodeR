@@ -21,6 +21,7 @@ use crate::ffmpeg::vmaf::VmafResult;
 use crate::presets;
 use crate::queue::{self, CropState, EstimateState, Event, Job, JobState, VmafState};
 use crate::settings::{EncodeSettings, Prefs, VideoCodec};
+use crate::subs::{self, ExternalSub, JobMode, SubsTarget};
 use crate::tracks::{self, PgsQuestion};
 use crate::ui::editor::Editor;
 use crate::ui::row::JobRow;
@@ -31,7 +32,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub enum Msg {
     Caps(Capabilities),
-    Probed(u64, Result<Box<ProbeInfo>, String>),
+    /// Probe result, plus the sidecar subtitle files found next to the video.
+    Probed(u64, Result<Box<ProbeInfo>, String>, Vec<ExternalSub>),
     Analyzed(u64, Result<worker::Analysis, String>),
     Estimate(u64, String, Result<SizeRange, String>),
     /// The estimate key the score was measured with, checked on arrival.
@@ -101,13 +103,21 @@ impl State {
             job.settings.target_gb,
             p.duration,
             job.selection.audio_bytes(p),
-            job.selection.subtitle_bytes(p),
+            job.selection.subtitle_bytes(p) + job.external_bytes(),
         )
     }
 
     /// Output path for a job: never its own input, another job's input, or the
     /// output of a job earlier in the queue.
     pub fn output_for(&self, job: &Job) -> std::path::PathBuf {
+        // Subtitles-only jobs write next to (or into) their own input.
+        if let JobMode::Subtitles(t) = job.mode {
+            let first = (t == SubsTarget::Sidecar)
+                .then(|| subs::sidecar_outputs(&job.input, &job.externals).ok())
+                .flatten()
+                .and_then(|v| v.into_iter().next());
+            return first.unwrap_or_else(|| job.input.clone());
+        }
         let mut taken: Vec<std::path::PathBuf> =
             self.jobs.iter().map(|j| j.input.clone()).collect();
         for j in &self.jobs {
@@ -135,6 +145,9 @@ impl State {
             video_kbps: self.video_kbps(job),
             dv_preserve: job.dv_preserve,
             mkvpropedit: self.caps.as_ref().is_some_and(|c| c.mkvpropedit),
+            externals: job.externals.clone(),
+            mode: job.mode,
+            alass: self.caps.as_ref().and_then(|c| c.alass.clone()),
             settings: job.settings.clone(),
             selection: job.selection.clone(),
             probe,
@@ -145,6 +158,12 @@ impl State {
         let Some(p) = &job.probe else {
             return Vec::new();
         };
+        let alass = self.caps.as_ref().is_none_or(|c| c.alass.is_some());
+        let sub_issues =
+            checks::external_issues(&job.input, &job.settings, job.mode, &job.externals, alass);
+        if job.mode.subtitles_only() {
+            return sub_issues;
+        }
         let estimate = match &job.estimate {
             EstimateState::Ready(r) => Some(*r),
             _ => None,
@@ -189,6 +208,8 @@ impl State {
                 },
             );
         }
+        v.extend(sub_issues);
+        v.sort_by_key(|i| std::cmp::Reverse(i.severity));
         v
     }
 
@@ -204,6 +225,32 @@ impl State {
         let Some(req) = self.request(job) else {
             return String::new();
         };
+        match job.mode {
+            JobMode::Subtitles(SubsTarget::Sidecar) => {
+                return match subs::sidecar_outputs(&job.input, &job.externals) {
+                    Ok(v) => v
+                        .iter()
+                        .map(|p| format!("# saves {}", p.display()))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    Err(e) => format!("# {e}"),
+                };
+            }
+            JobMode::Subtitles(SubsTarget::Embed) => {
+                let c =
+                    subs::embed_container(&job.input).unwrap_or(crate::settings::Container::Mkv);
+                let part = worker::partial_path(&job.input);
+                return match command::build_embed(&req.probe, &job.externals, c, &part) {
+                    Ok(a) => format!(
+                        "{}\n# then the checked file replaces {}",
+                        command::display_command(&self.tools.ffmpeg, &a),
+                        job.input.display()
+                    ),
+                    Err(e) => format!("# {e}"),
+                };
+            }
+            JobMode::Encode => {}
+        }
         // The same job the encode will run, so the shown command can't drift.
         let j = req.job(&req.output, req.first_decode());
         let mut text = match command::build(&j) {
@@ -292,6 +339,7 @@ pub fn build(app: &adw::Application, files: Vec<PathBuf>) {
     let menu = gio::Menu::new();
     let section = gio::Menu::new();
     section.append(Some("_Add Files…"), Some("win.add-files"));
+    section.append(Some("Add _Subtitles to Videos…"), Some("win.add-subtitles"));
     section.append(Some("Clear _Finished Jobs"), Some("win.clear-finished"));
     menu.append_section(None, &section);
     let section = gio::Menu::new();
@@ -544,6 +592,11 @@ fn install_actions(app: &Rc<App>) {
     let a = app.clone();
     add("add-files", Box::new(move || a.pick_files()));
     let a = app.clone();
+    add(
+        "add-subtitles",
+        Box::new(move || a.pick_videos_for_subtitles()),
+    );
+    let a = app.clone();
     add("clear-finished", Box::new(move || a.clear_finished()));
     let a = app.clone();
     add("preferences", Box::new(move || crate::ui::prefs::show(&a)));
@@ -585,7 +638,7 @@ impl App {
         let filter = gtk::FileFilter::new();
         filter.set_name(Some("Videos"));
         filter.add_mime_type("video/*");
-        for ext in ["mkv", "mp4", "m4v", "mov", "ts", "m2ts", "avi", "webm"] {
+        for ext in subs::VIDEO_EXTS {
             filter.add_suffix(ext);
         }
         let filters = gio::ListStore::new::<gtk::FileFilter>();
@@ -612,9 +665,18 @@ impl App {
     }
 
     pub fn add_files(self: &Rc<Self>, paths: Vec<PathBuf>) {
+        self.add_files_as(paths, JobMode::Encode);
+    }
+
+    /// Queue videos as jobs of `mode`. Subtitle files among `paths` are given
+    /// to the video they belong to (`Movie.no.srt` → `Movie.mkv`).
+    pub fn add_files_as(self: &Rc<Self>, paths: Vec<PathBuf>, mode: JobMode) {
         if paths.is_empty() {
             return;
         }
+        let (srts, paths): (Vec<PathBuf>, Vec<PathBuf>) = paths
+            .into_iter()
+            .partition(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("srt")));
         let mut new_ids = Vec::new();
         {
             let mut st = self.state.borrow_mut();
@@ -630,10 +692,15 @@ impl App {
                 }
                 let id = st.next_id;
                 st.next_id += 1;
-                st.jobs
-                    .push(Job::new(id, batch, p, settings.clone(), preset.clone()));
+                let mut job = Job::new(id, batch, p, settings.clone(), preset.clone());
+                // Sidecars next to the video arrive with the probe result.
+                job.mode = mode;
+                st.jobs.push(job);
                 new_ids.push(id);
             }
+        }
+        if !srts.is_empty() {
+            self.attach_subtitles(srts, &new_ids, None);
         }
         for id in &new_ids {
             let row = JobRow::new();
@@ -654,6 +721,210 @@ impl App {
         self.update_start();
     }
 
+    /// Give each subtitle file to the queued video it belongs to; files that
+    /// match nothing go to the only new video, or else to the selected job.
+    pub fn attach_subtitles(
+        self: &Rc<Self>,
+        srts: Vec<PathBuf>,
+        new_ids: &[u64],
+        target: Option<u64>,
+    ) {
+        let mut touched: Vec<u64> = Vec::new();
+        let mut unmatched: Vec<String> = Vec::new();
+        let mut busy: Vec<String> = Vec::new();
+        {
+            let mut st = self.state.borrow_mut();
+            let sync = st.prefs.sync_subs;
+            let selected = st.selected;
+            let fallback = match new_ids {
+                [one] => Some(*one),
+                [] => selected.filter(|id| st.job(*id).is_some_and(|j| j.state.editable())),
+                _ => None,
+            };
+            for srt in srts {
+                let open = |j: &Job| j.state.editable() || j.state == JobState::Probing;
+                // The video it belongs to, among every job: the longest name
+                // wins, and an open job wins a tie with a finished one.
+                let named = st
+                    .jobs
+                    .iter()
+                    .filter(|j| subs::belongs_to(&j.input, &srt))
+                    .max_by_key(|j| (j.input.file_stem().map_or(0, |s| s.len()), open(j)));
+                let owner = match (target, named) {
+                    (Some(t), _) => Some(t),
+                    (None, Some(j)) if open(j) => Some(j.id),
+                    (None, Some(j)) => {
+                        busy.push(format!(
+                            "{} belongs to {}, which has already started",
+                            srt.file_name().unwrap_or_default().to_string_lossy(),
+                            j.file_name()
+                        ));
+                        continue;
+                    }
+                    (None, None) => fallback,
+                };
+                let Some(id) = owner else {
+                    unmatched.push(
+                        srt.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                    continue;
+                };
+                let Some(j) = st.job_mut(id) else { continue };
+                if !j.externals.iter().any(|e| e.path == srt) {
+                    let e = ExternalSub::from_path(&j.input, srt, sync);
+                    j.externals.push(e);
+                }
+                j.externals_changed();
+                if !touched.contains(&id) {
+                    touched.push(id);
+                }
+            }
+        }
+        if !unmatched.is_empty() {
+            self.toast(&format!(
+                "No video to add {} to. Add the video too, or select its job first.",
+                unmatched.join(", ")
+            ));
+        }
+        if !busy.is_empty() {
+            self.toast(&format!("Not added: {}.", busy.join("; ")));
+        }
+        for id in touched {
+            if !new_ids.contains(&id) {
+                self.changed(id);
+                if self.state.borrow().selected == Some(id) {
+                    self.rebuild_editor();
+                }
+            }
+        }
+        self.update_start();
+        self.run_next();
+    }
+
+    /// File dialog for SRT files to add to job `id`.
+    pub fn pick_subtitles(self: &Rc<Self>, id: u64) {
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("SubRip subtitles"));
+        filter.add_suffix("srt");
+        filter.add_mime_type("application/x-subrip");
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        let folder = self
+            .state
+            .borrow()
+            .job(id)
+            .and_then(|j| j.input.parent().map(gio::File::for_path));
+        let dialog = gtk::FileDialog::builder()
+            .title("Add Subtitle Files")
+            .modal(true)
+            .filters(&filters)
+            .build();
+        if let Some(f) = folder {
+            dialog.set_initial_folder(Some(&f));
+        }
+        let a = self.clone();
+        dialog.open_multiple(Some(&self.window), None::<&gio::Cancellable>, move |res| {
+            if let Ok(model) = res {
+                let paths: Vec<PathBuf> = (0..model.n_items())
+                    .filter_map(|i| model.item(i).and_downcast::<gio::File>()?.path())
+                    .collect();
+                if !paths.is_empty() {
+                    a.attach_subtitles(paths, &[], Some(id));
+                }
+            }
+        });
+    }
+
+    /// File dialog for videos that get the "subtitles only" treatment.
+    fn pick_videos_for_subtitles(self: &Rc<Self>) {
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Videos and subtitles"));
+        filter.add_mime_type("video/*");
+        for ext in ["mkv", "mp4", "m4v", "mov", "srt"] {
+            filter.add_suffix(ext);
+        }
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        let dialog = gtk::FileDialog::builder()
+            .title("Add Subtitles to Videos")
+            .modal(true)
+            .filters(&filters)
+            .build();
+        let a = self.clone();
+        dialog.open_multiple(Some(&self.window), None::<&gio::Cancellable>, move |res| {
+            if let Ok(model) = res {
+                let paths: Vec<PathBuf> = (0..model.n_items())
+                    .filter_map(|i| model.item(i).and_downcast::<gio::File>()?.path())
+                    .collect();
+                let target = a.state.borrow().prefs.subs_target;
+                a.add_files_as(paths, JobMode::Subtitles(target));
+            }
+        });
+    }
+
+    /// Switch a job between encoding and subtitles only.
+    pub fn set_mode(self: &Rc<Self>, id: u64, mode: JobMode) {
+        let needs_analysis = {
+            let mut st = self.state.borrow_mut();
+            if let JobMode::Subtitles(t) = mode {
+                st.prefs.subs_target = t;
+            }
+            st.job(id).is_some_and(|j| {
+                mode == JobMode::Encode && j.probe.is_some() && j.crop == CropState::Unknown
+            })
+        };
+        self.edit(id, |j| {
+            j.mode = mode;
+            j.subs_ok.clear();
+        });
+        if needs_analysis {
+            self.detect_crop(id);
+        }
+        self.reopen_pgs(id);
+        self.rebuild_editor();
+        self.update_start();
+    }
+
+    /// Queue the "only PGS" questions a job hasn't had answered: ones held back
+    /// while it was a subtitles-only job or while an external SRT covered the
+    /// language. Languages already decided for its batch are left as they are.
+    pub fn reopen_pgs(self: &Rc<Self>, id: u64) {
+        let new: Vec<PgsQuestion> = {
+            let mut st = self.state.borrow_mut();
+            let prefs = st.prefs.preferred_languages.clone();
+            let Some(j) = st.job(id) else { return };
+            if j.mode != JobMode::Encode || j.state != JobState::Pending {
+                return;
+            }
+            let Some(p) = &j.probe else { return };
+            let (_, _, qs) = tracks::auto_select(p, &prefs, &j.settings);
+            let new: Vec<PgsQuestion> = qs
+                .into_iter()
+                .filter(|q| {
+                    !subs::covers_language(&j.externals, &q.family)
+                        && !j.pgs_pending.iter().any(|x| x.family == q.family)
+                        && !st.pgs_batch.contains_key(&(j.batch, q.family.clone()))
+                        && !st.pgs_session.contains_key(&q.family)
+                })
+                .collect();
+            if let Some(j) = st.job_mut(id) {
+                j.pgs_pending.extend(new.iter().cloned());
+            }
+            new
+        };
+        if new.is_empty() {
+            return;
+        }
+        for q in new {
+            self.pgs_queue.borrow_mut().push_back((id, q));
+        }
+        self.update_row(id);
+        self.process_pgs();
+    }
+
     fn probe(&self, id: u64) {
         let (ffprobe, path) = {
             let st = self.state.borrow();
@@ -664,7 +935,16 @@ impl App {
         std::thread::spawn(move || {
             let _slot = runner::PROBES.acquire(None);
             let r = probe::run(&ffprobe, &path).map(Box::new);
-            let _ = tx.send_blocking(Msg::Probed(id, r));
+            // Reading the folder can be slow on a NAS: keep it off the UI thread.
+            let sidecars = subs::discover(&path)
+                .into_iter()
+                .map(|s| {
+                    let mut e = ExternalSub::from_path(&path, s, false);
+                    e.auto = true;
+                    e
+                })
+                .collect();
+            let _ = tx.send_blocking(Msg::Probed(id, r, sidecars));
         });
     }
 
@@ -802,7 +1082,7 @@ impl App {
     fn handle(self: &Rc<Self>, msg: Msg) {
         match msg {
             Msg::Caps(c) => self.on_caps(c),
-            Msg::Probed(id, r) => self.on_probed(id, r),
+            Msg::Probed(id, r, sidecars) => self.on_probed(id, r, sidecars),
             Msg::Analyzed(id, r) => {
                 let mut st = self.state.borrow_mut();
                 st.crop_cancel.remove(&id);
@@ -992,15 +1272,43 @@ impl App {
         d.present(Some(&self.window));
     }
 
-    fn on_probed(self: &Rc<Self>, id: u64, r: Result<Box<ProbeInfo>, String>) {
+    fn on_probed(
+        self: &Rc<Self>,
+        id: u64,
+        r: Result<Box<ProbeInfo>, String>,
+        sidecars: Vec<ExternalSub>,
+    ) {
         let mut questions = Vec::new();
         {
             let mut st = self.state.borrow_mut();
             let prefs = st.prefs.preferred_languages.clone();
+            let sync = st.prefs.sync_subs;
             let Some(j) = st.job_mut(id) else { return };
             match r {
                 Ok(p) => {
-                    let (sel, groups, qs) = tracks::auto_select(&p, &prefs, &j.settings);
+                    let (mut sel, groups, mut qs) = tracks::auto_select(&p, &prefs, &j.settings);
+                    // Sidecars found next to the video. For a re-encode keep
+                    // the preferred languages (and unknown ones); files the
+                    // user added by hand are left as they are.
+                    let fams = tracks::resolve_preferences(&p, &prefs);
+                    for mut e in sidecars {
+                        if j.externals.iter().any(|x| x.path == e.path) {
+                            continue;
+                        }
+                        e.sync = sync;
+                        if j.mode == JobMode::Encode
+                            && let Some(l) = &e.language
+                        {
+                            e.selected = fams.contains(&tracks::family(l));
+                        }
+                        j.externals.push(e);
+                    }
+                    subs::prefer_externals(&mut sel, &p, &j.externals);
+                    qs.retain(|q| !subs::covers_language(&j.externals, &q.family));
+                    // Subtitles-only jobs keep every embedded track; nothing to ask.
+                    if j.mode.subtitles_only() {
+                        qs.clear();
+                    }
                     j.selection = sel;
                     j.groups = groups;
                     j.pgs_pending = qs.clone();
@@ -1026,8 +1334,16 @@ impl App {
         for q in questions {
             self.pgs_queue.borrow_mut().push_back((id, q));
         }
-        self.detect_crop(id);
-        self.schedule_estimate(id);
+        let encode = self
+            .state
+            .borrow()
+            .job(id)
+            .is_some_and(|j| j.mode == JobMode::Encode);
+        // Crop/interlace analysis and size estimates only matter for encodes.
+        if encode {
+            self.detect_crop(id);
+            self.schedule_estimate(id);
+        }
         self.update_row(id);
         if self.state.borrow().selected == Some(id) {
             self.rebuild_editor();
@@ -1178,10 +1494,13 @@ impl App {
         let Some(job) = st.job(id).cloned() else {
             return;
         };
+        if job.mode.subtitles_only() {
+            return;
+        }
         let Some(p) = job.probe.as_ref() else { return };
         let (audio, subs) = (
             job.selection.audio_bytes(p),
-            job.selection.subtitle_bytes(p),
+            job.selection.subtitle_bytes(p) + job.external_bytes(),
         );
         let s = &job.settings;
         let rc = s.effective_rate_control();
@@ -1354,11 +1673,77 @@ impl App {
     /// Ask once, up front, about every queued job whose output already exists,
     /// so an unattended queue doesn't stop half-way at a "Replace?" dialog.
     fn confirm_replacements(self: &Rc<Self>) {
-        let existing: Vec<(u64, PathBuf)> = {
+        // Subtitles-only jobs that would replace files: embeds rewrite the video,
+        // sidecars may land on an existing file that isn't their own source.
+        #[allow(clippy::type_complexity)]
+        let subs_jobs: Vec<(u64, String, Vec<PathBuf>)> = {
             let st = self.state.borrow();
             st.jobs
                 .iter()
                 .filter(|j| j.state == JobState::Pending)
+                .filter_map(|j| {
+                    let files = j.unapproved_replacements();
+                    if files.is_empty() {
+                        return None;
+                    }
+                    let line = if j.mode == JobMode::Subtitles(SubsTarget::Embed) {
+                        format!("• {} (subtitles embedded in place)", j.input.display())
+                    } else {
+                        files
+                            .iter()
+                            .map(|o| format!("• {}", o.display()))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    Some((j.id, line, files))
+                })
+                .collect()
+        };
+        if !subs_jobs.is_empty() {
+            let list: Vec<&str> = subs_jobs.iter().map(|(_, l, _)| l.as_str()).collect();
+            let d = adw::AlertDialog::new(
+                Some("Replace Files?"),
+                Some(&format!(
+                    "These files will be replaced. Embedding writes a new copy of the video next to it, checks it, and only then replaces the original; it needs free space for one more copy.\n\n{}",
+                    list.join("\n")
+                )),
+            );
+            d.add_responses(&[
+                ("cancel", "Cancel"),
+                ("skip", "Skip Those Jobs"),
+                ("replace", "Replace"),
+            ]);
+            d.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
+            d.set_close_response("cancel");
+            let a = self.clone();
+            d.connect_response(None, move |_, resp| {
+                if resp == "cancel" {
+                    return;
+                }
+                for (id, _, files) in &subs_jobs {
+                    let mut st = a.state.borrow_mut();
+                    let Some(j) = st.job_mut(*id).filter(|j| j.state == JobState::Pending) else {
+                        continue;
+                    };
+                    if resp == "replace" {
+                        j.subs_ok.extend(files.iter().cloned());
+                    } else {
+                        j.apply(Event::Cancel);
+                        j.error = Some("Skipped: it would replace files".into());
+                    }
+                    drop(st);
+                    a.update_row(*id);
+                }
+                a.confirm_replacements();
+            });
+            d.present(Some(&self.window));
+            return;
+        }
+        let existing: Vec<(u64, PathBuf)> = {
+            let st = self.state.borrow();
+            st.jobs
+                .iter()
+                .filter(|j| j.state == JobState::Pending && j.mode == JobMode::Encode)
                 .map(|j| (j.id, st.output_for(j)))
                 .filter(|(id, out)| {
                     out.exists() && st.job(*id).and_then(|j| j.replace_ok.as_ref()) != Some(out)
@@ -1440,7 +1825,9 @@ impl App {
                 return;
             };
             let j = st.job(id).expect("pending job exists");
-            if let Some(reason) = st.codec_unavailable(&j.settings) {
+            if j.mode == JobMode::Encode
+                && let Some(reason) = st.codec_unavailable(&j.settings)
+            {
                 let msg = format!("{} isn't available: {reason}", j.settings.codec.label());
                 drop(st);
                 if let Some(j) = self.state.borrow_mut().job_mut(id) {
@@ -1457,22 +1844,40 @@ impl App {
             }
             (id, st.output_for(j))
         };
-        let approved = self
-            .state
-            .borrow()
-            .job(id)
-            .is_some_and(|j| j.replace_ok.as_ref() == Some(&output));
-        // Fallback for an output that appeared after Start was pressed.
-        if output.exists() && !approved {
+        // Files this job would replace that nobody has approved: an output
+        // that appeared after Start was pressed, a job added while the queue
+        // runs, or a subtitles job edited since it was approved.
+        let (unapproved, embed) = {
+            let st = self.state.borrow();
+            let Some(j) = st.job(id) else { return };
+            let list = if j.mode.subtitles_only() {
+                j.unapproved_replacements()
+            } else if output.exists() && j.replace_ok.as_ref() != Some(&output) {
+                vec![output.clone()]
+            } else {
+                Vec::new()
+            };
+            (list, j.mode == JobMode::Subtitles(SubsTarget::Embed))
+        };
+        if !unapproved.is_empty() {
             self.state.borrow_mut().replace_pending = Some(id);
             self.update_start();
-            let d = adw::AlertDialog::new(
-                Some("Replace Existing File?"),
-                Some(&format!(
-                    "“{}” already exists. Replacing it will overwrite its contents.",
+            let body = if embed {
+                format!(
+                    "Subtitles will be embedded into “{}”, replacing the original once the new copy checks out.",
                     output.display()
-                )),
-            );
+                )
+            } else {
+                let names: Vec<String> = unapproved
+                    .iter()
+                    .map(|p| format!("“{}”", p.display()))
+                    .collect();
+                format!(
+                    "{} already exists. Replacing it will overwrite its contents.",
+                    names.join(", ")
+                )
+            };
+            let d = adw::AlertDialog::new(Some("Replace Existing File?"), Some(&body));
             d.add_responses(&[("skip", "Skip Job"), ("replace", "Replace")]);
             d.set_response_appearance("replace", adw::ResponseAppearance::Destructive);
             d.set_close_response("skip");
@@ -1486,6 +1891,9 @@ impl App {
                     .job(id)
                     .is_some_and(|j| j.state == JobState::Pending);
                 if resp == "replace" && pending {
+                    if let Some(j) = a.state.borrow_mut().job_mut(id) {
+                        j.subs_ok.extend(unapproved.iter().cloned());
+                    }
                     a.launch(id);
                 } else {
                     if pending && let Some(j) = a.state.borrow_mut().job_mut(id) {
@@ -1603,7 +2011,7 @@ impl App {
         let wanted = st.prefs.vmaf_after_encode && st.caps.as_ref().is_some_and(|c| c.libvmaf);
         let Some(job) = st
             .job(id)
-            .filter(|j| j.settings.codec != VideoCodec::Copy)
+            .filter(|j| j.settings.codec != VideoCodec::Copy && !j.mode.subtitles_only())
             .cloned()
         else {
             return;

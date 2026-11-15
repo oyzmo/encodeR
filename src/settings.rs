@@ -329,6 +329,10 @@ pub struct Prefs {
     pub last_settings: EncodeSettings,
     pub last_preset: String,
     pub user_presets: Vec<Preset>,
+    /// Where "Add Subtitles to Videos…" jobs put the subtitles.
+    pub subs_target: crate::subs::SubsTarget,
+    /// Sync external subtitles with alass by default (when it's installed).
+    pub sync_subs: bool,
 }
 
 impl Default for Prefs {
@@ -342,6 +346,8 @@ impl Default for Prefs {
             last_settings: EncodeSettings::default(),
             last_preset: crate::presets::DEFAULT_PRESET.into(),
             user_presets: Vec::new(),
+            subs_target: crate::subs::SubsTarget::default(),
+            sync_subs: true,
         }
     }
 }

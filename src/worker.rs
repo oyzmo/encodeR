@@ -16,6 +16,7 @@ use crate::ffmpeg::vmaf::{self, VmafResult};
 use crate::hdr;
 use crate::scan::{self, Scan, ScanType};
 use crate::settings::{Container, EncodeSettings, VideoCodec, cache_dir};
+use crate::subs::{self, ExternalSub, JobMode, SubsTarget};
 use crate::tracks::Selection;
 
 #[derive(Clone, Debug)]
@@ -47,6 +48,11 @@ pub struct Request {
     pub video_kbps: Option<u32>,
     pub dv_preserve: bool,
     pub mkvpropedit: bool,
+    /// External SRT files (the job's list; only selected ones are used).
+    pub externals: Vec<ExternalSub>,
+    pub mode: JobMode,
+    /// alass program, when installed.
+    pub alass: Option<String>,
 }
 
 impl Request {
@@ -63,6 +69,7 @@ impl Request {
         j.crop_on_gpu = self.crop_on_gpu;
         j.scan = self.scan;
         j.video_kbps = self.video_kbps;
+        j.externals = &self.externals;
         j
     }
 
@@ -176,6 +183,9 @@ pub fn encode(
     cancel: &Cancel,
     mut update: impl FnMut(Update),
 ) -> Outcome {
+    if let JobMode::Subtitles(target) = req.mode {
+        return subtitles_only(tools, req, target, cancel, &mut update);
+    }
     // Last line of defence: the queue picks outputs that aren't the input, but
     // a failed or cancelled job deletes its output, so check the real file.
     let part = partial_path(&req.output);
@@ -188,8 +198,19 @@ pub fn encode(
             Vec::new(),
         );
     }
+    let prepared = if req.externals.iter().any(|e| e.selected) {
+        match prepare_externals(tools, req, cancel, &mut update) {
+            Ok(p) => Some(p),
+            Err(o) => return o,
+        }
+    } else {
+        None
+    };
     let work = Request {
         output: part.clone(),
+        externals: prepared
+            .as_ref()
+            .map_or_else(|| req.externals.clone(), |p| p.externals.clone()),
         ..req.clone()
     };
     let result = if work.dv_preserve && work.probe.hdr.dovi.is_some() {
@@ -222,11 +243,375 @@ pub fn encode(
         ..Default::default()
     };
     out.report.push(size_report(req));
+    if let Some(p) = &prepared {
+        out.report.extend(p.report.iter().cloned());
+    }
     if req.settings.codec != VideoCodec::Copy {
         update(Update::Stage("Checking output".into()));
         out.report.extend(hdr_report(tools, req));
     }
     out
+}
+
+/// External subtitles made ready for ffmpeg: clean UTF-8 SRT files in a
+/// private temp folder that is removed when this is dropped.
+struct PreparedSubs {
+    /// Selected externals only, `path` pointing at the prepared file.
+    externals: Vec<ExternalSub>,
+    report: Vec<String>,
+    dir: PathBuf,
+}
+
+impl Drop for PreparedSubs {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn cancelled() -> Outcome {
+    Outcome {
+        cancelled: true,
+        ..Default::default()
+    }
+}
+
+/// Decode, sync (alass) and shift every selected external subtitle file.
+/// A failed sync isn't fatal: the file is used as it is and the report says so.
+fn prepare_externals(
+    tools: &Tools,
+    req: &Request,
+    cancel: &Cancel,
+    update: &mut impl FnMut(Update),
+) -> Result<PreparedSubs, Outcome> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let dir = cache_dir().join(format!("subs-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| fail(format!("Couldn't create a temp folder: {e}"), Vec::new()))?;
+    let mut out = PreparedSubs {
+        externals: Vec::new(),
+        report: Vec::new(),
+        dir: dir.clone(),
+    };
+    // Extracted once per job, on first use.
+    let mut reference: Option<Result<(PathBuf, String), String>> = None;
+    for (k, e) in req.externals.iter().filter(|e| e.selected).enumerate() {
+        let name = e.file_name();
+        let bytes = std::fs::read(&e.path)
+            .map_err(|err| fail(format!("Couldn't read {name}: {err}"), Vec::new()))?;
+        let (text, decode_note) = subs::decode_text_noted(&bytes);
+        let mut cues =
+            subs::parse_srt(&text).map_err(|err| fail(format!("{name}: {err}"), Vec::new()))?;
+        let mut notes: Vec<String> = decode_note.map(String::from).into_iter().collect();
+        if e.sync {
+            match &req.alass {
+                None => notes.push("not synced (alass isn't installed)".into()),
+                Some(alass) => {
+                    if reference.is_none() {
+                        reference = Some(extract_reference(tools, req, &dir, cancel, update)?);
+                    }
+                    match reference.as_ref().expect("set above") {
+                        Err(why) => notes.push(format!("not synced ({why})")),
+                        Ok((rf, what)) => {
+                            update(Update::Stage(format!("Syncing {name}")));
+                            let input = dir.join(format!("in-{k}.srt"));
+                            let synced = dir.join(format!("synced-{k}.srt"));
+                            std::fs::write(&input, subs::write_srt(&cues)).map_err(|err| {
+                                fail(format!("Couldn't write a temp file: {err}"), Vec::new())
+                            })?;
+                            let r = runner::run_capture(
+                                alass,
+                                &subs::alass_args(rf, &input, &synced),
+                                cancel,
+                            );
+                            if cancel.is_cancelled() {
+                                return Err(cancelled());
+                            }
+                            let result = match r {
+                                Ok(c) if c.success => std::fs::read(&synced)
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|b| subs::parse_srt(&subs::decode_text(&b))),
+                                Ok(c) => Err(c
+                                    .stderr
+                                    .lines()
+                                    .rev()
+                                    .find(|l| !l.trim().is_empty())
+                                    .unwrap_or("alass failed")
+                                    .to_string()),
+                                Err(e) => Err(e),
+                            };
+                            match result {
+                                Ok(after) => {
+                                    notes.push(format!(
+                                        "{} against {what}",
+                                        subs::describe_sync(&cues, &after)
+                                    ));
+                                    cues = after;
+                                }
+                                Err(why) => {
+                                    notes.push(format!("sync failed, used as it is ({why})"))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if e.offset_ms != 0 {
+            cues = subs::shift(&cues, e.offset_ms);
+            notes.push(format!(
+                "moved {:+.2} s by hand",
+                e.offset_ms as f64 / 1000.0
+            ));
+        }
+        let path = dir.join(format!("{k}.srt"));
+        std::fs::write(&path, subs::write_srt(&cues))
+            .map_err(|err| fail(format!("Couldn't write a temp file: {err}"), Vec::new()))?;
+        let mut line = format!("{} subtitles ({name})", e.language_name());
+        if !notes.is_empty() {
+            line.push_str(": ");
+            line.push_str(&notes.join(", "));
+        }
+        out.report.push(line);
+        out.externals.push(ExternalSub { path, ..e.clone() });
+    }
+    Ok(out)
+}
+
+/// The sync reference as a file, with a description ("the English audio").
+/// `Err(Outcome)` only for cancel; a failed extraction is an inner `Err`.
+#[allow(clippy::type_complexity)]
+fn extract_reference(
+    tools: &Tools,
+    req: &Request,
+    dir: &Path,
+    cancel: &Cancel,
+    update: &mut impl FnMut(Update),
+) -> Result<Result<(PathBuf, String), String>, Outcome> {
+    let Some(r) = subs::sync_reference(&req.probe, &req.selection) else {
+        return Ok(Err("the video has no audio to sync against".into()));
+    };
+    let file = dir.join(match r {
+        subs::SyncRef::Subtitle(_) => "reference.srt",
+        subs::SyncRef::Audio(_) => "reference.wav",
+    });
+    update(Update::Stage(format!(
+        "Reading {} for syncing",
+        r.describe(&req.probe)
+    )));
+    let res = runner::run_ffmpeg(
+        &tools.ffmpeg,
+        &subs::reference_args(&req.probe.path, r, &file),
+        cancel,
+        |p| update(Update::Progress(p)),
+    );
+    if res.cancelled {
+        return Err(cancelled());
+    }
+    if !res.success {
+        return Ok(Err(format!(
+            "couldn't read the sync reference: {}",
+            runner::error_summary(&res.stderr_tail.join("\n"))
+        )));
+    }
+    Ok(Ok((file, r.describe(&req.probe))))
+}
+
+/// Subtitles-only job: sync the files, then save them next to the video or
+/// embed them into it. The video stream is never re-encoded.
+fn subtitles_only(
+    tools: &Tools,
+    req: &Request,
+    target: SubsTarget,
+    cancel: &Cancel,
+    update: &mut impl FnMut(Update),
+) -> Outcome {
+    let video = &req.probe.path;
+    // Fail on a bad job before spending time on syncing.
+    let check = match target {
+        SubsTarget::Sidecar => subs::sidecar_outputs(video, &req.externals).map(|_| ()),
+        SubsTarget::Embed => subs::embed_container(video).map(|_| ()),
+    };
+    if let Err(e) = check {
+        return fail(e, Vec::new());
+    }
+    if !req.externals.iter().any(|e| e.selected) {
+        return fail("No subtitle files selected", Vec::new());
+    }
+    let prepared = match prepare_externals(tools, req, cancel, update) {
+        Ok(p) => p,
+        Err(o) => return o,
+    };
+    let mut out = match target {
+        SubsTarget::Sidecar => save_sidecars(video, &prepared),
+        SubsTarget::Embed => embed_in_place(tools, req, &prepared, cancel, update),
+    };
+    if out.success {
+        out.report.extend(prepared.report.iter().cloned());
+    }
+    out
+}
+
+fn save_sidecars(video: &Path, prepared: &PreparedSubs) -> Outcome {
+    let targets = match subs::sidecar_outputs(video, &prepared.externals) {
+        Ok(t) => t,
+        Err(e) => return fail(e, Vec::new()),
+    };
+    let part_of = |dest: &Path| {
+        let mut p = dest.as_os_str().to_owned();
+        p.push(".part");
+        PathBuf::from(p)
+    };
+    let cleanup = || {
+        for dest in &targets {
+            let _ = std::fs::remove_file(part_of(dest));
+        }
+    };
+    // All or nothing: back up and write every file as `.part` first, and only
+    // rename once all of them are written. A failure halfway would otherwise
+    // leave some files already shifted, and a retry would shift them again.
+    for (e, dest) in prepared.externals.iter().zip(&targets) {
+        let name = dest.file_name().unwrap_or_default().to_string_lossy();
+        // Any file that gets replaced (the source synced in place, or another
+        // sidecar already there) keeps its very first version as `.orig`.
+        let backup = subs::backup_path(dest);
+        if dest.exists()
+            && !backup.exists()
+            && let Err(err) = std::fs::copy(dest, &backup)
+        {
+            cleanup();
+            return fail(format!("Couldn't back up {name}: {err}"), Vec::new());
+        }
+        let written = std::fs::read(&e.path)
+            .map_err(|err| format!("Couldn't read a temp file: {err}"))
+            .and_then(|d| {
+                std::fs::write(part_of(dest), d)
+                    .map_err(|err| format!("Couldn't save {name}: {err}"))
+            });
+        if let Err(err) = written {
+            cleanup();
+            return fail(err, Vec::new());
+        }
+    }
+    let mut report = Vec::new();
+    for dest in &targets {
+        let name = dest.file_name().unwrap_or_default().to_string_lossy();
+        if let Err(err) = std::fs::rename(part_of(dest), dest) {
+            cleanup();
+            return fail(format!("Couldn't save {name}: {err}"), Vec::new());
+        }
+        let backup = subs::backup_path(dest);
+        if backup.exists() {
+            report.push(format!(
+                "Saved {name} (the earlier version is kept as {})",
+                backup.file_name().unwrap_or_default().to_string_lossy()
+            ));
+        } else {
+            report.push(format!("Saved {name}"));
+        }
+    }
+    Outcome {
+        success: true,
+        report,
+        ..Default::default()
+    }
+}
+
+/// Remux into `<video>.part.<ext>`, check the result, then replace the video.
+fn embed_in_place(
+    tools: &Tools,
+    req: &Request,
+    prepared: &PreparedSubs,
+    cancel: &Cancel,
+    update: &mut impl FnMut(Update),
+) -> Outcome {
+    let video = &req.probe.path;
+    let container = match subs::embed_container(video) {
+        Ok(c) => c,
+        Err(e) => return fail(e, Vec::new()),
+    };
+    let part = partial_path(video);
+    let args = match command::build_embed(&req.probe, &prepared.externals, container, &part) {
+        Ok(a) => a,
+        Err(e) => return fail(e, Vec::new()),
+    };
+    update(Update::Stage("Adding subtitles".into()));
+    let r = runner::run_ffmpeg(&tools.ffmpeg, &args, cancel, |p| {
+        update(Update::Progress(p))
+    });
+    if r.cancelled {
+        let _ = std::fs::remove_file(&part);
+        return cancelled();
+    }
+    if !r.success {
+        let _ = std::fs::remove_file(&part);
+        return fail(
+            r.error.unwrap_or_else(|| {
+                format!(
+                    "ffmpeg failed: {}",
+                    runner::error_summary(&r.stderr_tail.join("\n"))
+                )
+            }),
+            r.stderr_tail,
+        );
+    }
+    update(Update::Stage("Checking the new file".into()));
+    let verdict = probe::run(&tools.ffprobe, &part)
+        .and_then(|out| embed_verdict(&req.probe, &out, prepared.externals.len()));
+    if let Err(e) = verdict {
+        let _ = std::fs::remove_file(&part);
+        return fail(
+            format!("The new file didn't check out, so the original was left alone: {e}"),
+            Vec::new(),
+        );
+    }
+    if let Ok(m) = std::fs::metadata(video) {
+        let _ = std::fs::set_permissions(&part, m.permissions());
+    }
+    if let Err(e) = std::fs::rename(&part, video) {
+        let _ = std::fs::remove_file(&part);
+        return fail(format!("Couldn't replace the original: {e}"), Vec::new());
+    }
+    let n = prepared.externals.len();
+    Outcome {
+        success: true,
+        report: vec![format!(
+            "Embedded {n} subtitle track{} into {}",
+            if n == 1 { "" } else { "s" },
+            video.file_name().unwrap_or_default().to_string_lossy()
+        )],
+        ..Default::default()
+    }
+}
+
+/// Does the remuxed file have everything the original had, plus `added` subtitles?
+fn embed_verdict(src: &ProbeInfo, out: &ProbeInfo, added: usize) -> Result<(), String> {
+    if src.video.is_some() && out.video.is_none() {
+        return Err("the video stream is missing".into());
+    }
+    if out.audio.len() != src.audio.len() {
+        return Err(format!(
+            "{} audio tracks instead of {}",
+            out.audio.len(),
+            src.audio.len()
+        ));
+    }
+    if out.subtitles.len() != src.subtitles.len() + added {
+        return Err(format!(
+            "{} subtitle tracks instead of {}",
+            out.subtitles.len(),
+            src.subtitles.len() + added
+        ));
+    }
+    let tolerance = (src.duration * 0.005).max(1.0);
+    if src.duration > 0.0 && (out.duration - src.duration).abs() > tolerance {
+        return Err(format!(
+            "it is {:.1} s long instead of {:.1} s",
+            out.duration, src.duration
+        ));
+    }
+    Ok(())
 }
 
 fn size_report(req: &Request) -> String {
@@ -642,6 +1027,86 @@ pub fn vmaf_output(tools: &Tools, req: &Request, cancel: &Cancel) -> Result<Vmaf
 /// Real-ffmpeg tests against the clips in `dev/media` (made by `dev/make-media.sh`).
 /// Run with `cargo test -- --ignored`.
 #[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ffmpeg::probe::tests::sample_4k;
+
+    #[test]
+    fn embed_verdict_needs_every_stream_plus_the_new_subtitles() {
+        let src = sample_4k();
+        let mut out = src.clone();
+        assert!(embed_verdict(&src, &out, 1).is_err());
+        out.subtitles.push(Default::default());
+        assert_eq!(embed_verdict(&src, &out, 1), Ok(()));
+        out.audio.pop();
+        assert!(embed_verdict(&src, &out, 1).unwrap_err().contains("audio"));
+        let mut short = src.clone();
+        short.subtitles.push(Default::default());
+        short.duration = src.duration * 0.5;
+        assert!(embed_verdict(&src, &short, 1).unwrap_err().contains("long"));
+        short.duration = src.duration - 0.5;
+        assert_eq!(embed_verdict(&src, &short, 1), Ok(()));
+    }
+
+    #[test]
+    fn sidecars_are_all_or_nothing_and_back_up_what_they_replace() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("encoder-sidecar-test-{nanos}"));
+        let tmp = dir.join("prep");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let video = dir.join("Film.mkv");
+        let ext = |file: &str, lang: &str| {
+            let mut e = ExternalSub::from_path(&video, tmp.join(file), false);
+            e.language = Some(lang.into());
+            e
+        };
+        std::fs::write(tmp.join("0.srt"), "new no").unwrap();
+        std::fs::write(dir.join("Film.no.srt"), "old no").unwrap();
+        // The second prepared file is missing: nothing may be replaced.
+        let prepared = PreparedSubs {
+            externals: vec![ext("0.srt", "nor"), ext("1.srt", "eng")],
+            report: Vec::new(),
+            dir: tmp.clone(),
+        };
+        assert!(!save_sidecars(&video, &prepared).success);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("Film.no.srt")).unwrap(),
+            "old no"
+        );
+        assert!(!dir.join("Film.no.srt.part").exists());
+        assert!(!dir.join("Film.en.srt").exists());
+        drop(prepared);
+        // Both present: saved, and the replaced sidecar is kept as .orig.
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("0.srt"), "new no").unwrap();
+        std::fs::write(tmp.join("1.srt"), "new en").unwrap();
+        let prepared = PreparedSubs {
+            externals: vec![ext("0.srt", "nor"), ext("1.srt", "eng")],
+            report: Vec::new(),
+            dir: tmp.clone(),
+        };
+        assert!(save_sidecars(&video, &prepared).success);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("Film.no.srt")).unwrap(),
+            "new no"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("Film.en.srt")).unwrap(),
+            "new en"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("Film.no.srt.orig")).unwrap(),
+            "old no"
+        );
+        assert!(!dir.join("Film.en.srt.orig").exists());
+        drop(prepared);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
 mod media_tests {
     use super::*;
     use crate::ffmpeg::command::DecodeMode;
@@ -691,6 +1156,9 @@ mod media_tests {
             video_kbps: None,
             dv_preserve: false,
             mkvpropedit: false,
+            externals: Vec::new(),
+            mode: JobMode::Encode,
+            alass: None,
         };
         let mut progress = 0;
         let o = encode(&t, &req, &Cancel::default(), |u| {
@@ -897,6 +1365,9 @@ mod media_tests {
             video_kbps: None,
             dv_preserve: false,
             mkvpropedit: false,
+            externals: Vec::new(),
+            mode: JobMode::Encode,
+            alass: None,
         };
         assert_eq!(req.first_decode(), DecodeMode::Hardware);
         match estimate_video(&t, &req, &Cancel::default()) {

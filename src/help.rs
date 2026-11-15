@@ -55,3 +55,13 @@ pub const DEVICE: &str =
 pub const LANGUAGES: &str = "Languages to keep, in order, separated by commas, e.g. “Norwegian, English, Original”. Original = the language of the first audio track. The first kept audio track becomes the default.";
 
 pub const PGS: &str = "Image-based PGS subtitles: Plex usually burns them into the video when they're turned on, which forces a transcode. SRT is preferred.";
+
+pub const JOB_MODE: &str = "Re-encode or remux writes a new, smaller file (external subtitles are muxed in). Add subtitles only leaves the video as it is: the subtitle files are synced and either saved next to the video or embedded into it.";
+pub const SUBS_TARGET: &str = "Save next to the video writes Movie.no.srt (Plex picks it up, the video isn't touched, takes seconds). Embed remuxes the subtitles into the video file: a new copy is written next to it, checked, and then replaces the original, so it needs free space for one more copy.";
+pub const EXTERNAL_SUBS: &str = "SRT files from outside the video. Language and kind are read from names like Movie.no.srt, Movie.en.forced.srt or Movie.en.sdh.srt; change them if they're wrong. Files next to the video are added automatically.";
+pub const SUB_LANGUAGE: &str =
+    "Language tag in the output and in the saved file name. Plex shows it in the subtitle menu.";
+pub const SUB_KIND: &str = "Full = all dialogue. SDH = also describes sounds, for the hearing impaired. Forced = only foreign-language parts, shown automatically.";
+pub const SUB_SYNC: &str = "Lines the subtitles up with the video using alass. It compares against an embedded text subtitle when the video has one, otherwise the speech in the main audio track. Fixes constant offsets, 25 vs 23.976 fps timing and cuts. The original file isn't changed.";
+pub const SUB_SYNC_MISSING: &str = "Install alass to sync subtitles automatically: `cargo install alass-cli`, or a binary from https://github.com/kaegi/alass/releases on your PATH.";
+pub const SUB_OFFSET: &str = "Moves every subtitle by this much, after syncing. Positive = later (subtitles show up too early), negative = earlier.";

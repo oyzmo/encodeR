@@ -80,6 +80,33 @@ pub fn canonical(code: &str) -> String {
     entry(code).map_or_else(|| code.trim().to_ascii_lowercase(), |e| e.0.to_string())
 }
 
+/// Canonical code if `code` is a language this table knows (`no` → `nor`).
+pub fn known_language(code: &str) -> Option<String> {
+    entry(code).map(|e| e.0.to_string())
+}
+
+/// Two-letter code where one exists (`nor` → `no`, `nob` → `nb`), for file names.
+pub fn short_code(code: &str) -> String {
+    entry(code).map_or_else(
+        || code.trim().to_ascii_lowercase(),
+        |e| {
+            e.1.iter()
+                .find(|a| a.len() == 2)
+                .map_or(e.0, |a| *a)
+                .to_string()
+        },
+    )
+}
+
+/// (code, name) of every real language in the table, for pickers.
+pub fn language_choices() -> Vec<(&'static str, &'static str)> {
+    LANGUAGES
+        .iter()
+        .filter(|(c, _, _)| !matches!(*c, "zxx" | "mul" | "mis"))
+        .map(|(c, _, n)| (*c, *n))
+        .collect()
+}
+
 /// Grouping key: all Norwegian variants form one group.
 pub fn family(code: &str) -> String {
     match canonical(code).as_str() {
