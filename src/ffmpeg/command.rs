@@ -2,7 +2,7 @@
 //! No I/O here, so every shape can be unit-tested.
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::crop::Crop;
 use crate::ffmpeg::probe::ProbeInfo;
@@ -600,14 +600,27 @@ pub fn build_dv_mux(job: &EncodeJob, raw_video: &Path) -> Result<Vec<OsString>, 
 
 /// Fix-tracks remux: every stream of the source copied as it is, plus the
 /// external SRTs, with audio tracks shifted by `delays` (stream index, ms).
-/// Global metadata, chapters and attachments come along.
+/// Global metadata, chapters and attachments come along. `covers` are cover
+/// art streams already extracted to files (stream index, file): they go back
+/// in as MKV attachments, since the Matroska muxer would otherwise turn them
+/// into ordinary video tracks. Covers not listed are copied as streams.
 pub fn build_fix(
     p: &ProbeInfo,
     externals: &[ExternalSub],
     delays: &[(usize, i64)],
+    covers: &[(usize, PathBuf)],
     container: Container,
     output: &Path,
 ) -> Result<Vec<OsString>, String> {
+    let covers: Vec<(&crate::ffmpeg::probe::Cover, &PathBuf)> = if container == Container::Mkv {
+        covers
+            .iter()
+            .filter_map(|(i, f)| Some((p.covers.iter().find(|c| c.index == *i)?, f)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let attached = |i: usize| covers.iter().any(|(c, _)| c.index == i);
     if output == p.path.as_path() {
         return Err("The output file would overwrite the input".into());
     }
@@ -639,27 +652,61 @@ pub fn build_fix(
         a.kv("-i", &p.path);
     }
     let delay_of = |i: usize| delays.iter().find(|(k, _)| *k == i).map(|(_, ms)| *ms);
+    // Data streams are left out: MP4 timecode (`tmcd`) and MOV chapter-text
+    // tracks can't be written back as data and stop the muxer, and an MP4's
+    // chapter track would come back as a stray data track on every run
+    // (`-map_chapters` writes the chapters themselves).
     if delays.is_empty() {
-        a.add(&["-map", "0"]);
-    } else {
-        // Map by type so each audio track keeps its place, whichever input
-        // it comes from.
-        a.add(&["-map", "0:v?"]);
-        for t in &p.audio {
-            let input = delay_of(t.index)
-                .and_then(|ms| offsets.iter().position(|o| *o == ms))
-                .map_or(0, |j| 1 + ext.len() + j);
-            a.kv("-map", format!("{input}:{}", t.index));
+        a.add(&["-map", "0", "-map", "-0:d?"]);
+        for (c, _) in &covers {
+            a.kv("-map", format!("-0:{}", c.index));
         }
-        a.add(&["-map", "0:s?"]);
+    } else {
+        // A hand-built probe has no stream list: video, audio, subtitles.
+        let streams: Vec<(usize, String)> = if p.streams.is_empty() {
+            let v = p.video.iter().map(|v| (v.index, "video".to_string()));
+            let au = p.audio.iter().map(|t| (t.index, "audio".to_string()));
+            let su = p
+                .subtitles
+                .iter()
+                .map(|t| (t.index, "subtitle".to_string()));
+            v.chain(au).chain(su).collect()
+        } else {
+            p.streams.clone()
+        };
+        // Stream by stream in file order, so every stream keeps its place;
+        // a shifted audio track comes from its time-shifted input.
+        for (i, kind) in &streams {
+            match kind.as_str() {
+                "data" => {}
+                _ if attached(*i) => {}
+                "audio" => {
+                    let input = delay_of(*i)
+                        .and_then(|ms| offsets.iter().position(|o| *o == ms))
+                        .map_or(0, |j| 1 + ext.len() + j);
+                    a.kv("-map", format!("{input}:{i}"));
+                }
+                _ => a.kv("-map", format!("0:{i}")),
+            }
+        }
     }
     for k in 1..=ext.len() {
         a.kv("-map", format!("{k}:0"));
     }
-    if !delays.is_empty() {
-        a.add(&["-map", "0:t?", "-map", "0:d?"]);
-    }
     a.add(&["-c", "copy", "-map_metadata", "0", "-map_chapters", "0"]);
+    // Attachments made by `-attach` come after the copied ones.
+    for (j, (c, f)) in covers.iter().enumerate() {
+        let k = p.attachments + j;
+        a.kv("-attach", f.as_path());
+        a.kv(
+            format!("-metadata:s:t:{k}"),
+            format!("mimetype={}", c.mime()),
+        );
+        a.kv(
+            format!("-metadata:s:t:{k}"),
+            format!("filename={}", c.file_name()),
+        );
+    }
     // Packets shifted before 0 are dropped, as in `build`.
     for (i, t) in p.audio.iter().enumerate() {
         if delay_of(t.index).is_some_and(|ms| ms < 0) {
@@ -684,9 +731,9 @@ pub fn build_fix(
         a.add(&["-default_mode", "infer_no_subs"]);
     }
     // Name the muxer: from a `.part.m4v` name ffmpeg would pick `ipod`, which
-    // refuses HEVC and chapter tracks.
-    let mov = p
-        .path
+    // refuses HEVC and chapter tracks. `.mov` from the file being written, so
+    // a new `.mp4` from a `.mov` source is a real MP4.
+    let mov = output
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("mov"));
     let muxer = match container {
@@ -697,6 +744,26 @@ pub fn build_fix(
     a.add(&["-progress", "pipe:1", "-nostats", "-f", muxer]);
     a.0.push(output.into());
     Ok(a.0)
+}
+
+/// Copy cover art stream `index` of the source to an image file, unchanged.
+pub fn build_cover_extract(p: &ProbeInfo, index: usize, file: &Path) -> Vec<OsString> {
+    let mut a = Args(Vec::new());
+    a.add(&["-hide_banner", "-y", "-v", "error", "-i"]);
+    a.0.push(p.path.as_os_str().into());
+    a.kv("-map", format!("0:{index}"));
+    a.add(&["-c", "copy", "-f", "image2", "-update", "1"]);
+    a.0.push(file.into());
+    a.0
+}
+
+/// Where a fix-tracks job extracts the source's cover art for an MKV.
+pub fn cover_files(p: &ProbeInfo, dir: &Path) -> Vec<(usize, PathBuf)> {
+    p.covers
+        .iter()
+        .enumerate()
+        .map(|(n, c)| (c.index, dir.join(format!("{n}-{}", c.file_name()))))
+        .collect()
 }
 
 /// Size of the encoded picture after cropping and downscaling (`scale_vaapi=w=-2`).
@@ -1513,10 +1580,12 @@ mod tests {
             ext("/s/F.en.sdh.srt", None, ExtKind::Sdh),
         ];
         let out = Path::new("/lib/F.part.mkv");
-        let a = strings(build_fix(&p, &externals, &[], Container::Mkv, out).unwrap());
+        let a = strings(build_fix(&p, &externals, &[], &[], Container::Mkv, out).unwrap());
         assert!(has(
             &a,
-            &["-map", "0", "-map", "1:0", "-map", "2:0", "-c", "copy"]
+            &[
+                "-map", "0", "-map", "-0:d?", "-map", "1:0", "-map", "2:0", "-c", "copy"
+            ]
         ));
         assert!(has(&a, &["-map_metadata", "0", "-map_chapters", "0"]));
         let i = embedded;
@@ -1539,12 +1608,12 @@ mod tests {
         assert!(has(&a, &["-default_mode", "infer_no_subs"]));
         assert!(has(&a, &["-f", "matroska", "/lib/F.part.mkv"]));
         assert_eq!(a.last().unwrap(), "/lib/F.part.mkv");
-        let a = strings(build_fix(&p, &externals, &[], Container::Mp4, out).unwrap());
+        let a = strings(build_fix(&p, &externals, &[], &[], Container::Mp4, out).unwrap());
         assert!(has(&a, &[&format!("-c:s:{i}"), "mov_text"]));
         assert!(has(&a, &["-movflags", "+faststart"]));
         assert!(has(&a, &["-f", "mp4"]));
-        assert!(build_fix(&p, &externals, &[], Container::Mkv, &p.path).is_err());
-        assert!(build_fix(&p, &[], &[], Container::Mkv, out).is_err());
+        assert!(build_fix(&p, &externals, &[], &[], Container::Mkv, &p.path).is_err());
+        assert!(build_fix(&p, &[], &[], &[], Container::Mkv, out).is_err());
     }
 
     #[test]
@@ -1555,7 +1624,8 @@ mod tests {
         let out = Path::new("/lib/F.part.mkv");
         let (a2, a3) = (p.audio[1].index, p.audio[2].index);
         // Audio only: no subtitle files needed.
-        let a = strings(build_fix(&p, &[], &[(a2, -100), (a3, 0)], Container::Mkv, out).unwrap());
+        let a =
+            strings(build_fix(&p, &[], &[(a2, -100), (a3, 0)], &[], Container::Mkv, out).unwrap());
         assert!(has(&a, &["-itsoffset", "-0.100", "-i", &src]));
         assert_eq!(a.iter().filter(|x| *x == "-itsoffset").count(), 1);
         // Every audio track keeps its place; only the shifted one comes from input 1.
@@ -1565,15 +1635,14 @@ mod tests {
             .filter(|(k, _)| *k == "-map")
             .map(|(_, v)| v)
             .collect();
-        let mut want = vec!["0:v?".to_string()];
-        for t in &p.audio {
-            want.push(if t.index == a2 {
-                format!("1:{}", t.index)
-            } else {
-                format!("0:{}", t.index)
-            });
-        }
-        want.extend(["0:s?", "0:t?", "0:d?"].map(String::from));
+        // File order, data streams left out.
+        let want: Vec<String> = p
+            .streams
+            .iter()
+            .filter(|(_, k)| k != "data")
+            .map(|(i, _)| format!("{}:{i}", if *i == a2 { 1 } else { 0 }))
+            .collect();
+        assert!(!p.streams.is_empty());
         assert_eq!(maps, want.iter().collect::<Vec<_>>());
         assert!(has(&a, &["-c", "copy"]));
         assert!(has(&a, &["-copypriorss:a:1", "0"]));
@@ -1581,13 +1650,97 @@ mod tests {
 
         // With subtitle files: they come before the shifted input.
         let externals = vec![ext("/s/F.no.srt", Some("nor"), ExtKind::Full)];
-        let a = strings(build_fix(&p, &externals, &[(a2, 250)], Container::Mkv, out).unwrap());
+        let a = strings(build_fix(&p, &externals, &[(a2, 250)], &[], Container::Mkv, out).unwrap());
         assert!(has(&a, &["-itsoffset", "0.250", "-i", &src]));
         assert!(has(&a, &["-map", &format!("2:{a2}")]));
-        assert!(has(&a, &["-map", "0:s?", "-map", "1:0"]));
+        let last_sub = p.subtitles.last().unwrap().index;
+        assert!(has(&a, &["-map", &format!("0:{last_sub}"), "-map", "1:0"]));
         assert!(!a.iter().any(|x| x.starts_with("-copypriorss")));
+        // A hand-built probe without a stream list: video, audio, subtitles.
+        let mut bare = p.clone();
+        bare.streams.clear();
+        let a = strings(build_fix(&bare, &[], &[(a2, 250)], &[], Container::Mkv, out).unwrap());
+        assert!(has(
+            &a,
+            &["-map", "0:0", "-map", &format!("0:{}", p.audio[0].index)]
+        ));
+        assert!(has(&a, &["-map", &format!("1:{a2}")]));
+        // A new .mp4 from a .mov source is written as MP4, in place stays mov.
+        let mut mov = p.clone();
+        mov.path = "/lib/C.mov".into();
+        let a = strings(
+            build_fix(
+                &mov,
+                &externals,
+                &[],
+                &[],
+                Container::Mp4,
+                Path::new("/o/C-x.mp4"),
+            )
+            .unwrap(),
+        );
+        assert!(has(&a, &["-f", "mp4", "/o/C-x.mp4"]));
+        let a = strings(
+            build_fix(
+                &mov,
+                &externals,
+                &[],
+                &[],
+                Container::Mp4,
+                Path::new("/lib/C.part.mov"),
+            )
+            .unwrap(),
+        );
+        assert!(has(&a, &["-f", "mov"]));
         // A zero delay alone is nothing to do.
-        assert!(build_fix(&p, &[], &[(a2, 0)], Container::Mkv, out).is_err());
+        assert!(build_fix(&p, &[], &[(a2, 0)], &[], Container::Mkv, out).is_err());
+    }
+
+    #[test]
+    fn fix_puts_cover_art_back_as_an_mkv_attachment() {
+        use crate::ffmpeg::probe::Cover;
+        let mut p = sample_4k();
+        p.attachments = 1;
+        p.streams.push((20, "attachment".into()));
+        p.streams.push((21, "cover".into()));
+        p.covers.push(Cover {
+            index: 21,
+            codec: "mjpeg".into(),
+            filename: Some("cover.jpg".into()),
+            mimetype: Some("image/jpeg".into()),
+        });
+        let externals = [ext("/s/F.no.srt", Some("nor"), crate::subs::ExtKind::Full)];
+        let files = cover_files(&p, Path::new("/tmp/j"));
+        assert_eq!(files, vec![(21, PathBuf::from("/tmp/j/0-cover.jpg"))]);
+        let out = Path::new("/lib/F.part.mkv");
+        let cover_args = |a: &[String]| {
+            has(a, &["-attach", "/tmp/j/0-cover.jpg"])
+                && has(a, &["-metadata:s:t:1", "mimetype=image/jpeg"])
+                && has(a, &["-metadata:s:t:1", "filename=cover.jpg"])
+        };
+        // No delay: everything, minus data streams and the cover stream.
+        let a = strings(build_fix(&p, &externals, &[], &files, Container::Mkv, out).unwrap());
+        assert!(has(&a, &["-map", "0", "-map", "-0:d?", "-map", "-0:21"]));
+        assert!(cover_args(&a));
+        // With a delay: the cover stream isn't mapped, the font attachment is.
+        let a2 = p.audio[1].index;
+        let a = strings(build_fix(&p, &[], &[(a2, 100)], &files, Container::Mkv, out).unwrap());
+        assert!(!has(&a, &["-map", "0:21"]) && has(&a, &["-map", "0:20"]));
+        assert!(cover_args(&a));
+        // MP4 keeps covers as a flagged stream on its own; not extracted.
+        let a = strings(build_fix(&p, &externals, &[], &files, Container::Mp4, out).unwrap());
+        assert!(!a.iter().any(|x| x == "-attach" || x == "-0:21"));
+        // Probe: an attached_pic video stream is a cover, not the video.
+        let q = crate::ffmpeg::probe::parse(
+            r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":64,"height":64},
+            {"index":1,"codec_type":"video","codec_name":"png","disposition":{"attached_pic":1},
+             "tags":{"filename":"folder.png"}}],"format":{"duration":"2"}}"#,
+        )
+        .unwrap();
+        assert_eq!(q.video.as_ref().unwrap().index, 0);
+        assert_eq!(q.streams[1], (1, "cover".to_string()));
+        assert_eq!(q.covers[0].file_name(), "folder.png");
+        assert_eq!(q.covers[0].mime(), "image/png");
     }
 
     #[test]

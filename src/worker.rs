@@ -566,7 +566,29 @@ fn remux_fix(
         Err(e) => return fail(e, Vec::new()),
     };
     let part = partial_path(dest);
-    let args = match command::build_fix(&req.probe, &prepared.externals, delays, container, &part) {
+    // Cover art goes back into an MKV as an attachment; one that can't be
+    // extracted is copied as a stream instead (it loses its cover flag).
+    let mut covers = Vec::new();
+    if container == crate::settings::Container::Mkv {
+        for (i, file) in command::cover_files(&req.probe, &prepared.dir) {
+            let args = command::build_cover_extract(&req.probe, i, &file);
+            let ok = runner::run_capture(&tools.ffmpeg, &args, cancel).is_ok_and(|r| r.success);
+            if cancel.is_cancelled() {
+                return cancelled();
+            }
+            if ok && file.exists() {
+                covers.push((i, file));
+            }
+        }
+    }
+    let args = match command::build_fix(
+        &req.probe,
+        &prepared.externals,
+        delays,
+        &covers,
+        container,
+        &part,
+    ) {
         Ok(a) => a,
         Err(e) => return fail(e, Vec::new()),
     };
@@ -598,9 +620,8 @@ fn remux_fix(
         );
     }
     update(Update::Stage("Checking the new file".into()));
-    let max_delay = delays.iter().map(|(_, ms)| *ms).max().unwrap_or(0).max(0);
     let verdict = probe::run(&tools.ffprobe, &part)
-        .and_then(|out| embed_verdict(&req.probe, &out, prepared.externals.len(), max_delay));
+        .and_then(|out| embed_verdict(&req.probe, &out, prepared.externals.len(), delays));
     if let Err(e) = verdict {
         let _ = std::fs::remove_file(&part);
         let left = if in_place {
@@ -655,13 +676,14 @@ fn remux_fix(
 }
 
 /// Does the remuxed file have everything the original had, plus `added` subtitles?
-/// `max_delay_ms` is the largest positive audio delay, which can make the
-/// file that much longer.
+/// Audio `delays` (stream index, ms) may make it longer (positive) or, for a
+/// file whose length is set by the audio, shorter (negative), but only by
+/// that much and only in that direction.
 fn embed_verdict(
     src: &ProbeInfo,
     out: &ProbeInfo,
     added: usize,
-    max_delay_ms: i64,
+    delays: &[(usize, i64)],
 ) -> Result<(), String> {
     if src.video.is_some() && out.video.is_none() {
         return Err("the video stream is missing".into());
@@ -680,8 +702,11 @@ fn embed_verdict(
             src.subtitles.len() + added
         ));
     }
-    let tolerance = (src.duration * 0.005).max(1.0) + max_delay_ms as f64 / 1000.0;
-    if src.duration > 0.0 && (out.duration - src.duration).abs() > tolerance {
+    let tolerance = (src.duration * 0.005).max(1.0);
+    let later = delays.iter().map(|(_, ms)| *ms).max().unwrap_or(0).max(0) as f64 / 1000.0;
+    let earlier = -(delays.iter().map(|(_, ms)| *ms).min().unwrap_or(0).min(0)) as f64 / 1000.0;
+    let diff = out.duration - src.duration;
+    if src.duration > 0.0 && (diff > tolerance + later || -diff > tolerance + earlier) {
         return Err(format!(
             "it is {:.1} s long instead of {:.1} s",
             out.duration, src.duration
@@ -1111,12 +1136,12 @@ mod tests {
     fn embed_verdict_needs_every_stream_plus_the_new_subtitles() {
         let src = sample_4k();
         let mut out = src.clone();
-        assert!(embed_verdict(&src, &out, 1, 0).is_err());
+        assert!(embed_verdict(&src, &out, 1, &[]).is_err());
         out.subtitles.push(Default::default());
-        assert_eq!(embed_verdict(&src, &out, 1, 0), Ok(()));
+        assert_eq!(embed_verdict(&src, &out, 1, &[]), Ok(()));
         out.audio.pop();
         assert!(
-            embed_verdict(&src, &out, 1, 0)
+            embed_verdict(&src, &out, 1, &[])
                 .unwrap_err()
                 .contains("audio")
         );
@@ -1124,17 +1149,24 @@ mod tests {
         short.subtitles.push(Default::default());
         short.duration = src.duration * 0.5;
         assert!(
-            embed_verdict(&src, &short, 1, 0)
+            embed_verdict(&src, &short, 1, &[])
                 .unwrap_err()
                 .contains("long")
         );
         short.duration = src.duration - 0.5;
-        assert_eq!(embed_verdict(&src, &short, 1, 0), Ok(()));
+        assert_eq!(embed_verdict(&src, &short, 1, &[]), Ok(()));
         // A positive audio delay may make the file that much longer.
         let mut long = short.clone();
         long.duration = src.duration * 1.005 + 1.0 + 20.0;
-        assert!(embed_verdict(&src, &long, 1, 0).is_err());
-        assert_eq!(embed_verdict(&src, &long, 1, 21_500), Ok(()));
+        assert!(embed_verdict(&src, &long, 1, &[]).is_err());
+        assert_eq!(embed_verdict(&src, &long, 1, &[(1, 21_500)]), Ok(()));
+        // ...but it doesn't excuse a file that came out short.
+        let mut cut = short.clone();
+        cut.duration = src.duration * 0.995 - 1.0 - 20.0;
+        assert!(embed_verdict(&src, &cut, 1, &[(1, 21_500)]).is_err());
+        // A negative delay may make an audio-only file that much shorter.
+        assert_eq!(embed_verdict(&src, &cut, 1, &[(1, -21_500)]), Ok(()));
+        assert!(embed_verdict(&src, &long, 1, &[(1, -21_500)]).is_err());
     }
 
     #[test]
@@ -1212,6 +1244,111 @@ mod media_tests {
 
     fn tools() -> Tools {
         Tools::default()
+    }
+
+    #[test]
+    #[ignore]
+    fn fix_tracks_keeps_cover_art_and_fonts_in_mkv() {
+        let t = tools();
+        let dir = std::env::temp_dir().join("encoder-test-cover");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ff = |args: &[&str]| {
+            let ok = std::process::Command::new(&t.ffmpeg)
+                .args(["-v", "error", "-y"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "{args:?}");
+        };
+        let d = |n: &str| dir.join(n).to_string_lossy().into_owned();
+        ff(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=d=1:s=64x64",
+            "-frames:v",
+            "1",
+            &d("cover.jpg"),
+        ]);
+        std::fs::write(dir.join("font.ttf"), b"not really a font").unwrap();
+        std::fs::write(
+            dir.join("src.en.srt"),
+            "1\n00:00:00,500 --> 00:00:01,500\nHello\n",
+        )
+        .unwrap();
+        ff(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=d=2:s=64x64:r=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=d=2",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-attach",
+            &d("font.ttf"),
+            "-metadata:s:t:0",
+            "mimetype=font/ttf",
+            "-attach",
+            &d("cover.jpg"),
+            "-metadata:s:t:1",
+            "mimetype=image/jpeg",
+            "-metadata:s:t:1",
+            "filename=cover.jpg",
+            &d("src.mkv"),
+        ]);
+        let p = probe::run(&t.ffprobe, &dir.join("src.mkv")).unwrap();
+        assert_eq!((p.attachments, p.covers.len()), (1, 1));
+        let (mut sel, _, _) = auto_select(&p, &[], &EncodeSettings::default());
+        for (n, delay) in [0, -100].into_iter().enumerate() {
+            for c in &mut sel.audio {
+                c.offset_ms = delay;
+            }
+            let externals = if delay == 0 {
+                vec![ExternalSub::from_path(
+                    &p.path,
+                    dir.join("src.en.srt"),
+                    false,
+                )]
+            } else {
+                Vec::new()
+            };
+            let out = dir.join(format!("out{n}.mkv"));
+            let req = Request {
+                probe: p.clone(),
+                settings: EncodeSettings::default(),
+                selection: sel.clone(),
+                output: out.clone(),
+                device: "/dev/dri/renderD128".into(),
+                crop: None,
+                crop_on_gpu: false,
+                scan: Scan::Progressive,
+                video_kbps: None,
+                dv_preserve: false,
+                mkvpropedit: false,
+                externals,
+                mode: JobMode::Fix(SubsTarget::NewFile),
+                alass: None,
+            };
+            let o = encode(&t, &req, &Cancel::default(), |_| {});
+            assert!(o.success, "{:?} {:?}", o.error, o.stderr_tail);
+            let r = probe::run(&t.ffprobe, &out).unwrap();
+            assert_eq!(r.covers.len(), 1, "delay {delay}: {:?}", r.streams);
+            assert_eq!(r.covers[0].filename.as_deref(), Some("cover.jpg"));
+            assert_eq!(r.covers[0].mimetype.as_deref(), Some("image/jpeg"));
+            assert_eq!(r.attachments, 1, "font kept");
+            assert_eq!(r.video.as_ref().unwrap().codec, "h264");
+            // Only one real video track: the cover isn't a second one.
+            let videos = r.streams.iter().filter(|(_, k)| k == "video").count();
+            assert_eq!(videos, 1);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

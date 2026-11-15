@@ -294,7 +294,16 @@ impl State {
                 };
                 let part = worker::partial_path(&dest);
                 let delays = subs::audio_delays(&job.selection);
-                return match command::build_fix(&req.probe, &job.externals, &delays, c, &part) {
+                // Covers are extracted to the job's temp folder at run time.
+                let covers = command::cover_files(&req.probe, std::path::Path::new("<temp>"));
+                return match command::build_fix(
+                    &req.probe,
+                    &job.externals,
+                    &delays,
+                    &covers,
+                    c,
+                    &part,
+                ) {
                     Ok(a) => format!(
                         "{}\n# then the checked file {} {}",
                         command::display_command(&self.tools.ffmpeg, &a),
@@ -963,6 +972,7 @@ impl App {
     pub fn set_mode(self: &Rc<Self>, id: u64, mode: JobMode) {
         // Coming from an encode with audio delays set: next to the video
         // can't apply them, so start with a new file.
+        let requested = mode;
         let mode = match (mode, self.state.borrow().job(id)) {
             (JobMode::Fix(SubsTarget::Sidecar), Some(j))
                 if j.mode == JobMode::Encode && !subs::audio_delays(&j.selection).is_empty() =>
@@ -973,7 +983,10 @@ impl App {
         };
         let needs_analysis = {
             let mut st = self.state.borrow_mut();
-            if let JobMode::Fix(t) = mode {
+            // Remember only a result the user picked, not the switch above.
+            if let JobMode::Fix(t) = mode
+                && mode == requested
+            {
                 st.prefs.subs_target = t;
             }
             st.job(id).is_some_and(|j| {
@@ -1793,7 +1806,7 @@ impl App {
                         return None;
                     }
                     let line = if j.mode == JobMode::Fix(SubsTarget::Embed) {
-                        format!("• {} (subtitles embedded in place)", j.input.display())
+                        format!("• {} (remuxed in place)", j.input.display())
                     } else {
                         files
                             .iter()
@@ -1810,7 +1823,7 @@ impl App {
             let d = adw::AlertDialog::new(
                 Some("Replace Files?"),
                 Some(&format!(
-                    "These files will be replaced. Embedding writes a new copy of the video next to it, checks it, and only then replaces the original; it needs free space for one more copy.\n\n{}",
+                    "These files will be replaced. Replacing a video writes a new copy next to it, checks it, and only then replaces the original; it needs free space for one more copy.\n\n{}",
                     list.join("\n")
                 )),
             );
@@ -1849,7 +1862,7 @@ impl App {
             let st = self.state.borrow();
             st.jobs
                 .iter()
-                .filter(|j| j.state == JobState::Pending && j.mode == JobMode::Encode)
+                .filter(|j| j.state == JobState::Pending && !j.mode.in_place())
                 .map(|j| (j.id, st.output_for(j)))
                 .filter(|(id, out)| {
                     out.exists() && st.job(*id).and_then(|j| j.replace_ok.as_ref()) != Some(out)
@@ -1970,7 +1983,7 @@ impl App {
             self.update_start();
             let body = if embed {
                 format!(
-                    "Subtitles will be embedded into “{}”, replacing the original once the new copy checks out.",
+                    "“{}” will be remuxed and replaced by the new copy once it checks out.",
                     output.display()
                 )
             } else {
@@ -1998,7 +2011,11 @@ impl App {
                     .is_some_and(|j| j.state == JobState::Pending);
                 if resp == "replace" && pending {
                     if let Some(j) = a.state.borrow_mut().job_mut(id) {
-                        j.subs_ok.extend(unapproved.iter().cloned());
+                        if j.mode.in_place() {
+                            j.subs_ok.extend(unapproved.iter().cloned());
+                        } else {
+                            j.replace_ok = unapproved.first().cloned();
+                        }
                     }
                     a.launch(id);
                 } else {
@@ -2327,7 +2344,10 @@ impl App {
             return;
         }
         if fix == checks::Fix::TracksOnly {
-            self.set_mode(id, JobMode::Fix(SubsTarget::NewFile));
+            // The remembered result; set_mode turns "next to the video" into
+            // a new file, since that can't apply the delay.
+            let t = self.state.borrow().prefs.subs_target;
+            self.set_mode(id, JobMode::Fix(t));
             return;
         }
         self.edit(id, |j| {

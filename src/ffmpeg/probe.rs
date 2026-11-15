@@ -85,6 +85,44 @@ pub struct ProbeInfo {
     pub subtitles: Vec<SubtitleStream>,
     pub attachments: usize,
     pub hdr: HdrInfo,
+    /// Every stream in file order: (index, codec_type), with cover art
+    /// (an `attached_pic` video stream) as "cover".
+    pub streams: Vec<(usize, String)>,
+    /// Cover art streams.
+    pub covers: Vec<Cover>,
+}
+
+/// Cover art: a picture stream flagged `attached_pic` (an MKV image
+/// attachment, MP4 `covr`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Cover {
+    pub index: usize,
+    pub codec: String,
+    pub filename: Option<String>,
+    pub mimetype: Option<String>,
+}
+
+impl Cover {
+    /// File name to write it back as an MKV attachment.
+    pub fn file_name(&self) -> String {
+        self.filename
+            .clone()
+            .filter(|f| !f.is_empty() && !f.contains('/'))
+            .unwrap_or_else(|| {
+                let ext = if self.codec == "png" { "png" } else { "jpg" };
+                format!("cover.{ext}")
+            })
+    }
+
+    pub fn mime(&self) -> String {
+        self.mimetype.clone().unwrap_or_else(|| {
+            if self.codec == "png" {
+                "image/png".into()
+            } else {
+                "image/jpeg".into()
+            }
+        })
+    }
 }
 
 impl ProbeInfo {
@@ -381,15 +419,27 @@ pub fn parse(json: &str) -> Result<ProbeInfo, String> {
                 .filter(|_| stats_ok)
                 .and_then(|b| b.parse().ok())
         });
+        let attached = st
+            .get("disposition")
+            .and_then(|d| d.get("attached_pic"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            != 0;
+        let kind = s(st, "codec_type").unwrap_or_else(|| "unknown".into());
+        if attached && kind == "video" {
+            info.streams.push((index, "cover".into()));
+            info.covers.push(Cover {
+                index,
+                codec: codec.clone(),
+                filename: tag(st, "filename"),
+                mimetype: tag(st, "mimetype"),
+            });
+            continue;
+        }
+        info.streams.push((index, kind));
         match st.get("codec_type").and_then(Value::as_str) {
             Some("video") => {
-                let attached = st
-                    .get("disposition")
-                    .and_then(|d| d.get("attached_pic"))
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0)
-                    != 0;
-                if attached || info.video.is_some() {
+                if info.video.is_some() {
                     continue;
                 }
                 if info.duration <= 0.0 {

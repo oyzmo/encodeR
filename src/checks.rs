@@ -864,7 +864,7 @@ pub fn external_issues(
                 _ => "embedcontainer",
             };
             v.push(issue(id, Severity::Strong, e, None));
-        } else if target.remuxes() && selected.iter().any(|e| e.is_sidecar_of(video)) {
+        } else if target == SubsTarget::Embed && selected.iter().any(|e| e.is_sidecar_of(video)) {
             v.push(issue(
                 "sidecarstays",
                 Severity::Info,
@@ -1489,6 +1489,19 @@ mod tests {
         assert!(delay(SubsTarget::Embed).is_empty());
         assert!(delay(SubsTarget::NewFile).is_empty());
         assert_eq!(delay(SubsTarget::Sidecar), vec!["sidecardelay"]);
+        // A delay-only replace of an AVI points at the new-file result.
+        let avi_delay = external_issues(avi, &s, JobMode::Fix(SubsTarget::Embed), &[], true, true);
+        assert!(avi_delay[0].message.contains("Write a new file"));
+        // A new file has another name, so the sidecars don't double up.
+        assert!(
+            ids(
+                JobMode::Fix(SubsTarget::NewFile),
+                std::slice::from_ref(&no),
+                true,
+                &s
+            )
+            .is_empty()
+        );
         assert_eq!(
             ids(JobMode::Fix(SubsTarget::NewFile), &[], true, &s),
             vec!["nosubs"]

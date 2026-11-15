@@ -191,6 +191,10 @@ pub fn fix_problem(
         SubsTarget::Sidecar if !subs => Err(NOTHING_TO_FIX.into()),
         SubsTarget::Sidecar => sidecar_outputs(video, externals).map(|_| ()),
         _ if !subs && !delays => Err(NOTHING_TO_FIX.into()),
+        SubsTarget::Embed if !subs && fix_container(video, target).is_err() => Err(format!(
+            "A .{} file can't be remuxed in place here. Pick “Write a new file” (it becomes an MKV).",
+            video.extension().unwrap_or_default().to_string_lossy()
+        )),
         _ => fix_container(video, target).map(|_| ()),
     }
 }

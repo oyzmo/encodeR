@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.2
+
+- Fix tracks only keeps cover art as cover art in MKV files. Before, the remux turned it into an ordinary one-frame video track. The picture is copied out unchanged and put back as an attachment with its file name and type. MP4 covers already stayed covers.
+
+## 0.8.1
+
+- Fix tracks only works on MP4/MOV files with a timecode or chapter track. Before, ffmpeg refused them. Data tracks are no longer copied: the muxer writes timecode and chapters afresh, so they don't pile up as stray tracks on each run.
+- With an audio delay, every stream keeps its place in the file, so cover art no longer jumps ahead of the audio and odd stream orders are left alone.
+- *Write a new file* jobs whose output already exists are asked about up front with the other replacements, so the queue no longer stops half-way.
+- A new `.mp4` from a `.mov` source is a real MP4.
+- The file check only lets a positive delay make the result longer and a negative delay make it shorter. An audio-only file with a negative delay no longer fails, and a cut-short file no longer passes.
+- Switching a job to Fix tracks only because of a delay no longer changes your remembered *Result* choice.
+- Delays can be reset while *Subtitles next to the video* is picked. The messages for delay-only jobs no longer talk about subtitles.
+
 ## 0.8.0
 
 - "Add subtitles only" is now **Fix tracks only**: it also shifts out-of-sync audio without re-encoding anything. Its *Audio Timing* group has a delay button for every audio track, and every stream is copied as it is (Atmos is kept).

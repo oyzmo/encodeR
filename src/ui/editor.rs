@@ -1528,11 +1528,12 @@ fn audio_timing_group(
     let g = adw::PreferencesGroup::new();
     g.set_title("Audio Timing");
     g.set_tooltip_text(Some(help::AUDIO_OFFSET));
+    // Rows stay editable next to the video too, so a delay can be reset.
     let remux = target.remuxes();
     g.set_description(Some(if remux {
         "Shift a track that's out of sync; it stays a copy"
     } else {
-        "Pick “Replace the original file” or “Write a new file” to shift audio"
+        "Next to the video can't shift audio: pick “Replace the original file” or “Write a new file”, or reset the delays"
     }));
     for a in &p.audio {
         let offset = job
@@ -1561,7 +1562,6 @@ fn audio_timing_group(
         let row = adw::ActionRow::builder()
             .title(glib::markup_escape_text(&title))
             .subtitle(glib::markup_escape_text(&sub.join(" · ")))
-            .sensitive(remux)
             .build();
         let b = offset_button(app, id, a.index, offset);
         // Rebuild when the popover closes so the subtitle shows the new delay.
