@@ -1534,10 +1534,12 @@ fn offset_button(app: &Rc<App>, id: u64, index: usize, offset_ms: i64) -> gtk::M
     };
     set_look(&button, offset_ms);
 
-    let spin = gtk::SpinButton::with_range(-30.0, 30.0, 0.05);
-    spin.set_digits(2);
-    spin.set_value(offset_ms as f64 / 1000.0);
-    spin.set_width_chars(6);
+    // Milliseconds: the arrows step 50 ms, typing takes any whole number.
+    let spin = gtk::SpinButton::with_range(-30_000.0, 30_000.0, 50.0);
+    spin.set_increments(50.0, 500.0);
+    spin.set_digits(0);
+    spin.set_value(offset_ms as f64);
+    spin.set_width_chars(7);
     let reset = gtk::Button::with_label("Reset");
     reset.set_sensitive(offset_ms != 0);
     {
@@ -1549,7 +1551,7 @@ fn offset_button(app: &Rc<App>, id: u64, index: usize, offset_ms: i64) -> gtk::M
         let b = button.clone();
         let r = reset.clone();
         spin.connect_value_changed(move |s| {
-            let ms = (s.value() * 1000.0).round() as i64;
+            let ms = s.value().round() as i64;
             set_look(&b, ms);
             r.set_sensitive(ms != 0);
             ap.edit(id, |j| {
@@ -1559,7 +1561,7 @@ fn offset_button(app: &Rc<App>, id: u64, index: usize, offset_ms: i64) -> gtk::M
             });
         });
     }
-    let title = gtk::Label::new(Some("Audio delay (seconds)"));
+    let title = gtk::Label::new(Some("Audio delay (ms)"));
     title.add_css_class("heading");
     title.set_halign(gtk::Align::Start);
     let hint = gtk::Label::new(Some(
