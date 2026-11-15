@@ -1,6 +1,6 @@
 [package]
 name = "encoder"
-version = "0.5.1"
+version = "0.6.2"
 edition = "2024"
 description = "Shrink large videos with VA-API hardware encoding"
 license = "GPL-3.0-or-later"
@@ -12,6 +12,8 @@ async-channel = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shlex = "2"
+# Subtitle downloads arrive as .zip; reading them (deflate) is all we need.
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [profile.release]
 lto = "thin"

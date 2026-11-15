@@ -1,3 +1,4 @@
+mod alass;
 mod changelog;
 mod checks;
 mod cli;
@@ -23,7 +24,7 @@ use adw::prelude::*;
 const USAGE: &str = "Usage: encoder [FILE…]
        encoder --print-command FILE [--preset NAME] [--out DIR] [--subs SRT]…
        encoder --encode FILE [--preset NAME] [--out DIR] [--subs SRT]…
-       encoder --add-subs VIDEO [SRT…] [--embed] [--no-sync]
+       encoder --add-subs VIDEO [SRT|ZIP…] [--embed] [--no-sync]
        encoder --version";
 
 fn run_cli(mode: &str, rest: &[String]) -> gtk::glib::ExitCode {

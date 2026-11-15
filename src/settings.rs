@@ -369,6 +369,16 @@ pub fn config_dir() -> PathBuf {
         .join("encoder")
 }
 
+/// `$XDG_DATA_HOME/encoder` (tools the app installs itself).
+pub fn data_dir() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("encoder")
+}
+
 pub fn cache_dir() -> PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)

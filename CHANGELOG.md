@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.2
+
+- Subtitle zips are unpacked in the background, so a zip on a sleeping NAS no longer freezes the window. Oversized archives are refused (at most 200 SRT files, 64 MB in total).
+- A zip with one folder per language (`English/Movie.srt`, `Norwegian/Movie.srt`) gives `Movie.English.srt` and `Movie.Norwegian.srt` instead of two "Unknown" files. Two files with the same name keep their names, so the language in the name is still read.
+- Adding the same zip twice no longer adds every subtitle twice. `encoder --add-subs` cleans up its unpacked files however the run ends.
+- An alass download that isn't executable no longer counts as installed. A download cut short by quitting is cleaned up on the next install.
+- The *Install alass* button says "Installing…" while it works, and the sync tooltip only mentions the button where it exists.
+
+## 0.6.1
+
+- The Flatpak bundles alass, so subtitles are synced automatically there too.
+- Native installs get an *Install alass* button on the "alass isn't installed" check. It downloads the official build (checked against a pinned checksum) into `~/.local/share/encoder/bin`, with no root needed. A **?** next to it explains how to install alass by hand, for both native and Flatpak.
+- alass in `~/.local/bin` or `~/.cargo/bin` is found even when the app is started from GNOME without those folders on PATH.
+
+## 0.6.0
+
+- Subtitle zips (as subtitle sites ship them) can be dropped on the window, picked in *Add Subtitle Files…* and *Add Subtitles to Videos…*, or passed to `encoder --add-subs`. The SRT files inside are used; anything else (`.nfo` and so on) is ignored.
+
 ## 0.5.1
 
 - Subtitles-only jobs always ask before replacing a file, including jobs added while the queue is running and jobs edited after you approved them.

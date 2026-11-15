@@ -227,8 +227,10 @@ pub fn externals_group(app: &Rc<App>, id: u64, job: &Job, alass: bool) -> adw::P
             if alass { "" } else { "alass isn't installed" },
             if alass {
                 help::SUB_SYNC
-            } else {
+            } else if crate::alass::installable() {
                 help::SUB_SYNC_MISSING
+            } else {
+                help::SUB_SYNC_MISSING_MANUAL
             },
             e.sync,
         );

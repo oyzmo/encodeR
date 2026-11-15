@@ -63,5 +63,24 @@ pub const SUB_LANGUAGE: &str =
     "Language tag in the output and in the saved file name. Plex shows it in the subtitle menu.";
 pub const SUB_KIND: &str = "Full = all dialogue. SDH = also describes sounds, for the hearing impaired. Forced = only foreign-language parts, shown automatically.";
 pub const SUB_SYNC: &str = "Lines the subtitles up with the video using alass. It compares against an embedded text subtitle when the video has one, otherwise the speech in the main audio track. Fixes constant offsets, 25 vs 23.976 fps timing and cuts. The original file isn't changed.";
-pub const SUB_SYNC_MISSING: &str = "Install alass to sync subtitles automatically: `cargo install alass-cli`, or a binary from https://github.com/kaegi/alass/releases on your PATH.";
+pub const SUB_SYNC_MISSING: &str = "Install alass to sync subtitles automatically: the Install alass button under Checks downloads the official build into ~/.local/share/encoder/bin. The ? next to it shows how to install it by hand.";
+pub const SUB_SYNC_MISSING_MANUAL: &str = "Install alass to sync subtitles automatically. The ? next to the alass check under Checks shows how.";
+/// The "?" next to the "alass isn't installed" check. Plain text, selectable.
+pub const ALASS_MANUAL: &str = "alass lines subtitles up with the video. To install it by hand:
+
+Native install
+1. Download alass-linux64 from
+   https://github.com/kaegi/alass/releases (v2.0.0)
+2. Save it as ~/.local/share/encoder/bin/alass
+   (or as alass anywhere on your PATH, e.g. ~/.local/bin)
+3. chmod +x ~/.local/share/encoder/bin/alass
+Or: cargo install alass-cli (encodeR also looks in ~/.cargo/bin)
+
+Flatpak
+alass is bundled in the Flatpak from 0.6.1 on: rebuild it with
+scripts/install.sh --install-flatpak
+Or put the downloaded file, made executable, at
+~/.var/app/no.oyzmo.EncodeR/data/encoder/bin/alass
+
+Restart encodeR afterwards.";
 pub const SUB_OFFSET: &str = "Moves every subtitle by this much, after syncing. Positive = later (subtitles show up too early), negative = earlier.";

@@ -1321,7 +1321,14 @@ impl Editor {
                         glib::idle_add_local_once(move || a.apply_fix(id, fix));
                     });
                     b.set_sensitive(job.state.editable());
+                    if fix == crate::checks::Fix::InstallAlass && app.alass_installing.get() {
+                        b.set_label("Installing…");
+                        b.set_sensitive(false);
+                    }
                     row.add_suffix(&b);
+                }
+                if i.id == "noalass" {
+                    row.add_suffix(&help_button(crate::help::ALASS_MANUAL));
                 }
                 g.add(&row);
             }
@@ -1498,4 +1505,30 @@ impl Editor {
             buf.set_text(&st.command_text(job));
         }
     }
+}
+
+/// A "?" button whose popover holds longer, copyable help text.
+fn help_button(text: &str) -> gtk::MenuButton {
+    let label = gtk::Label::builder()
+        .label(text)
+        .wrap(true)
+        .max_width_chars(56)
+        .selectable(true)
+        .xalign(0.0)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    let pop = gtk::Popover::builder().child(&label).build();
+    // A selectable label opens with all its text selected; start with none.
+    pop.connect_show(move |_| label.select_region(0, 0));
+    let b = gtk::MenuButton::builder()
+        .icon_name("help-about-symbolic")
+        .popover(&pop)
+        .valign(gtk::Align::Center)
+        .tooltip_text("How to install it by hand")
+        .build();
+    b.add_css_class("flat");
+    b
 }

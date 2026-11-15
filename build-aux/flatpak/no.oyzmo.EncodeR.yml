@@ -88,6 +88,19 @@ modules:
         url: https://github.com/quietvoid/dovi_tool/archive/refs/tags/2.3.4.tar.gz
         sha256: 15b5cb68b3598e51ca968316443c9fb9597b6230e9d692cb4e641d54505a97ec
 
+  # Subtitle sync. The official static build (the same file the app's
+  # "Install alass" button fetches outside the Flatpak), pinned by checksum.
+  - name: alass
+    buildsystem: simple
+    only-arches:
+      - x86_64
+    build-commands:
+      - install -Dm755 alass-linux64 /app/bin/alass
+    sources:
+      - type: file
+        url: https://github.com/kaegi/alass/releases/download/v2.0.0/alass-linux64
+        sha256: 7bd0b9ae7e035d3ba940eacffb21243614df36231d47f21f0b4ce42001ab7fcd
+
   - name: encoder
     buildsystem: simple
     build-options:

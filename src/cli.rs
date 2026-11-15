@@ -278,8 +278,18 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
     })
 }
 
+/// A folder deleted when it goes out of scope.
+struct TempDir(PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// `--add-subs VIDEO [SRT…] [--embed] [--no-sync]`: the subtitles-only job.
-/// Without SRT files, the video's sidecars are used.
+/// SRT arguments may be zips of SRT files. Without any, the video's sidecars
+/// are used.
 pub fn add_subs(args: &[String]) -> Result<(), String> {
     let mut video: Option<PathBuf> = None;
     let mut files = Vec::new();
@@ -295,6 +305,25 @@ pub fn add_subs(args: &[String]) -> Result<(), String> {
         }
     }
     let video = video.ok_or("Missing VIDEO")?;
+    // Zips of SRT files are unpacked to a temp folder for this run, removed
+    // however the run ends. The time in the name keeps two runs apart in a
+    // Flatpak, where every sandbox has the same pid.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let unzip = TempDir(
+        crate::settings::cache_dir().join(format!("unzip-{}-cli-{nanos}", std::process::id())),
+    );
+    let unzip_dir = &unzip.0;
+    let mut unpacked = Vec::new();
+    for (k, f) in files.into_iter().enumerate() {
+        if subs::is_zip(&f) {
+            unpacked.extend(subs::unpack_zip(&f, &unzip_dir.join(k.to_string()))?);
+        } else {
+            unpacked.push(f);
+        }
+    }
+    let mut files = unpacked;
     if files.is_empty() {
         files = subs::discover(&video);
     }
@@ -310,10 +339,7 @@ pub fn add_subs(args: &[String]) -> Result<(), String> {
         .into_iter()
         .map(|f| ExternalSub::from_path(&video, f, sync))
         .collect();
-    let alass = ["alass", "alass-cli"]
-        .into_iter()
-        .find(|p| crate::ffmpeg::runner::which(p))
-        .map(String::from);
+    let alass = crate::alass::find();
     for e in &externals {
         println!(
             "subs    {} · {} · {}",

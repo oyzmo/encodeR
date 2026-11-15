@@ -32,6 +32,8 @@ pub enum Fix {
     ConvertMp4Audio,
     /// Turn cropping off (job state, handled by the window).
     NoCrop,
+    /// Download alass (handled by the window).
+    InstallAlass,
 }
 
 impl Fix {
@@ -51,6 +53,7 @@ impl Fix {
             Fix::AutoRateControl => "Use automatic".into(),
             Fix::ConvertMp4Audio => "Convert those tracks".into(),
             Fix::NoCrop => "Turn off crop".into(),
+            Fix::InstallAlass => "Install alass".into(),
         }
     }
 }
@@ -800,8 +803,21 @@ pub fn apply_fix(fix: Fix, p: &ProbeInfo, s: &mut EncodeSettings, sel: &mut Sele
                 }
             }
         }
-        // Job state, not settings: the window turns cropping off.
-        Fix::NoCrop => {}
+        // Not settings: the window turns cropping off or installs alass.
+        Fix::NoCrop | Fix::InstallAlass => {}
+    }
+}
+
+/// Keep the "Install alass" button only where the install can work (native
+/// x86-64 with curl and sha256sum); elsewhere the "?" help remains.
+pub fn offer_alass_install(issues: &mut [Issue], installable: bool) {
+    if installable {
+        return;
+    }
+    for i in issues {
+        if i.fix == Some(Fix::InstallAlass) {
+            i.fix = None;
+        }
     }
 }
 
@@ -858,7 +874,7 @@ pub fn external_issues(
             "noalass",
             Severity::Info,
             "alass isn't installed, so subtitles can't be synced automatically; only the manual offset is applied.",
-            None,
+            Some(Fix::InstallAlass),
         ));
     }
     let unknown: Vec<String> = selected
@@ -1448,5 +1464,22 @@ mod tests {
             vec!["mp4movtext"]
         );
         assert!(ids(JobMode::Encode, &[no], true, &s).is_empty());
+    }
+
+    #[test]
+    fn alass_install_offered_only_where_it_works() {
+        let mk = || {
+            vec![
+                issue("noalass", Severity::Info, "x", Some(Fix::InstallAlass)).unwrap(),
+                issue("other", Severity::Info, "y", Some(Fix::Mkv)).unwrap(),
+            ]
+        };
+        let mut v = mk();
+        offer_alass_install(&mut v, true);
+        assert_eq!(v[0].fix, Some(Fix::InstallAlass));
+        let mut v = mk();
+        offer_alass_install(&mut v, false);
+        assert_eq!(v[0].fix, None);
+        assert_eq!(v[1].fix, Some(Fix::Mkv));
     }
 }

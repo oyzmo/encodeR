@@ -496,6 +496,155 @@ pub fn is_video(p: &Path) -> bool {
         .is_some_and(|e| VIDEO_EXTS.iter().any(|v| e.eq_ignore_ascii_case(v)))
 }
 
+/// Is this a subtitle file we take (`.srt`), or an archive that may hold some (`.zip`)?
+pub fn is_srt(p: &Path) -> bool {
+    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("srt"))
+}
+
+pub fn is_zip(p: &Path) -> bool {
+    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+}
+
+/// Limits for SRT files taken from an archive: a real one is well under
+/// 1 MB, and a subtitle pack holds a few dozen at most.
+pub struct ZipLimits {
+    pub file: u64,
+    pub total: u64,
+    pub count: usize,
+}
+
+pub const ZIP_LIMITS: ZipLimits = ZipLimits {
+    file: 16 * 1024 * 1024,
+    total: 64 * 1024 * 1024,
+    count: 200,
+};
+
+/// File name for a zip entry: its base name, with the folder it sits in
+/// folded in when that folder names a language or kind the file name lacks
+/// (`Norwegian/Movie.srt` → `Movie.Norwegian.srt`). None for entries that
+/// aren't SRT files, hidden files and macOS `__MACOSX` junk. Folder parts are
+/// otherwise dropped, so nothing can land outside the unpack folder.
+pub fn zip_entry_name(full: &str) -> Option<String> {
+    let full = full.replace('\\', "/");
+    let mut parts: Vec<&str> = full.split('/').filter(|p| !p.is_empty()).collect();
+    let name = parts.pop()?;
+    if parts.first() == Some(&"__MACOSX") || name.starts_with('.') || !is_srt(Path::new(name)) {
+        return None;
+    }
+    let folder = parts.last().map(|f| tokens(f)).unwrap_or_default();
+    let describes = !folder.is_empty()
+        && folder
+            .iter()
+            .all(|w| language_word(w).is_some() || kind_word(w).is_some());
+    let has_language = guess_from_name(Path::new(""), Path::new(name))
+        .language
+        .is_some();
+    if describes && !has_language {
+        let stem = &name[..name.len() - 4];
+        return Some(format!("{stem}.{}.srt", parts.last()?.replace(' ', ".")));
+    }
+    Some(name.to_string())
+}
+
+/// Unpack the SRT files of a zip archive into `dir` and return their paths,
+/// writing each file as it's read. Two files with the same name go into
+/// numbered subfolders (`dir/2/Movie.srt`), so the name, which carries the
+/// language, stays as it is.
+pub fn unpack_zip_from<R: std::io::Read + std::io::Seek>(
+    reader: R,
+    dir: &Path,
+    limits: &ZipLimits,
+) -> Result<Vec<PathBuf>, String> {
+    use std::io::Read;
+    let mut zip = zip::ZipArchive::new(reader).map_err(|e| e.to_string())?;
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut total = 0u64;
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).map_err(|e| e.to_string())?;
+        if !f.is_file() {
+            continue;
+        }
+        let Some(name) = zip_entry_name(&f.name().map_err(|e| e.to_string())?) else {
+            continue;
+        };
+        if out.len() >= limits.count {
+            return Err(format!("more than {} subtitle files in it", limits.count));
+        }
+        let too_big = || format!("{name} is too big to be a subtitle file");
+        if f.size() > limits.file {
+            return Err(too_big());
+        }
+        let mut data = Vec::new();
+        (&mut f)
+            .take(limits.file + 1)
+            .read_to_end(&mut data)
+            .map_err(|e| format!("{name}: {e}"))?;
+        if data.len() as u64 > limits.file {
+            return Err(too_big());
+        }
+        total += data.len() as u64;
+        if total > limits.total {
+            return Err("its subtitles are too big in total".into());
+        }
+        let taken = |p: &PathBuf| {
+            out.iter().any(|o| {
+                o.parent() == p.parent()
+                    && o.file_name()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(p.file_name().unwrap_or_default()))
+            })
+        };
+        let mut path = dir.join(&name);
+        let mut slot = 2;
+        while taken(&path) {
+            path = dir.join(slot.to_string()).join(&name);
+            slot += 1;
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&path, data).map_err(|e| e.to_string())?;
+        out.push(path);
+    }
+    Ok(out)
+}
+
+/// Unpack the SRT files of `zip` into `dir` (created if needed). An archive
+/// without any is an error, so the user hears of it. A finished unpack is
+/// recorded in `dir`, and a second call returns the same files without
+/// unpacking again, so adding the same zip twice gives the same paths.
+pub fn unpack_zip(zip: &Path, dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let name = zip.file_name().unwrap_or_default().to_string_lossy();
+    let done = dir.join(".unpacked");
+    if let Ok(list) = std::fs::read_to_string(&done) {
+        let paths: Vec<PathBuf> = list.lines().map(|l| dir.join(l)).collect();
+        if !paths.is_empty() && paths.iter().all(|p| p.is_file()) {
+            return Ok(paths);
+        }
+    }
+    let file = std::fs::File::open(zip).map_err(|e| format!("Couldn't open {name}: {e}"))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("Couldn't unpack {name}: {e}"))?;
+    let unpacked = unpack_zip_from(std::io::BufReader::new(file), dir, &ZIP_LIMITS);
+    let paths = match unpacked {
+        Ok(p) if p.is_empty() => Err(format!("{name} has no SRT subtitles in it")),
+        Ok(p) => Ok(p),
+        Err(e) => Err(format!("Couldn't unpack {name}: {e}")),
+    };
+    match &paths {
+        Ok(p) => {
+            let list: Vec<String> = p
+                .iter()
+                .filter_map(|p| p.strip_prefix(dir).ok())
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            let _ = std::fs::write(&done, list.join("\n"));
+        }
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+    paths
+}
+
 /// Of `videos`, the one this subtitle file belongs to: the longest name wins,
 /// so `Blade.Runner.2049.en.srt` goes to `Blade.Runner.2049.mkv`, not to
 /// `Blade.Runner.mkv`.
@@ -1217,5 +1366,118 @@ mod tests {
             Path::new("out.srt"),
         );
         assert_eq!(a.len(), 7);
+    }
+
+    fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in entries {
+            w.start_file(*name, opts).unwrap();
+            w.write_all(data).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn zip_entry_names() {
+        assert_eq!(
+            zip_entry_name("film.nor.srt").as_deref(),
+            Some("film.nor.srt")
+        );
+        assert_eq!(
+            zip_entry_name("../../etc/evil.srt").as_deref(),
+            Some("evil.srt")
+        );
+        assert_eq!(zip_entry_name("a\\b\\c.SRT").as_deref(), Some("c.SRT"));
+        assert_eq!(zip_entry_name("film.nfo"), None);
+        assert_eq!(zip_entry_name("__MACOSX/._film.srt"), None);
+        assert_eq!(zip_entry_name(".hidden.srt"), None);
+        assert_eq!(zip_entry_name("dir/"), None);
+        // A language folder names the file; a file with its own language keeps it.
+        assert_eq!(
+            zip_entry_name("Subs/Norwegian/Movie.srt").as_deref(),
+            Some("Movie.Norwegian.srt")
+        );
+        assert_eq!(
+            zip_entry_name("English SDH/Movie.srt").as_deref(),
+            Some("Movie.English.SDH.srt")
+        );
+        assert_eq!(
+            zip_entry_name("English/Movie.2019.1080p.no.srt").as_deref(),
+            Some("Movie.2019.1080p.no.srt")
+        );
+        assert_eq!(
+            zip_entry_name("Subs/Movie.srt").as_deref(),
+            Some("Movie.srt")
+        );
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("encoder-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn zips_unpack_with_names_intact_and_limits() {
+        let z = zip_of(&[
+            ("English/Movie.srt", b"1"),
+            ("Norwegian/Movie.srt", b"2"),
+            ("a/Film.2019.no.srt", b"3"),
+            ("b/film.2019.NO.srt", b"4"),
+            ("film.nfo", b"x"),
+        ]);
+        let dir = scratch("unzip");
+        let got = unpack_zip_from(std::io::Cursor::new(z.clone()), &dir, &ZIP_LIMITS).unwrap();
+        let rel: Vec<String> = got
+            .iter()
+            .map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            rel,
+            [
+                "Movie.English.srt",
+                "Movie.Norwegian.srt",
+                "Film.2019.no.srt",
+                "2/film.2019.NO.srt"
+            ]
+        );
+        assert_eq!(std::fs::read(&got[3]).unwrap(), b"4");
+        let tight = |file, total, count| ZipLimits { file, total, count };
+        let d2 = scratch("unzip-limits");
+        assert!(unpack_zip_from(std::io::Cursor::new(z.clone()), &d2, &tight(0, 99, 99)).is_err());
+        assert!(unpack_zip_from(std::io::Cursor::new(z.clone()), &d2, &tight(9, 2, 99)).is_err());
+        assert!(unpack_zip_from(std::io::Cursor::new(z), &d2, &tight(9, 99, 3)).is_err());
+        assert!(
+            unpack_zip_from(
+                std::io::Cursor::new(b"not a zip".to_vec()),
+                &d2,
+                &ZIP_LIMITS
+            )
+            .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    #[test]
+    fn unpacking_the_same_zip_twice_gives_the_same_files() {
+        let dir = scratch("unzip-twice");
+        std::fs::create_dir_all(&dir).unwrap();
+        let zip = dir.join("subs.zip");
+        std::fs::write(&zip, zip_of(&[("Movie.no.srt", b"1")])).unwrap();
+        let out = dir.join("out");
+        let first = unpack_zip(&zip, &out).unwrap();
+        std::fs::write(&first[0], b"changed").unwrap();
+        assert_eq!(unpack_zip(&zip, &out).unwrap(), first);
+        assert_eq!(std::fs::read(&first[0]).unwrap(), b"changed");
+        let empty = dir.join("empty.zip");
+        std::fs::write(&empty, zip_of(&[("readme.nfo", b"x")])).unwrap();
+        let e = unpack_zip(&empty, &dir.join("out2")).unwrap_err();
+        assert!(e.contains("no SRT"), "{e}");
+        assert!(!dir.join("out2").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

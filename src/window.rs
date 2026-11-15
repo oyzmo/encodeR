@@ -20,7 +20,7 @@ use crate::ffmpeg::runner::{Cancel, Helpers};
 use crate::ffmpeg::vmaf::VmafResult;
 use crate::presets;
 use crate::queue::{self, CropState, EstimateState, Event, Job, JobState, VmafState};
-use crate::settings::{EncodeSettings, Prefs, VideoCodec};
+use crate::settings::{EncodeSettings, Prefs, VideoCodec, cache_dir};
 use crate::subs::{self, ExternalSub, JobMode, SubsTarget};
 use crate::tracks::{self, PgsQuestion};
 use crate::ui::editor::Editor;
@@ -43,6 +43,46 @@ pub enum Msg {
     Finished(u64, Outcome),
     /// Post-encode VMAF line for a finished job.
     PostVmaf(u64, String),
+    /// The one-click alass install finished: the program path, or why not.
+    AlassInstalled(Result<String, String>),
+    /// Dropped or picked files with their zips unpacked, the zips that failed,
+    /// and what to do with the files.
+    Unzipped(Vec<PathBuf>, Vec<String>, AfterUnzip),
+}
+
+/// What to do with files once their zips are unpacked.
+pub enum AfterUnzip {
+    /// Queue them (`add_files_as`).
+    Add(JobMode),
+    /// Give the subtitles to this job.
+    Attach(u64),
+}
+
+/// Replace each zip in `paths` with its SRT files (see `subs::unpack_zip`).
+/// Each zip gets its own cache folder named after its path, size and date, so
+/// the same zip added twice gives the same files. Blocking.
+fn unzip_all(paths: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<String>) {
+    use std::hash::{Hash, Hasher};
+    let mut out = Vec::new();
+    let mut errors = Vec::new();
+    for p in paths {
+        if !subs::is_zip(&p) {
+            out.push(p);
+            continue;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        p.hash(&mut h);
+        if let Ok(m) = std::fs::metadata(&p) {
+            m.len().hash(&mut h);
+            m.modified().ok().hash(&mut h);
+        }
+        let dir = cache_dir().join(format!("unzip-{}-{:016x}", std::process::id(), h.finish()));
+        match subs::unpack_zip(&p, &dir) {
+            Ok(srts) => out.extend(srts),
+            Err(e) => errors.push(e),
+        }
+    }
+    (out, errors)
 }
 
 /// Report line shown while the post-encode VMAF runs; replaced by the result.
@@ -159,8 +199,9 @@ impl State {
             return Vec::new();
         };
         let alass = self.caps.as_ref().is_none_or(|c| c.alass.is_some());
-        let sub_issues =
+        let mut sub_issues =
             checks::external_issues(&job.input, &job.settings, job.mode, &job.externals, alass);
+        checks::offer_alass_install(&mut sub_issues, crate::alass::installable());
         if job.mode.subtitles_only() {
             return sub_issues;
         }
@@ -289,6 +330,8 @@ pub struct App {
     tx: async_channel::Sender<Msg>,
     /// A debounced preferences save is scheduled.
     save_pending: std::cell::Cell<bool>,
+    /// The alass download is running (its button is greyed out meanwhile).
+    pub alass_installing: std::cell::Cell<bool>,
 }
 
 thread_local! {
@@ -473,6 +516,7 @@ pub fn build(app: &adw::Application, files: Vec<PathBuf>) {
         helpers: Helpers::default(),
         tx,
         save_pending: std::cell::Cell::new(false),
+        alass_installing: std::cell::Cell::new(false),
     });
 
     install_actions(&app_rc);
@@ -671,12 +715,16 @@ impl App {
     /// Queue videos as jobs of `mode`. Subtitle files among `paths` are given
     /// to the video they belong to (`Movie.no.srt` → `Movie.mkv`).
     pub fn add_files_as(self: &Rc<Self>, paths: Vec<PathBuf>, mode: JobMode) {
+        self.expand_zips(paths, AfterUnzip::Add(mode));
+    }
+
+    /// `add_files_as` once any zips are unpacked.
+    fn add_unpacked(self: &Rc<Self>, paths: Vec<PathBuf>, mode: JobMode) {
         if paths.is_empty() {
             return;
         }
-        let (srts, paths): (Vec<PathBuf>, Vec<PathBuf>) = paths
-            .into_iter()
-            .partition(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("srt")));
+        let (srts, paths): (Vec<PathBuf>, Vec<PathBuf>) =
+            paths.into_iter().partition(|p| subs::is_srt(p));
         let mut new_ids = Vec::new();
         {
             let mut st = self.state.borrow_mut();
@@ -719,6 +767,35 @@ impl App {
             self.select_row(*first);
         }
         self.update_start();
+    }
+
+    /// Replace each `.zip` among `paths` with the SRT files it holds, then
+    /// carry on with `then`. Zips are unpacked on a worker thread (a zip on a
+    /// sleeping NAS mustn't freeze the window); without any, `then` runs now.
+    fn expand_zips(self: &Rc<Self>, paths: Vec<PathBuf>, then: AfterUnzip) {
+        if !paths.iter().any(|p| subs::is_zip(p)) {
+            self.after_unzip(paths, Vec::new(), then);
+            return;
+        }
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let (paths, errors) = unzip_all(paths);
+            let _ = tx.send_blocking(Msg::Unzipped(paths, errors, then));
+        });
+    }
+
+    fn after_unzip(self: &Rc<Self>, paths: Vec<PathBuf>, errors: Vec<String>, then: AfterUnzip) {
+        if !errors.is_empty() {
+            self.toast(&format!("{}.", errors.join("; ")));
+        }
+        match then {
+            AfterUnzip::Add(mode) => self.add_unpacked(paths, mode),
+            AfterUnzip::Attach(id) => {
+                if !paths.is_empty() {
+                    self.attach_subtitles(paths, &[], Some(id));
+                }
+            }
+        }
     }
 
     /// Give each subtitle file to the queued video it belongs to; files that
@@ -804,11 +881,12 @@ impl App {
         self.run_next();
     }
 
-    /// File dialog for SRT files to add to job `id`.
+    /// File dialog for SRT files (or zips of them) to add to job `id`.
     pub fn pick_subtitles(self: &Rc<Self>, id: u64) {
         let filter = gtk::FileFilter::new();
-        filter.set_name(Some("SubRip subtitles"));
+        filter.set_name(Some("SubRip subtitles (.srt, .zip)"));
         filter.add_suffix("srt");
+        filter.add_suffix("zip");
         filter.add_mime_type("application/x-subrip");
         let filters = gio::ListStore::new::<gtk::FileFilter>();
         filters.append(&filter);
@@ -831,9 +909,7 @@ impl App {
                 let paths: Vec<PathBuf> = (0..model.n_items())
                     .filter_map(|i| model.item(i).and_downcast::<gio::File>()?.path())
                     .collect();
-                if !paths.is_empty() {
-                    a.attach_subtitles(paths, &[], Some(id));
-                }
+                a.expand_zips(paths, AfterUnzip::Attach(id));
             }
         });
     }
@@ -843,7 +919,7 @@ impl App {
         let filter = gtk::FileFilter::new();
         filter.set_name(Some("Videos and subtitles"));
         filter.add_mime_type("video/*");
-        for ext in ["mkv", "mp4", "m4v", "mov", "srt"] {
+        for ext in ["mkv", "mp4", "m4v", "mov", "srt", "zip"] {
             filter.add_suffix(ext);
         }
         let filters = gio::ListStore::new::<gtk::FileFilter>();
@@ -1082,6 +1158,8 @@ impl App {
     fn handle(self: &Rc<Self>, msg: Msg) {
         match msg {
             Msg::Caps(c) => self.on_caps(c),
+            Msg::AlassInstalled(r) => self.on_alass_installed(r),
+            Msg::Unzipped(paths, errors, then) => self.after_unzip(paths, errors, then),
             Msg::Probed(id, r, sidecars) => self.on_probed(id, r, sidecars),
             Msg::Analyzed(id, r) => {
                 let mut st = self.state.borrow_mut();
@@ -2216,6 +2294,10 @@ impl App {
     }
 
     pub fn apply_fix(self: &Rc<Self>, id: u64, fix: checks::Fix) {
+        if fix == checks::Fix::InstallAlass {
+            self.install_alass();
+            return;
+        }
         self.edit(id, |j| {
             if fix == checks::Fix::NoCrop {
                 j.crop_enabled = false;
@@ -2224,6 +2306,41 @@ impl App {
             }
         });
         self.rebuild_editor();
+    }
+
+    /// Download alass in the background; the checks update when it's done.
+    fn install_alass(self: &Rc<Self>) {
+        if self.alass_installing.replace(true) {
+            return;
+        }
+        self.rebuild_editor();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(Msg::AlassInstalled(crate::alass::install()));
+        });
+    }
+
+    fn on_alass_installed(self: &Rc<Self>, r: Result<String, String>) {
+        self.alass_installing.set(false);
+        match r {
+            Ok(path) => {
+                if let Some(c) = self.state.borrow_mut().caps.as_mut() {
+                    c.alass = Some(path);
+                }
+                self.toast("alass installed; subtitles will be synced automatically.");
+                let ids: Vec<u64> = self.state.borrow().jobs.iter().map(|j| j.id).collect();
+                for id in ids {
+                    self.update_row(id);
+                }
+                self.rebuild_editor();
+            }
+            Err(e) => {
+                self.toast(&format!(
+                    "Couldn't install alass. {e}. The ? next to the check shows how to install it by hand."
+                ));
+                self.rebuild_editor();
+            }
+        }
     }
 
     pub fn crop_preview(self: &Rc<Self>, id: u64) {

@@ -284,7 +284,7 @@ fn encode_samples_into(
 }
 
 /// Delete leftovers of dead processes in the cache folder: sample encodes,
-/// crop previews, capability probes and Dolby Vision intermediates (named
+/// crop previews, capability probes, unpacked subtitle zips and Dolby Vision intermediates (named
 /// `<kind>-<pid>-…`) that a crash or kill left behind.
 pub fn sweep_cache() {
     let Ok(entries) = std::fs::read_dir(cache_dir()) else {
@@ -308,7 +308,7 @@ pub fn sweep_cache() {
 }
 
 fn stale_pid(name: &str) -> Option<u32> {
-    let rest = ["sample-", "preview-", "dv-", "capcrop-"]
+    let rest = ["sample-", "preview-", "dv-", "capcrop-", "unzip-"]
         .iter()
         .find_map(|p| name.strip_prefix(p))?;
     rest.split(['-', '.']).next()?.parse().ok()
@@ -324,6 +324,7 @@ mod tests {
         assert_eq!(stale_pid("preview-77-3-1.png"), Some(77));
         assert_eq!(stale_pid("dv-9-7200"), Some(9));
         assert_eq!(stale_pid("capcrop-5.mkv"), Some(5));
+        assert_eq!(stale_pid("unzip-42-0"), Some(42));
         assert_eq!(stale_pid("config.json"), None);
     }
 

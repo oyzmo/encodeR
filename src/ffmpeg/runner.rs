@@ -398,10 +398,16 @@ pub fn error_summary(stderr: &str) -> String {
 /// Is `program` runnable (found on PATH or as a path)?
 pub fn which(program: &str) -> bool {
     if program.contains('/') {
-        return std::path::Path::new(program).is_file();
+        return is_executable(std::path::Path::new(program));
     }
     std::env::var_os("PATH")
-        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(program).is_file()))
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| is_executable(&d.join(program))))
+}
+
+/// A file someone may run (a download without `chmod +x` isn't).
+pub fn is_executable(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(test)]
