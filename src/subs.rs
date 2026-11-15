@@ -1321,6 +1321,7 @@ mod tests {
             index: 2,
             selected: true,
             action: crate::tracks::AudioAction::Copy,
+            offset_ms: 0,
         });
         assert_eq!(sync_reference(&p, &sel), Some(SyncRef::Audio(2)));
         p.subtitles.push(sub(5, "ass", "jpn", false));

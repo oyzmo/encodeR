@@ -296,6 +296,17 @@ fn prepare_externals(
     };
     // Extracted once per job, on first use.
     let mut reference: Option<Result<(PathBuf, String), String>> = None;
+    // Subtitles synced to an audio track follow that track's lip-sync offset
+    // (the subtitles-only modes don't touch the audio).
+    let ref_shift = match (req.mode, subs::sync_reference(&req.probe, &req.selection)) {
+        (JobMode::Subtitles(_), _) => 0,
+        (_, Some(subs::SyncRef::Audio(i))) => req
+            .selection
+            .selected_audio()
+            .find(|c| c.index == i)
+            .map_or(0, |c| c.offset_ms),
+        _ => 0,
+    };
     for (k, e) in req.externals.iter().filter(|e| e.selected).enumerate() {
         let name = e.file_name();
         let bytes = std::fs::read(&e.path)
@@ -348,6 +359,13 @@ fn prepare_externals(
                                         subs::describe_sync(&cues, &after)
                                     ));
                                     cues = after;
+                                    if ref_shift != 0 {
+                                        cues = subs::shift(&cues, ref_shift);
+                                        notes.push(format!(
+                                            "moved {:+.2} s with the audio",
+                                            ref_shift as f64 / 1000.0
+                                        ));
+                                    }
                                 }
                                 Err(why) => {
                                     notes.push(format!("sync failed, used as it is ({why})"))

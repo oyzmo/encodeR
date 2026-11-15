@@ -1,6 +1,6 @@
 [package]
 name = "encoder"
-version = "0.6.2"
+version = "0.7.1"
 edition = "2024"
 description = "Shrink large videos with VA-API hardware encoding"
 license = "GPL-3.0-or-later"

@@ -2373,7 +2373,13 @@ impl App {
             let mut ids = Vec::new();
             for j in st.jobs.iter_mut().filter(|j| j.state == JobState::Pending) {
                 if let Some(p) = &j.probe {
-                    let (sel, groups, qs) = tracks::auto_select(p, &prefs, &j.settings);
+                    let (mut sel, groups, qs) = tracks::auto_select(p, &prefs, &j.settings);
+                    // Lip-sync offsets are measured by hand; keep them.
+                    for c in &mut sel.audio {
+                        if let Some(old) = j.selection.audio.iter().find(|o| o.index == c.index) {
+                            c.offset_ms = old.offset_ms;
+                        }
+                    }
                     j.selection = sel;
                     j.groups = groups;
                     j.pgs_pending = qs.clone();

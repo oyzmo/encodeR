@@ -10,7 +10,7 @@ use crate::scan::Scan;
 use crate::settings::{Container, EncodeSettings, RateControl, VideoCodec, av1_qindex};
 use crate::subs::ExternalSub;
 use crate::tracks::{
-    AudioAction, Selection, SubKind, is_audio_description, is_commentary, sub_kind,
+    AudioAction, AudioChoice, Selection, SubKind, is_audio_description, is_commentary, sub_kind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,6 +249,17 @@ fn disposition_flags(flags: &[&str]) -> String {
 }
 
 /// Build the ffmpeg argument list (without the program name).
+/// Distinct non-zero audio offsets, in track order: one extra input each.
+fn audio_offsets(audio: &[&AudioChoice]) -> Vec<i64> {
+    let mut out: Vec<i64> = Vec::new();
+    for c in audio {
+        if c.offset_ms != 0 && !out.contains(&c.offset_ms) {
+            out.push(c.offset_ms);
+        }
+    }
+    out
+}
+
 pub fn build(job: &EncodeJob) -> Result<Vec<OsString>, String> {
     let p = job.probe;
     let s = job.settings;
@@ -279,6 +290,22 @@ pub fn build(job: &EncodeJob) -> Result<Vec<OsString>, String> {
         a.add(&["-f", "srt"]);
         a.kv("-i", &e.path);
     }
+    let audio: Vec<_> = if job.video_only {
+        Vec::new()
+    } else {
+        job.selection.selected_audio().collect()
+    };
+    // Lip-sync: the source again, shifted, once per distinct audio offset.
+    // The shifted tracks are mapped from that input, so copied audio stays a copy.
+    let offsets = audio_offsets(&audio);
+    for ms in &offsets {
+        if let Some((start, len)) = job.segment {
+            a.kv("-ss", format!("{start:.3}"));
+            a.kv("-t", format!("{len:.3}"));
+        }
+        a.kv("-itsoffset", format!("{:.3}", *ms as f64 / 1000.0));
+        a.kv("-i", &p.path);
+    }
 
     if encode && let Some(vf) = video_filter(job) {
         a.kv("-vf", vf);
@@ -286,18 +313,17 @@ pub fn build(job: &EncodeJob) -> Result<Vec<OsString>, String> {
 
     a.kv("-map", format!("0:{}", v.index));
     let mp4 = s.container == Container::Mp4 && !job.raw_hevc;
-    let audio: Vec<_> = if job.video_only {
-        Vec::new()
-    } else {
-        job.selection.selected_audio().collect()
-    };
     let subs: Vec<_> = if job.video_only || mp4 {
         Vec::new()
     } else {
         job.selection.selected_subs().collect()
     };
     for c in &audio {
-        a.kv("-map", format!("0:{}", c.index));
+        let input = offsets
+            .iter()
+            .position(|ms| *ms == c.offset_ms)
+            .map_or(0, |j| 1 + externals.len() + j);
+        a.kv("-map", format!("{input}:{}", c.index));
     }
     for c in &subs {
         a.kv("-map", format!("0:{}", c.index));
@@ -382,6 +408,15 @@ pub fn build(job: &EncodeJob) -> Result<Vec<OsString>, String> {
                 }
             }
             AudioAction::Flac => a.kv(spec("c"), "flac"),
+        }
+        // A negative offset puts the track's first packets before 0. Drop them;
+        // left in, MKV would move every stream later (chapters and the
+        // post-encode VMAF timestamps would no longer line up).
+        if c.offset_ms < 0 {
+            match c.action {
+                AudioAction::Copy => a.kv(spec("copypriorss"), "0"),
+                _ => a.kv(spec("filter"), "atrim=start=0"),
+            }
         }
         // Keep the source's flags, except `default`, which goes to the chosen
         // main track only.
@@ -1469,5 +1504,97 @@ mod tests {
         assert!(has(&a, &["-f", "mp4"]));
         assert!(build_embed(&p, &externals, Container::Mkv, &p.path).is_err());
         assert!(build_embed(&p, &[], Container::Mkv, out).is_err());
+    }
+
+    #[test]
+    fn audio_offsets_add_shifted_inputs_and_keep_copies() {
+        let p = sample_4k();
+        let src = p.path.to_string_lossy().into_owned();
+        let s = EncodeSettings::default();
+        let (mut sel, _, _) = auto_select(&p, &langs(), &s);
+        // Selected: Norwegian DTS (0:4, converted) then English E-AC-3 (0:2, copied).
+        for c in &mut sel.audio {
+            c.offset_ms = match c.index {
+                4 => 250,
+                2 => -120,
+                _ => 0,
+            };
+        }
+        let externals = [ext("/s/F.no.srt", Some("nob"), crate::subs::ExtKind::Full)];
+        let out = Path::new("/out/x.mkv");
+        let mut job = EncodeJob::new(&p, &s, &sel, out, "/d");
+        job.video_kbps = Some(4000);
+        job.externals = &externals;
+        let a = strings(build(&job).unwrap());
+        // Source, external SRT, then one shifted copy of the source per offset.
+        assert!(has(&a, &["-f", "srt", "-i", "/s/F.no.srt"]));
+        assert!(has(&a, &["-itsoffset", "0.250", "-i", &src]));
+        assert!(has(&a, &["-itsoffset", "-0.120", "-i", &src]));
+        assert_eq!(a.iter().filter(|x| *x == "-i").count(), 4);
+        assert!(has(&a, &["-map", "0:0", "-map", "2:4", "-map", "3:2"]));
+        assert!(has(&a, &["-map", "1:0"]));
+        // Copied audio stays a copy; metadata and chapters still come from input 0.
+        assert!(has(&a, &["-c:a:1", "copy"]));
+        assert!(has(&a, &["-map_metadata", "0", "-map_chapters", "0"]));
+        // Only the early (negative) track drops what lands before 0.
+        assert!(has(&a, &["-copypriorss:a:1", "0"]));
+        assert!(!a.iter().any(|x| x.starts_with("-filter:a:0")));
+        // A converted track with a negative offset is trimmed instead.
+        let mut conv = sel.clone();
+        for c in &mut conv.audio {
+            if c.index == 4 {
+                c.offset_ms = -80;
+            }
+        }
+        let cj = EncodeJob {
+            selection: &conv,
+            ..job.clone()
+        };
+        let a = strings(build(&cj).unwrap());
+        assert!(has(&a, &["-c:a:0", "eac3"]));
+        assert!(has(&a, &["-filter:a:0", "atrim=start=0"]));
+
+        // Two tracks with the same offset share one input; zero adds none.
+        let mut same = sel.clone();
+        for c in &mut same.audio {
+            c.offset_ms = if c.selected { 300 } else { 0 };
+        }
+        let job = EncodeJob {
+            selection: &same,
+            ..job
+        };
+        let a = strings(build(&job).unwrap());
+        assert_eq!(a.iter().filter(|x| *x == "-itsoffset").count(), 1);
+        assert!(has(&a, &["-map", "2:4", "-map", "2:2"]));
+
+        // Dolby Vision mux: the raw stream comes after the shifted input.
+        let m = strings(build_dv_mux(&job, Path::new("/tmp/v_dv.hevc")).unwrap());
+        assert!(has(&m, &["-map", "3:v:0", "-map", "2:4"]));
+        assert!(has(&m, &["-itsoffset", "0.300", "-i", &src, "-fflags"]));
+
+        // Video-only sample encodes ignore offsets.
+        let mut v = job.clone();
+        v.video_only = true;
+        assert!(!strings(build(&v).unwrap()).contains(&"-itsoffset".to_string()));
+    }
+
+    #[test]
+    fn audio_offset_inputs_follow_the_segment() {
+        let p = sample_4k();
+        let s = EncodeSettings::default();
+        let (mut sel, _, _) = auto_select(&p, &langs(), &s);
+        for c in &mut sel.audio {
+            c.offset_ms = 500;
+        }
+        let out = Path::new("/out/x.mkv");
+        let mut job = EncodeJob::new(&p, &s, &sel, out, "/d");
+        job.video_kbps = Some(4000);
+        job.segment = Some((60.0, 8.0));
+        let a = strings(build(&job).unwrap());
+        assert_eq!(a.iter().filter(|x| *x == "-ss").count(), 2);
+        assert!(has(
+            &a,
+            &["-ss", "60.000", "-t", "8.000", "-itsoffset", "0.500"]
+        ));
     }
 }

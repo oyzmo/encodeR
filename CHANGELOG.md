@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.1
+
+- A negative audio delay in MKV no longer starts the video late. Before, chapters landed too early and the after-encode VMAF check compared the wrong frames. The audio that would land before the start is dropped instead.
+- Changing the preferred languages keeps the audio delays you set on queued jobs.
+
+## 0.7.0
+
+- Lip-sync fix: each audio track has a clock button in the track picker that sets an audio delay in seconds, for sources that are out of sync. Positive = the sound comes later. It uses the same sign as mpv and VLC, so you can find the value while watching and type it in.
+- Copied tracks stay copies (E-AC-3 Atmos keeps Atmos). The shift is a timestamp offset, not a re-encode. Tracks with different delays each get their own.
+- External subtitles synced against the speech in a delayed track move with it.
+
 ## 0.6.2
 
 - Subtitle zips are unpacked in the background, so a zip on a sleeping NAS no longer freezes the window. Oversized archives are refused (at most 200 SRT files, 64 MB in total).

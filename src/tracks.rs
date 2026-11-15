@@ -665,6 +665,10 @@ pub struct AudioChoice {
     pub index: usize,
     pub selected: bool,
     pub action: AudioAction,
+    /// Lip-sync fix: positive delays the track (it plays too early), negative
+    /// makes it earlier. Same sign as mpv's audio delay.
+    #[serde(default)]
+    pub offset_ms: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -828,6 +832,7 @@ pub fn auto_select(
                 index: r.index,
                 selected: preferred && rank == 0 && main,
                 action: default_action(a, s),
+                offset_ms: 0,
             });
         }
         let mut chosen: Vec<usize> = Vec::new();

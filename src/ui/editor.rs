@@ -875,6 +875,7 @@ impl Editor {
                     });
                 }
                 row.add_suffix(&dd);
+                row.add_suffix(&offset_button(app, id, index, choice.offset_ms));
                 if !tracks::apple_compatible(&a.codec) {
                     let warn = gtk::Image::from_icon_name("dialog-warning-symbolic");
                     warn.set_tooltip_text(Some(&format!(
@@ -1407,6 +1408,13 @@ impl Editor {
                     if tracks::is_audio_description(a) {
                         parts.push("audio description".into());
                     }
+                    if c.offset_ms != 0 {
+                        parts.push(format!(
+                            "sound {:+.2} s ({})",
+                            c.offset_ms as f64 / 1000.0,
+                            if c.offset_ms > 0 { "later" } else { "earlier" }
+                        ));
+                    }
                     note = tracks::conversion_note(a, c.action);
                 }
                 TrackKind::Sub => {
@@ -1508,6 +1516,75 @@ impl Editor {
 }
 
 /// A "?" button whose popover holds longer, copyable help text.
+/// Lip-sync offset for audio track `index` of job `id`, in a popover so the
+/// row stays compact. The button is highlighted while an offset is set.
+fn offset_button(app: &Rc<App>, id: u64, index: usize, offset_ms: i64) -> gtk::MenuButton {
+    let button = gtk::MenuButton::builder()
+        .icon_name("preferences-system-time-symbolic")
+        .valign(gtk::Align::Center)
+        .tooltip_text(help::AUDIO_OFFSET)
+        .build();
+    button.add_css_class("flat");
+    let set_look = |b: &gtk::MenuButton, ms: i64| {
+        if ms == 0 {
+            b.remove_css_class("accent");
+        } else {
+            b.add_css_class("accent");
+        }
+    };
+    set_look(&button, offset_ms);
+
+    let spin = gtk::SpinButton::with_range(-30.0, 30.0, 0.05);
+    spin.set_digits(2);
+    spin.set_value(offset_ms as f64 / 1000.0);
+    spin.set_width_chars(6);
+    let reset = gtk::Button::with_label("Reset");
+    reset.set_sensitive(offset_ms != 0);
+    {
+        let s = spin.clone();
+        reset.connect_clicked(move |_| s.set_value(0.0));
+    }
+    {
+        let ap = app.clone();
+        let b = button.clone();
+        let r = reset.clone();
+        spin.connect_value_changed(move |s| {
+            let ms = (s.value() * 1000.0).round() as i64;
+            set_look(&b, ms);
+            r.set_sensitive(ms != 0);
+            ap.edit(id, |j| {
+                if let Some(ch) = j.selection.audio.iter_mut().find(|ch| ch.index == index) {
+                    ch.offset_ms = ms;
+                }
+            });
+        });
+    }
+    let title = gtk::Label::new(Some("Audio delay (seconds)"));
+    title.add_css_class("heading");
+    title.set_halign(gtk::Align::Start);
+    let hint = gtk::Label::new(Some(
+        "Positive if voices come before the lips move,\nnegative if they come after. Same sign as mpv.",
+    ));
+    hint.add_css_class("dim-label");
+    hint.add_css_class("caption");
+    hint.set_halign(gtk::Align::Start);
+    let line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    line.append(&spin);
+    line.append(&reset);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    content.set_margin_top(6);
+    content.set_margin_bottom(6);
+    content.set_margin_start(6);
+    content.set_margin_end(6);
+    content.append(&title);
+    content.append(&line);
+    content.append(&hint);
+    let pop = gtk::Popover::new();
+    pop.set_child(Some(&content));
+    button.set_popover(Some(&pop));
+    button
+}
+
 fn help_button(text: &str) -> gtk::MenuButton {
     let label = gtk::Label::builder()
         .label(text)
