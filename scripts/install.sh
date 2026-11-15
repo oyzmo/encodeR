@@ -169,6 +169,18 @@ release_github() {
     scripts/deploy-github.sh --confirm --release
 }
 
+# Docs-only changes (README etc.): back up to the NAS, then publish the new
+# snapshot to GitHub's main without a tag or release, so no version bump.
+update_github() {
+    if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+        echo "error: uncommitted changes; commit them first" >&2
+        exit 1
+    fi
+    echo "Backing up to the NAS…"
+    git push -q nas main
+    scripts/deploy-github.sh --confirm
+}
+
 full_release() {
     if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
         echo "error: uncommitted changes; commit them first" >&2
@@ -203,6 +215,7 @@ menu() {
             echo " 13) Full release: NAS → 9 in one go"
             echo "     or step by step:"
             echo "  9)   Release on GitHub (source only, no binaries)"
+            echo " 10) Update GitHub page only: NAS → GitHub, no release"
         fi
         echo "  q) Quit"
         # Ctrl+D on an empty line quits. After typed text it takes two presses to
@@ -214,6 +227,7 @@ menu() {
             3) run_step --make-flatpak ;;
             4) run_step --install-flatpak ;;
             9) if is_author; then run_step --release-github; else echo "Unknown choice."; fi ;;
+            10) if is_author; then run_step --update-github; else echo "Unknown choice."; fi ;;
             11) if is_author; then run_step --bump; else echo "Unknown choice."; fi ;;
             13) if is_author; then run_step --full-release; else echo "Unknown choice."; fi ;;
             q|Q) exit 0 ;;
@@ -230,6 +244,7 @@ case "${1:-}" in
     --bump) bump_version ;;
     --release-github) release_github ;;
     --full-release) full_release ;;
+    --update-github) update_github ;;
     "")
         if [ -t 0 ]; then menu
         else sed -n '2,6p' "$SELF" | sed 's/^# \{0,1\}//'; exit 1; fi

@@ -29,19 +29,98 @@ Drop files on the window, check the auto-picked audio and subtitle tracks, pick 
 
 ## What it does
 
-- **Tracks:** tracks are grouped by language and ranked: commentary and audio description go last, then default flag, channels, codec quality, bitrate and stream order. The top track of each preferred language is selected. SRT is preferred over PGS. If a language only has PGS subtitles, the app asks you (Keep/Drop, with "Remember for this session"). Subtitles are never burned in.
-- **External subtitles:** SRT files next to the video (`Movie.no.srt`, `Movie.en.forced.srt`, `Movie.en.sdh.srt`) are picked up automatically; more can be dropped on the window or added per job, also as the `.zip` files subtitle sites hand out. Language and kind come from the file name and can be changed. Old Windows-1252 files are converted to UTF-8. With [alass](https://github.com/kaegi/alass) (bundled in the Flatpak; elsewhere the *Install alass* button under Checks downloads the official build into `~/.local/share/encoder/bin`, or use `cargo install alass-cli`), each file is synced to the video first: against an embedded text subtitle when there is one, otherwise against the speech in the main audio track. That fixes constant offsets, 25 vs 23.976 fps timing and cuts. There's also a manual offset. An external SRT replaces an embedded PGS track of the same language and kind.
-- **Fix tracks only (no re-encode):** *Add Subtitles to Videos…* in the menu, or the *Job* row of any job. Adds synced subtitles and shifts out-of-sync audio, copying every stream as it is. The *Result* row picks where it goes: *Write a new file* (output folder, usual suffix), *Replace the original file* (a copy is written next to it and replaces it only after its tracks and duration check out), or *Subtitles next to the video* under Plex's naming (an existing sidecar that gets synced keeps its original as `.srt.orig`; the video isn't touched, so audio delays need one of the other two). Same from the terminal: `encoder --add-subs VIDEO [SRT|ZIP…] [--embed] [--no-sync]`.
-- **Lip-sync:** if the source itself is out of sync, each audio track can get a delay (clock button in the track picker). It uses the same sign as mpv and VLC: find the value while watching, then type it in. The track is read from a second, time-shifted copy of the input (`-itsoffset`), so copied tracks stay copies and Atmos is kept. A delay that stays the same through the film is covered; drift that grows over the film (a 25 vs 23.976 fps mismatch) isn't. To only fix the timing, use *Fix tracks only*: its *Audio Timing* group lists every track. A normal job that would re-encode the video just for a delay says so, with a one-click *Copy (remux only)*.
-- **Apple TV audio:** TrueHD, DTS and Opus tracks are converted (by default to E-AC-3 5.1 at 640 kb/s, or AAC 7.1 or FLAC 7.1). Compatible tracks are copied, so E-AC-3 Atmos stays Atmos. Each converted track shows exactly what is lost.
-- **Size:** target-size VBR aims 3% under the target. Constant quality (CQP/QVBR) gets a size estimate from three sample encodes at 20/50/80% into the file. When a job finishes, it reports the actual size against the target.
-- **Checks:** 8→10-bit, HDR→8-bit, HDR→H.264, same codec at a similar bitrate, output not smaller, low-bitrate source, older codec, bitrate too low (with a downscale or bigger-target suggestion), audio share above 25%, MP4 conflicts, Apple TV compatibility, software decode, Dolby Vision and HDR10+. Most checks come with a one-click fix.
-- **HDR10:** colour tags are passed through. After each encode the output is probed to check that mastering-display and MaxCLL metadata survived. If they didn't and the output is MKV, they are written into the MKV header with `mkvpropedit` when mkvtoolnix is installed.
-- **Dolby Vision (experimental):** with `dovi_tool` on `PATH` the pipeline is: extract the RPU (profile 7 → 8.1), encode to raw HEVC, check frame counts, inject the RPU, mux, and verify the DV profile. Without `dovi_tool`, DV is removed and the app warns you.
-- **Interlacing:** detected automatically from the picture with `idet`, which runs in the same pass as black-bar detection. File tags are often wrong, so they're only used as a fallback. Progressive video is left alone, even if it's tagged interlaced. Truly interlaced video is deinterlaced to 50p/60p (25p/30p optional) with `bwdif` on the CPU. The GPU's `deinterlace_vaapi` was tested on the RX 9070 and left most frames combed, so it isn't used. Telecined NTSC film is returned to its original 23.976 frames (`fieldmatch,yadif,decimate`, on the CPU). There's a per-job override, and the VMAF reference gets the same treatment so frames line up.
-- **Black bars:** `cropdetect` runs on 6 segments and keeps the least aggressive crop (union). Results are rounded to even sizes, and crops that save under 2% are ignored. Cropping is off by default, and there's a preview with the crop outlined.
-- **VMAF (opt-in):** sample encodes are scored against the source (4K model for 2160p). The app shows the mean and the worst segment. A post-encode check can be turned on.
-- **Startup check:** a test encode per codec, the 10-bit profiles, each rate-control mode, cropping on the GPU, plus libvmaf, dovi_tool, mkvpropedit and alass. Codecs that fail are disabled and say why.
+Click a point for the details.
+
+<details>
+<summary><b>Tracks:</b> Picks the main audio track and the full and forced subtitles in each of your preferred languages.</summary>
+
+Tracks are grouped by language and ranked: commentary and audio description go last, then default flag, channels, codec quality, bitrate and stream order. The top track of each preferred language is selected. SRT is preferred over PGS. If a language only has PGS subtitles, the app asks you (Keep/Drop, with "Remember for this session"). Subtitles are never burned in.
+
+</details>
+
+<details>
+<summary><b>External subtitles:</b> Finds SRT files (and subtitle zips) for the video and syncs them to it automatically.</summary>
+
+SRT files next to the video (`Movie.no.srt`, `Movie.en.forced.srt`, `Movie.en.sdh.srt`) are picked up automatically; more can be dropped on the window or added per job, also as the `.zip` files subtitle sites hand out. Language and kind come from the file name and can be changed. Old Windows-1252 files are converted to UTF-8. With [alass](https://github.com/kaegi/alass) (bundled in the Flatpak; elsewhere the *Install alass* button under Checks downloads the official build into `~/.local/share/encoder/bin`, or use `cargo install alass-cli`), each file is synced to the video first: against an embedded text subtitle when there is one, otherwise against the speech in the main audio track. That fixes constant offsets, 25 vs 23.976 fps timing and cuts. There's also a manual offset. An external SRT replaces an embedded PGS track of the same language and kind.
+
+</details>
+
+<details>
+<summary><b>Fix tracks only (no re-encode):</b> Adds synced subtitles and fixes audio timing without re-encoding anything.</summary>
+
+*Add Subtitles to Videos…* in the menu, or the *Job* row of any job. Adds synced subtitles and shifts out-of-sync audio, copying every stream as it is. The *Result* row picks where it goes: *Write a new file* (output folder, usual suffix), *Replace the original file* (a copy is written next to it and replaces it only after its tracks and duration check out), or *Subtitles next to the video* under Plex's naming (an existing sidecar that gets synced keeps its original as `.srt.orig`; the video isn't touched, so audio delays need one of the other two). Same from the terminal: `encoder --add-subs VIDEO [SRT|ZIP…] [--embed] [--no-sync]`.
+
+</details>
+
+<details>
+<summary><b>Lip-sync:</b> Delays individual audio tracks to fix out-of-sync sources, without re-encoding them.</summary>
+
+If the source itself is out of sync, each audio track can get a delay (clock button in the track picker). It uses the same sign as mpv and VLC: find the value while watching, then type it in. The track is read from a second, time-shifted copy of the input (`-itsoffset`), so copied tracks stay copies and Atmos is kept. A delay that stays the same through the film is covered; drift that grows over the film (a 25 vs 23.976 fps mismatch) isn't. To only fix the timing, use *Fix tracks only*: its *Audio Timing* group lists every track. A normal job that would re-encode the video just for a delay says so, with a one-click *Copy (remux only)*.
+
+</details>
+
+<details>
+<summary><b>Apple TV audio:</b> Converts audio the Apple TV can't play (TrueHD, DTS, Opus) and copies the rest untouched.</summary>
+
+TrueHD, DTS and Opus tracks are converted (by default to E-AC-3 5.1 at 640 kb/s, or AAC 7.1 or FLAC 7.1). Compatible tracks are copied, so E-AC-3 Atmos stays Atmos. Each converted track shows exactly what is lost.
+
+</details>
+
+<details>
+<summary><b>Size:</b> Hits a target size in GB, or estimates the size of a constant-quality encode from sample encodes.</summary>
+
+Target-size VBR aims 3% under the target. Constant quality (CQP/QVBR) gets a size estimate from three sample encodes at 20/50/80% into the file. When a job finishes, it reports the actual size against the target.
+
+</details>
+
+<details>
+<summary><b>Checks:</b> Warns about settings that don't suit the source, most with a one-click fix.</summary>
+
+8→10-bit, HDR→8-bit, HDR→H.264, same codec at a similar bitrate, output not smaller, low-bitrate source, older codec, bitrate too low (with a downscale or bigger-target suggestion), audio share above 25%, MP4 conflicts, Apple TV compatibility, software decode, Dolby Vision and HDR10+. Most checks come with a one-click fix.
+
+</details>
+
+<details>
+<summary><b>HDR10:</b> Keeps HDR10 and checks after each encode that the metadata survived.</summary>
+
+Colour tags are passed through. After each encode the output is probed to check that mastering-display and MaxCLL metadata survived. If they didn't and the output is MKV, they are written into the MKV header with `mkvpropedit` when mkvtoolnix is installed.
+
+</details>
+
+<details>
+<summary><b>Dolby Vision (experimental):</b> Keeps Dolby Vision when dovi_tool is installed, and warns that it's removed when it isn't.</summary>
+
+With `dovi_tool` on `PATH` the pipeline is: extract the RPU (profile 7 → 8.1), encode to raw HEVC, check frame counts, inject the RPU, mux, and verify the DV profile. Without `dovi_tool`, DV is removed and the app warns you.
+
+</details>
+
+<details>
+<summary><b>Interlacing:</b> Detects interlaced and telecined video from the picture itself and fixes it.</summary>
+
+Detected automatically from the picture with `idet`, which runs in the same pass as black-bar detection. File tags are often wrong, so they're only used as a fallback. Progressive video is left alone, even if it's tagged interlaced. Truly interlaced video is deinterlaced to 50p/60p (25p/30p optional) with `bwdif` on the CPU. The GPU's `deinterlace_vaapi` was tested on the RX 9070 and left most frames combed, so it isn't used. Telecined NTSC film is returned to its original 23.976 frames (`fieldmatch,yadif,decimate`, on the CPU). There's a per-job override, and the VMAF reference gets the same treatment so frames line up.
+
+</details>
+
+<details>
+<summary><b>Black bars:</b> Detects letterboxing and can crop it away.</summary>
+
+`cropdetect` runs on 6 segments and keeps the least aggressive crop (union). Results are rounded to even sizes, and crops that save under 2% are ignored. Cropping is off by default, and there's a preview with the crop outlined.
+
+</details>
+
+<details>
+<summary><b>VMAF (opt-in):</b> Scores the visual quality of sample encodes before you commit to a full encode.</summary>
+
+Sample encodes are scored against the source (4K model for 2160p). The app shows the mean and the worst segment. A post-encode check can be turned on.
+
+</details>
+
+<details>
+<summary><b>Startup check:</b> Tests what your GPU and ffmpeg can actually do and turns off whatever fails.</summary>
+
+A test encode per codec, the 10-bit profiles, each rate-control mode, cropping on the GPU, plus libvmaf, dovi_tool, mkvpropedit and alass. Codecs that fail are disabled and say why.
+
+</details>
 
 ## Install
 
@@ -106,20 +185,6 @@ scripts/hw-verify.sh [SDR_CLIP] [HDR10_CLIP]   # on the machine with the AMD GPU
 - HDR10 survived with both HEVC and AV1: PQ, BT.2020, mastering display and light levels.
 - Interlacing: 1080i25 TV, 576i25 anamorphic DVD and 480i29.97 telecine clips were each detected correctly. CPU deinterlacing gave clean 50p and kept SAR 64:45 / DAR 16:9. Inverse telecine gave 23.976 with no repeated fields. `deinterlace_vaapi` left frames combed in every mode: bob 999/1000, motion_adaptive and default about 89%, and motion_compensated isn't supported. So deinterlacing stays on the CPU.
 - Encoder frame-size limits: HEVC needs at least 384×128 and AV1 at least 320×128. The app reads these limits at startup and flags videos that are too small.
-
-## Design notes
-
-- ffmpeg and ffprobe always run as child processes with an explicit argv, never through a shell. "Extra arguments" are split with shell-quoting rules (`shlex`).
-- The command builder (`src/ffmpeg/command.rs`), checks, ranking, crop, estimate and HDR logic are pure functions with unit tests. The UI only wires them together.
-- Hardware decode is the first choice. If ffmpeg's errors show the decoder rejected the input, the job is retried once with software decode (`format=…,hwupload`), and the mode used is recorded on the job.
-- HDR10 static metadata (mastering display, MaxCLL/MaxFALL) carries over natively with both `hevc_vaapi` (`-sei hdr` is on by default) and `av1_vaapi`. This was verified on an RX 9070 with Mesa 26.2.5 and ffmpeg 8.1.3. The post-encode check and the `mkvpropedit` repair stay in place as a safety net for other drivers.
-- AV1 constant quality uses a 0–63 scale (default 28), mapped to VA-API qindex ×4.
-- Cropping uses `crop` on VA-API frames when the startup check shows it works. Otherwise it goes through `hwdownload,…,crop,…,hwupload`, which is slower, and the tooltip says so.
-- Cancelling sends `q` to ffmpeg, kills it after 4 s, and deletes the partial file.
-
-## Possible later steps (out of scope for v1)
-
-Publishing on Flathub (using its codecs extension instead of a bundled ffmpeg), hardware filters beyond scaling/cropping, two-pass or bitrate-targeted encoding, trimming/cutting, and PGS→SRT OCR.
 
 ## License
 
