@@ -598,11 +598,13 @@ pub fn build_dv_mux(job: &EncodeJob, raw_video: &Path) -> Result<Vec<OsString>, 
     Ok(args)
 }
 
-/// Subtitles-only embed: every stream of the source copied as it is, plus the
-/// external SRTs. Global metadata, chapters and attachments come along.
-pub fn build_embed(
+/// Fix-tracks remux: every stream of the source copied as it is, plus the
+/// external SRTs, with audio tracks shifted by `delays` (stream index, ms).
+/// Global metadata, chapters and attachments come along.
+pub fn build_fix(
     p: &ProbeInfo,
     externals: &[ExternalSub],
+    delays: &[(usize, i64)],
     container: Container,
     output: &Path,
 ) -> Result<Vec<OsString>, String> {
@@ -610,8 +612,13 @@ pub fn build_embed(
         return Err("The output file would overwrite the input".into());
     }
     let ext: Vec<&ExternalSub> = externals.iter().filter(|e| e.selected).collect();
-    if ext.is_empty() {
-        return Err("No subtitle files selected".into());
+    let delays: Vec<(usize, i64)> = delays
+        .iter()
+        .copied()
+        .filter(|(i, ms)| *ms != 0 && p.audio_by_index(*i).is_some())
+        .collect();
+    if ext.is_empty() && delays.is_empty() {
+        return Err("Nothing to fix: no subtitle files and no audio delay".into());
     }
     let mut a = Args(Vec::new());
     a.add(&["-hide_banner", "-y", "-i"]);
@@ -620,11 +627,45 @@ pub fn build_embed(
         a.add(&["-f", "srt", "-i"]);
         a.0.push(e.path.as_os_str().into());
     }
-    a.add(&["-map", "0"]);
+    // The source again, shifted, once per distinct offset (as in `build`).
+    let mut offsets: Vec<i64> = Vec::new();
+    for (_, ms) in &delays {
+        if !offsets.contains(ms) {
+            offsets.push(*ms);
+        }
+    }
+    for ms in &offsets {
+        a.kv("-itsoffset", format!("{:.3}", *ms as f64 / 1000.0));
+        a.kv("-i", &p.path);
+    }
+    let delay_of = |i: usize| delays.iter().find(|(k, _)| *k == i).map(|(_, ms)| *ms);
+    if delays.is_empty() {
+        a.add(&["-map", "0"]);
+    } else {
+        // Map by type so each audio track keeps its place, whichever input
+        // it comes from.
+        a.add(&["-map", "0:v?"]);
+        for t in &p.audio {
+            let input = delay_of(t.index)
+                .and_then(|ms| offsets.iter().position(|o| *o == ms))
+                .map_or(0, |j| 1 + ext.len() + j);
+            a.kv("-map", format!("{input}:{}", t.index));
+        }
+        a.add(&["-map", "0:s?"]);
+    }
     for k in 1..=ext.len() {
         a.kv("-map", format!("{k}:0"));
     }
+    if !delays.is_empty() {
+        a.add(&["-map", "0:t?", "-map", "0:d?"]);
+    }
     a.add(&["-c", "copy", "-map_metadata", "0", "-map_chapters", "0"]);
+    // Packets shifted before 0 are dropped, as in `build`.
+    for (i, t) in p.audio.iter().enumerate() {
+        if delay_of(t.index).is_some_and(|ms| ms < 0) {
+            a.kv(format!("-copypriorss:a:{i}"), "0");
+        }
+    }
     let mp4 = container == Container::Mp4;
     let first = p.subtitles.len();
     for (j, e) in ext.iter().enumerate() {
@@ -1472,7 +1513,7 @@ mod tests {
             ext("/s/F.en.sdh.srt", None, ExtKind::Sdh),
         ];
         let out = Path::new("/lib/F.part.mkv");
-        let a = strings(build_embed(&p, &externals, Container::Mkv, out).unwrap());
+        let a = strings(build_fix(&p, &externals, &[], Container::Mkv, out).unwrap());
         assert!(has(
             &a,
             &["-map", "0", "-map", "1:0", "-map", "2:0", "-c", "copy"]
@@ -1498,12 +1539,55 @@ mod tests {
         assert!(has(&a, &["-default_mode", "infer_no_subs"]));
         assert!(has(&a, &["-f", "matroska", "/lib/F.part.mkv"]));
         assert_eq!(a.last().unwrap(), "/lib/F.part.mkv");
-        let a = strings(build_embed(&p, &externals, Container::Mp4, out).unwrap());
+        let a = strings(build_fix(&p, &externals, &[], Container::Mp4, out).unwrap());
         assert!(has(&a, &[&format!("-c:s:{i}"), "mov_text"]));
         assert!(has(&a, &["-movflags", "+faststart"]));
         assert!(has(&a, &["-f", "mp4"]));
-        assert!(build_embed(&p, &externals, Container::Mkv, &p.path).is_err());
-        assert!(build_embed(&p, &[], Container::Mkv, out).is_err());
+        assert!(build_fix(&p, &externals, &[], Container::Mkv, &p.path).is_err());
+        assert!(build_fix(&p, &[], &[], Container::Mkv, out).is_err());
+    }
+
+    #[test]
+    fn fix_shifts_audio_in_place_without_reencoding() {
+        use crate::subs::ExtKind;
+        let p = sample_4k();
+        let src = p.path.to_string_lossy().into_owned();
+        let out = Path::new("/lib/F.part.mkv");
+        let (a2, a3) = (p.audio[1].index, p.audio[2].index);
+        // Audio only: no subtitle files needed.
+        let a = strings(build_fix(&p, &[], &[(a2, -100), (a3, 0)], Container::Mkv, out).unwrap());
+        assert!(has(&a, &["-itsoffset", "-0.100", "-i", &src]));
+        assert_eq!(a.iter().filter(|x| *x == "-itsoffset").count(), 1);
+        // Every audio track keeps its place; only the shifted one comes from input 1.
+        let maps: Vec<&String> = a
+            .iter()
+            .zip(a.iter().skip(1))
+            .filter(|(k, _)| *k == "-map")
+            .map(|(_, v)| v)
+            .collect();
+        let mut want = vec!["0:v?".to_string()];
+        for t in &p.audio {
+            want.push(if t.index == a2 {
+                format!("1:{}", t.index)
+            } else {
+                format!("0:{}", t.index)
+            });
+        }
+        want.extend(["0:s?", "0:t?", "0:d?"].map(String::from));
+        assert_eq!(maps, want.iter().collect::<Vec<_>>());
+        assert!(has(&a, &["-c", "copy"]));
+        assert!(has(&a, &["-copypriorss:a:1", "0"]));
+        assert!(!a.iter().any(|x| x.starts_with("-filter")));
+
+        // With subtitle files: they come before the shifted input.
+        let externals = vec![ext("/s/F.no.srt", Some("nor"), ExtKind::Full)];
+        let a = strings(build_fix(&p, &externals, &[(a2, 250)], Container::Mkv, out).unwrap());
+        assert!(has(&a, &["-itsoffset", "0.250", "-i", &src]));
+        assert!(has(&a, &["-map", &format!("2:{a2}")]));
+        assert!(has(&a, &["-map", "0:s?", "-map", "1:0"]));
+        assert!(!a.iter().any(|x| x.starts_with("-copypriorss")));
+        // A zero delay alone is nothing to do.
+        assert!(build_fix(&p, &[], &[(a2, 0)], Container::Mkv, out).is_err());
     }
 
     #[test]

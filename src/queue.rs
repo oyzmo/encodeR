@@ -241,14 +241,23 @@ impl Job {
             .sum()
     }
 
-    /// Existing files a subtitles-only job would replace right now: the video
+    /// Container of the file this job writes to the output folder.
+    pub fn output_container(&self) -> crate::settings::Container {
+        match self.mode {
+            JobMode::Fix(t) => crate::subs::fix_container(&self.input, t)
+                .unwrap_or(crate::settings::Container::Mkv),
+            JobMode::Encode => self.settings.container,
+        }
+    }
+
+    /// Existing files an in-place fix-tracks job would replace right now: the video
     /// for an embed, or sidecars already there that aren't their own source.
     pub fn subs_replacements(&self) -> Vec<PathBuf> {
         use crate::subs::{JobMode, SubsTarget};
         match self.mode {
-            JobMode::Encode => Vec::new(),
-            JobMode::Subtitles(SubsTarget::Embed) => vec![self.input.clone()],
-            JobMode::Subtitles(SubsTarget::Sidecar) => {
+            JobMode::Encode | JobMode::Fix(SubsTarget::NewFile) => Vec::new(),
+            JobMode::Fix(SubsTarget::Embed) => vec![self.input.clone()],
+            JobMode::Fix(SubsTarget::Sidecar) => {
                 let Ok(outs) = crate::subs::sidecar_outputs(&self.input, &self.externals) else {
                     return Vec::new();
                 };

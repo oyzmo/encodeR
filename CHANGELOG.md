@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.0
+
+- "Add subtitles only" is now **Fix tracks only**: it also shifts out-of-sync audio without re-encoding anything. Its *Audio Timing* group has a delay button for every audio track, and every stream is copied as it is (Atmos is kept).
+- New result choice, *Write a new file*: it remuxes into the output folder and leaves the original alone. *Replace the original file* and *Subtitles next to the video* work as before. An AVI or TS source written as a new file becomes an MKV.
+- A normal job that has an audio delay set but would re-encode the video now says so, with one-click *Copy (remux only)* and *Fix tracks only* buttons.
+
+## 0.7.2
+
+- The audio delay is set in milliseconds, 50 ms per arrow click.
+
 ## 0.7.1
 
 - A negative audio delay in MKV no longer starts the video late. Before, chapters landed too early and the after-encode VMAF check compared the wrong frames. The audio that would land before the start is dropped instead.

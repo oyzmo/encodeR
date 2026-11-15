@@ -150,8 +150,8 @@ impl State {
     /// Output path for a job: never its own input, another job's input, or the
     /// output of a job earlier in the queue.
     pub fn output_for(&self, job: &Job) -> std::path::PathBuf {
-        // Subtitles-only jobs write next to (or into) their own input.
-        if let JobMode::Subtitles(t) = job.mode {
+        // In-place fix-tracks jobs write next to (or into) their own input.
+        if let JobMode::Fix(t @ (SubsTarget::Sidecar | SubsTarget::Embed)) = job.mode {
             let first = (t == SubsTarget::Sidecar)
                 .then(|| subs::sidecar_outputs(&job.input, &job.externals).ok())
                 .flatten()
@@ -168,10 +168,10 @@ impl State {
                 .then(|| j.output.clone())
                 .flatten();
             taken.push(written.unwrap_or_else(|| {
-                queue::output_path_avoiding(&j.input, &self.prefs, j.settings.container, &taken)
+                queue::output_path_avoiding(&j.input, &self.prefs, j.output_container(), &taken)
             }));
         }
-        queue::output_path_avoiding(&job.input, &self.prefs, job.settings.container, &taken)
+        queue::output_path_avoiding(&job.input, &self.prefs, job.output_container(), &taken)
     }
 
     pub fn request(&self, job: &Job) -> Option<Request> {
@@ -199,10 +199,17 @@ impl State {
             return Vec::new();
         };
         let alass = self.caps.as_ref().is_none_or(|c| c.alass.is_some());
-        let mut sub_issues =
-            checks::external_issues(&job.input, &job.settings, job.mode, &job.externals, alass);
+        let delays = !subs::audio_delays(&job.selection).is_empty();
+        let mut sub_issues = checks::external_issues(
+            &job.input,
+            &job.settings,
+            job.mode,
+            &job.externals,
+            delays,
+            alass,
+        );
         checks::offer_alass_install(&mut sub_issues, crate::alass::installable());
-        if job.mode.subtitles_only() {
+        if job.mode.fix_only() {
             return sub_issues;
         }
         let estimate = match &job.estimate {
@@ -267,7 +274,7 @@ impl State {
             return String::new();
         };
         match job.mode {
-            JobMode::Subtitles(SubsTarget::Sidecar) => {
+            JobMode::Fix(SubsTarget::Sidecar) => {
                 return match subs::sidecar_outputs(&job.input, &job.externals) {
                     Ok(v) => v
                         .iter()
@@ -277,15 +284,26 @@ impl State {
                     Err(e) => format!("# {e}"),
                 };
             }
-            JobMode::Subtitles(SubsTarget::Embed) => {
+            JobMode::Fix(t) => {
                 let c =
-                    subs::embed_container(&job.input).unwrap_or(crate::settings::Container::Mkv);
-                let part = worker::partial_path(&job.input);
-                return match command::build_embed(&req.probe, &job.externals, c, &part) {
+                    subs::fix_container(&job.input, t).unwrap_or(crate::settings::Container::Mkv);
+                let dest = if t == SubsTarget::Embed {
+                    job.input.clone()
+                } else {
+                    req.output.clone()
+                };
+                let part = worker::partial_path(&dest);
+                let delays = subs::audio_delays(&job.selection);
+                return match command::build_fix(&req.probe, &job.externals, &delays, c, &part) {
                     Ok(a) => format!(
-                        "{}\n# then the checked file replaces {}",
+                        "{}\n# then the checked file {} {}",
                         command::display_command(&self.tools.ffmpeg, &a),
-                        job.input.display()
+                        if t == SubsTarget::Embed {
+                            "replaces"
+                        } else {
+                            "is renamed to"
+                        },
+                        dest.display()
                     ),
                     Err(e) => format!("# {e}"),
                 };
@@ -936,16 +954,26 @@ impl App {
                     .filter_map(|i| model.item(i).and_downcast::<gio::File>()?.path())
                     .collect();
                 let target = a.state.borrow().prefs.subs_target;
-                a.add_files_as(paths, JobMode::Subtitles(target));
+                a.add_files_as(paths, JobMode::Fix(target));
             }
         });
     }
 
     /// Switch a job between encoding and subtitles only.
     pub fn set_mode(self: &Rc<Self>, id: u64, mode: JobMode) {
+        // Coming from an encode with audio delays set: next to the video
+        // can't apply them, so start with a new file.
+        let mode = match (mode, self.state.borrow().job(id)) {
+            (JobMode::Fix(SubsTarget::Sidecar), Some(j))
+                if j.mode == JobMode::Encode && !subs::audio_delays(&j.selection).is_empty() =>
+            {
+                JobMode::Fix(SubsTarget::NewFile)
+            }
+            (m, _) => m,
+        };
         let needs_analysis = {
             let mut st = self.state.borrow_mut();
-            if let JobMode::Subtitles(t) = mode {
+            if let JobMode::Fix(t) = mode {
                 st.prefs.subs_target = t;
             }
             st.job(id).is_some_and(|j| {
@@ -1384,7 +1412,7 @@ impl App {
                     subs::prefer_externals(&mut sel, &p, &j.externals);
                     qs.retain(|q| !subs::covers_language(&j.externals, &q.family));
                     // Subtitles-only jobs keep every embedded track; nothing to ask.
-                    if j.mode.subtitles_only() {
+                    if j.mode.fix_only() {
                         qs.clear();
                     }
                     j.selection = sel;
@@ -1572,7 +1600,7 @@ impl App {
         let Some(job) = st.job(id).cloned() else {
             return;
         };
-        if job.mode.subtitles_only() {
+        if job.mode.fix_only() {
             return;
         }
         let Some(p) = job.probe.as_ref() else { return };
@@ -1764,7 +1792,7 @@ impl App {
                     if files.is_empty() {
                         return None;
                     }
-                    let line = if j.mode == JobMode::Subtitles(SubsTarget::Embed) {
+                    let line = if j.mode == JobMode::Fix(SubsTarget::Embed) {
                         format!("• {} (subtitles embedded in place)", j.input.display())
                     } else {
                         files
@@ -1928,14 +1956,14 @@ impl App {
         let (unapproved, embed) = {
             let st = self.state.borrow();
             let Some(j) = st.job(id) else { return };
-            let list = if j.mode.subtitles_only() {
+            let list = if j.mode.in_place() {
                 j.unapproved_replacements()
             } else if output.exists() && j.replace_ok.as_ref() != Some(&output) {
                 vec![output.clone()]
             } else {
                 Vec::new()
             };
-            (list, j.mode == JobMode::Subtitles(SubsTarget::Embed))
+            (list, j.mode == JobMode::Fix(SubsTarget::Embed))
         };
         if !unapproved.is_empty() {
             self.state.borrow_mut().replace_pending = Some(id);
@@ -2089,7 +2117,7 @@ impl App {
         let wanted = st.prefs.vmaf_after_encode && st.caps.as_ref().is_some_and(|c| c.libvmaf);
         let Some(job) = st
             .job(id)
-            .filter(|j| j.settings.codec != VideoCodec::Copy && !j.mode.subtitles_only())
+            .filter(|j| j.settings.codec != VideoCodec::Copy && !j.mode.fix_only())
             .cloned()
         else {
             return;
@@ -2296,6 +2324,10 @@ impl App {
     pub fn apply_fix(self: &Rc<Self>, id: u64, fix: checks::Fix) {
         if fix == checks::Fix::InstallAlass {
             self.install_alass();
+            return;
+        }
+        if fix == checks::Fix::TracksOnly {
+            self.set_mode(id, JobMode::Fix(SubsTarget::NewFile));
             return;
         }
         self.edit(id, |j| {

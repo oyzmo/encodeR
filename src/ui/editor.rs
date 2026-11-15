@@ -323,7 +323,8 @@ impl Editor {
         content.append(&settings_box);
         settings_box.append(&crate::ui::subs::mode_group(app, id, &job));
         let alass = caps.as_ref().is_none_or(|c| c.alass.is_some());
-        if job.mode.subtitles_only() {
+        if let crate::subs::JobMode::Fix(target) = job.mode {
+            settings_box.append(&audio_timing_group(app, id, &job, &probe, target));
             settings_box.append(&crate::ui::subs::externals_group(app, id, &job, alass));
             let (cmd_group, buffer) = command_group(app);
             content.append(&cmd_group);
@@ -1513,6 +1514,73 @@ impl Editor {
             buf.set_text(&st.command_text(job));
         }
     }
+}
+
+/// Fix-tracks mode: a delay button for every audio track in the file (all of
+/// them are kept). Off when the result is subtitles next to the video.
+fn audio_timing_group(
+    app: &Rc<App>,
+    id: u64,
+    job: &Job,
+    p: &crate::ffmpeg::probe::ProbeInfo,
+    target: crate::subs::SubsTarget,
+) -> adw::PreferencesGroup {
+    let g = adw::PreferencesGroup::new();
+    g.set_title("Audio Timing");
+    g.set_tooltip_text(Some(help::AUDIO_OFFSET));
+    let remux = target.remuxes();
+    g.set_description(Some(if remux {
+        "Shift a track that's out of sync; it stays a copy"
+    } else {
+        "Pick “Replace the original file” or “Write a new file” to shift audio"
+    }));
+    for a in &p.audio {
+        let offset = job
+            .selection
+            .audio
+            .iter()
+            .find(|c| c.index == a.index)
+            .map_or(0, |c| c.offset_ms);
+        let title = format!(
+            "{} · {} {}",
+            tracks::language_name(a.language.as_deref()),
+            tracks::codec_name(&a.codec, &a.profile),
+            tracks::channel_label(a.channels)
+        );
+        let mut sub = Vec::new();
+        if let Some(t) = a.title.as_deref().filter(|t| !t.is_empty()) {
+            sub.push(t.to_string());
+        }
+        if offset != 0 {
+            sub.push(format!(
+                "sound {:+.2} s ({})",
+                offset as f64 / 1000.0,
+                if offset > 0 { "later" } else { "earlier" }
+            ));
+        }
+        let row = adw::ActionRow::builder()
+            .title(glib::markup_escape_text(&title))
+            .subtitle(glib::markup_escape_text(&sub.join(" · ")))
+            .sensitive(remux)
+            .build();
+        let b = offset_button(app, id, a.index, offset);
+        // Rebuild when the popover closes so the subtitle shows the new delay.
+        {
+            let ap = app.clone();
+            b.popover()
+                .expect("offset button has a popover")
+                .connect_closed(move |_| {
+                    let ap = ap.clone();
+                    glib::idle_add_local_once(move || ap.rebuild_editor());
+                });
+        }
+        row.add_suffix(&b);
+        g.add(&row);
+    }
+    if p.audio.is_empty() {
+        g.add(&adw::ActionRow::builder().title("No audio tracks").build());
+    }
+    g
 }
 
 /// A "?" button whose popover holds longer, copyable help text.

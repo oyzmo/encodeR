@@ -183,8 +183,8 @@ pub fn encode(
     cancel: &Cancel,
     mut update: impl FnMut(Update),
 ) -> Outcome {
-    if let JobMode::Subtitles(target) = req.mode {
-        return subtitles_only(tools, req, target, cancel, &mut update);
+    if let JobMode::Fix(target) = req.mode {
+        return fix_tracks(tools, req, target, cancel, &mut update);
     }
     // Last line of defence: the queue picks outputs that aren't the input, but
     // a failed or cancelled job deletes its output, so check the real file.
@@ -296,10 +296,16 @@ fn prepare_externals(
     };
     // Extracted once per job, on first use.
     let mut reference: Option<Result<(PathBuf, String), String>> = None;
-    // Subtitles synced to an audio track follow that track's lip-sync offset
-    // (the subtitles-only modes don't touch the audio).
+    // Subtitles synced to an audio track follow that track's lip-sync offset.
+    // Fix-tracks jobs shift every track with a delay, except next to the
+    // video, where the audio isn't touched.
     let ref_shift = match (req.mode, subs::sync_reference(&req.probe, &req.selection)) {
-        (JobMode::Subtitles(_), _) => 0,
+        (JobMode::Fix(SubsTarget::Sidecar), _) => 0,
+        (JobMode::Fix(_), Some(subs::SyncRef::Audio(i))) => subs::audio_delays(&req.selection)
+            .into_iter()
+            .find(|(k, _)| *k == i)
+            .map_or(0, |(_, ms)| ms),
+        (JobMode::Fix(_), _) => 0,
         (_, Some(subs::SyncRef::Audio(i))) => req
             .selection
             .selected_audio()
@@ -436,9 +442,10 @@ fn extract_reference(
     Ok(Ok((file, r.describe(&req.probe))))
 }
 
-/// Subtitles-only job: sync the files, then save them next to the video or
-/// embed them into it. The video stream is never re-encoded.
-fn subtitles_only(
+/// Fix-tracks job: sync the subtitle files and save them next to the video,
+/// or remux them and any audio delays into the video or a new file. Nothing
+/// is re-encoded.
+fn fix_tracks(
     tools: &Tools,
     req: &Request,
     target: SubsTarget,
@@ -446,16 +453,10 @@ fn subtitles_only(
     update: &mut impl FnMut(Update),
 ) -> Outcome {
     let video = &req.probe.path;
+    let delays = subs::audio_delays(&req.selection);
     // Fail on a bad job before spending time on syncing.
-    let check = match target {
-        SubsTarget::Sidecar => subs::sidecar_outputs(video, &req.externals).map(|_| ()),
-        SubsTarget::Embed => subs::embed_container(video).map(|_| ()),
-    };
-    if let Err(e) = check {
+    if let Err(e) = subs::fix_problem(video, target, &req.externals, !delays.is_empty()) {
         return fail(e, Vec::new());
-    }
-    if !req.externals.iter().any(|e| e.selected) {
-        return fail("No subtitle files selected", Vec::new());
     }
     let prepared = match prepare_externals(tools, req, cancel, update) {
         Ok(p) => p,
@@ -463,7 +464,13 @@ fn subtitles_only(
     };
     let mut out = match target {
         SubsTarget::Sidecar => save_sidecars(video, &prepared),
-        SubsTarget::Embed => embed_in_place(tools, req, &prepared, cancel, update),
+        SubsTarget::Embed => remux_fix(tools, req, &prepared, &delays, video, cancel, update),
+        SubsTarget::NewFile => {
+            if crate::queue::same_file(&req.output, video) {
+                return fail("The output file would overwrite the input", Vec::new());
+            }
+            remux_fix(tools, req, &prepared, &delays, &req.output, cancel, update)
+        }
     };
     if out.success {
         out.report.extend(prepared.report.iter().cloned());
@@ -536,25 +543,41 @@ fn save_sidecars(video: &Path, prepared: &PreparedSubs) -> Outcome {
     }
 }
 
-/// Remux into `<video>.part.<ext>`, check the result, then replace the video.
-fn embed_in_place(
+/// Remux into `<dest>.part.<ext>`, check the result, then move it to `dest`
+/// (which is the video itself when replacing it).
+fn remux_fix(
     tools: &Tools,
     req: &Request,
     prepared: &PreparedSubs,
+    delays: &[(usize, i64)],
+    dest: &Path,
     cancel: &Cancel,
     update: &mut impl FnMut(Update),
 ) -> Outcome {
     let video = &req.probe.path;
-    let container = match subs::embed_container(video) {
+    let in_place = dest == video.as_path();
+    let target = if in_place {
+        SubsTarget::Embed
+    } else {
+        SubsTarget::NewFile
+    };
+    let container = match subs::fix_container(video, target) {
         Ok(c) => c,
         Err(e) => return fail(e, Vec::new()),
     };
-    let part = partial_path(video);
-    let args = match command::build_embed(&req.probe, &prepared.externals, container, &part) {
+    let part = partial_path(dest);
+    let args = match command::build_fix(&req.probe, &prepared.externals, delays, container, &part) {
         Ok(a) => a,
         Err(e) => return fail(e, Vec::new()),
     };
-    update(Update::Stage("Adding subtitles".into()));
+    update(Update::Stage(
+        if prepared.externals.is_empty() {
+            "Shifting audio"
+        } else {
+            "Adding subtitles"
+        }
+        .into(),
+    ));
     let r = runner::run_ffmpeg(&tools.ffmpeg, &args, cancel, |p| {
         update(Update::Progress(p))
     });
@@ -575,36 +598,71 @@ fn embed_in_place(
         );
     }
     update(Update::Stage("Checking the new file".into()));
+    let max_delay = delays.iter().map(|(_, ms)| *ms).max().unwrap_or(0).max(0);
     let verdict = probe::run(&tools.ffprobe, &part)
-        .and_then(|out| embed_verdict(&req.probe, &out, prepared.externals.len()));
+        .and_then(|out| embed_verdict(&req.probe, &out, prepared.externals.len(), max_delay));
     if let Err(e) = verdict {
         let _ = std::fs::remove_file(&part);
+        let left = if in_place {
+            "the original was left alone"
+        } else {
+            "nothing was written"
+        };
         return fail(
-            format!("The new file didn't check out, so the original was left alone: {e}"),
+            format!("The new file didn't check out, so {left}: {e}"),
             Vec::new(),
         );
     }
     if let Ok(m) = std::fs::metadata(video) {
         let _ = std::fs::set_permissions(&part, m.permissions());
     }
-    if let Err(e) = std::fs::rename(&part, video) {
+    if let Err(e) = std::fs::rename(&part, dest) {
         let _ = std::fs::remove_file(&part);
-        return fail(format!("Couldn't replace the original: {e}"), Vec::new());
+        let what = if in_place {
+            "replace the original"
+        } else {
+            "save the new file"
+        };
+        return fail(format!("Couldn't {what}: {e}"), Vec::new());
     }
+    let mut done = Vec::new();
     let n = prepared.externals.len();
+    if n > 0 {
+        done.push(format!(
+            "added {n} subtitle track{}",
+            if n == 1 { "" } else { "s" }
+        ));
+    }
+    for (i, ms) in delays {
+        if let Some(a) = req.probe.audio_by_index(*i) {
+            done.push(format!(
+                "shifted {} audio {:+} ms",
+                crate::tracks::language_name(a.language.as_deref()),
+                ms
+            ));
+        }
+    }
+    let mut line = done.join(", ");
+    if let Some(c) = line.get(..1) {
+        line = c.to_uppercase() + &line[1..];
+    }
+    let name = dest.file_name().unwrap_or_default().to_string_lossy();
     Outcome {
         success: true,
-        report: vec![format!(
-            "Embedded {n} subtitle track{} into {}",
-            if n == 1 { "" } else { "s" },
-            video.file_name().unwrap_or_default().to_string_lossy()
-        )],
+        report: vec![format!("{line} · {name} (nothing re-encoded)")],
         ..Default::default()
     }
 }
 
 /// Does the remuxed file have everything the original had, plus `added` subtitles?
-fn embed_verdict(src: &ProbeInfo, out: &ProbeInfo, added: usize) -> Result<(), String> {
+/// `max_delay_ms` is the largest positive audio delay, which can make the
+/// file that much longer.
+fn embed_verdict(
+    src: &ProbeInfo,
+    out: &ProbeInfo,
+    added: usize,
+    max_delay_ms: i64,
+) -> Result<(), String> {
     if src.video.is_some() && out.video.is_none() {
         return Err("the video stream is missing".into());
     }
@@ -622,7 +680,7 @@ fn embed_verdict(src: &ProbeInfo, out: &ProbeInfo, added: usize) -> Result<(), S
             src.subtitles.len() + added
         ));
     }
-    let tolerance = (src.duration * 0.005).max(1.0);
+    let tolerance = (src.duration * 0.005).max(1.0) + max_delay_ms as f64 / 1000.0;
     if src.duration > 0.0 && (out.duration - src.duration).abs() > tolerance {
         return Err(format!(
             "it is {:.1} s long instead of {:.1} s",
@@ -1053,17 +1111,30 @@ mod tests {
     fn embed_verdict_needs_every_stream_plus_the_new_subtitles() {
         let src = sample_4k();
         let mut out = src.clone();
-        assert!(embed_verdict(&src, &out, 1).is_err());
+        assert!(embed_verdict(&src, &out, 1, 0).is_err());
         out.subtitles.push(Default::default());
-        assert_eq!(embed_verdict(&src, &out, 1), Ok(()));
+        assert_eq!(embed_verdict(&src, &out, 1, 0), Ok(()));
         out.audio.pop();
-        assert!(embed_verdict(&src, &out, 1).unwrap_err().contains("audio"));
+        assert!(
+            embed_verdict(&src, &out, 1, 0)
+                .unwrap_err()
+                .contains("audio")
+        );
         let mut short = src.clone();
         short.subtitles.push(Default::default());
         short.duration = src.duration * 0.5;
-        assert!(embed_verdict(&src, &short, 1).unwrap_err().contains("long"));
+        assert!(
+            embed_verdict(&src, &short, 1, 0)
+                .unwrap_err()
+                .contains("long")
+        );
         short.duration = src.duration - 0.5;
-        assert_eq!(embed_verdict(&src, &short, 1), Ok(()));
+        assert_eq!(embed_verdict(&src, &short, 1, 0), Ok(()));
+        // A positive audio delay may make the file that much longer.
+        let mut long = short.clone();
+        long.duration = src.duration * 1.005 + 1.0 + 20.0;
+        assert!(embed_verdict(&src, &long, 1, 0).is_err());
+        assert_eq!(embed_verdict(&src, &long, 1, 21_500), Ok(()));
     }
 
     #[test]
@@ -1141,6 +1212,71 @@ mod media_tests {
 
     fn tools() -> Tools {
         Tools::default()
+    }
+
+    #[test]
+    #[ignore]
+    fn fix_tracks_shifts_audio_into_a_new_file_without_reencoding() {
+        let t = tools();
+        let p = probe::run(&t.ffprobe, &media("sample.mkv")).unwrap();
+        let settings = EncodeSettings::default();
+        let (mut sel, _, _) = auto_select(&p, &["eng".into()], &settings);
+        // A deselected track is shifted too: fix-tracks keeps every track.
+        for c in &mut sel.audio {
+            c.selected = false;
+            c.offset_ms = match c.index {
+                1 => 300,
+                4 => -100,
+                _ => 0,
+            };
+        }
+        let out = std::env::temp_dir().join("encoder-test-fix.mkv");
+        let _ = std::fs::remove_file(&out);
+        let req = Request {
+            probe: p.clone(),
+            settings,
+            selection: sel,
+            output: out.clone(),
+            device: "/dev/dri/renderD128".into(),
+            crop: None,
+            crop_on_gpu: false,
+            scan: Scan::Progressive,
+            video_kbps: None,
+            dv_preserve: false,
+            mkvpropedit: false,
+            externals: Vec::new(),
+            mode: JobMode::Fix(SubsTarget::NewFile),
+            alass: None,
+        };
+        let o = encode(&t, &req, &Cancel::default(), |_| {});
+        assert!(o.success, "{:?} {:?}", o.error, o.stderr_tail);
+        assert!(o.report[0].contains("nothing re-encoded"), "{:?}", o.report);
+        let r = probe::run(&t.ffprobe, &out).unwrap();
+        // Same streams, same codecs, same order: everything was copied.
+        let codecs =
+            |p: &ProbeInfo| -> Vec<String> { p.audio.iter().map(|a| a.codec.clone()).collect() };
+        assert_eq!(codecs(&r), codecs(&p));
+        assert_eq!(r.subtitles.len(), p.subtitles.len());
+        assert_eq!(
+            r.video.as_ref().map(|v| v.codec.clone()),
+            p.video.as_ref().map(|v| v.codec.clone())
+        );
+        // First audio packet times, per output stream.
+        let starts = std::process::Command::new(&t.ffprobe)
+            .args(["-v", "error", "-select_streams", "a", "-show_entries"])
+            .args(["stream=start_time", "-of", "csv=p=0"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let starts: Vec<f64> = String::from_utf8_lossy(&starts.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect();
+        let pos = p.audio.iter().position(|a| a.index == 1).unwrap();
+        let neg = p.audio.iter().position(|a| a.index == 4).unwrap();
+        assert!((starts[pos] - 0.3).abs() < 0.05, "{starts:?}");
+        assert!((0.0..0.05).contains(&starts[neg]), "{starts:?}");
+        let _ = std::fs::remove_file(&out);
     }
 
     #[test]

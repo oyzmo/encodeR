@@ -358,7 +358,7 @@ pub fn add_subs(args: &[String]) -> Result<(), String> {
         dv_preserve: false,
         mkvpropedit: false,
         externals,
-        mode: JobMode::Subtitles(target),
+        mode: JobMode::Fix(target),
         alass,
         settings,
         selection: sel,

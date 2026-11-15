@@ -34,6 +34,8 @@ pub enum Fix {
     NoCrop,
     /// Download alass (handled by the window).
     InstallAlass,
+    /// Switch the job to "Fix tracks only" (job state, handled by the window).
+    TracksOnly,
 }
 
 impl Fix {
@@ -54,6 +56,7 @@ impl Fix {
             Fix::ConvertMp4Audio => "Convert those tracks".into(),
             Fix::NoCrop => "Turn off crop".into(),
             Fix::InstallAlass => "Install alass".into(),
+            Fix::TracksOnly => "Fix tracks only".into(),
         }
     }
 }
@@ -176,6 +179,23 @@ pub fn hdr_to_h264(c: &CheckInput) -> Option<Issue> {
         Severity::Strong,
         "HDR source to H.264: HDR is lost and colours will look washed out. Use HEVC 10-bit or AV1 10-bit instead.",
         Some(Fix::HevcTenBit),
+    )
+}
+
+/// An audio delay alone never needs a re-encode; say so when the video is
+/// being re-encoded anyway.
+pub fn delay_with_reencode(c: &CheckInput) -> Option<Issue> {
+    (c.settings.codec != VideoCodec::Copy).then_some(())?;
+    c.selection
+        .selected_audio()
+        .any(|a| a.offset_ms != 0)
+        .then_some(())?;
+    issue2(
+        "delayreencode",
+        Severity::Info,
+        "Only fixing the audio timing? The delay doesn't need a re-encode: copy the video to keep it lossless and finish in seconds.",
+        Fix::Codec(VideoCodec::Copy),
+        Fix::TracksOnly,
     )
 }
 
@@ -704,6 +724,7 @@ pub fn run(c: &CheckInput) -> Vec<Issue> {
         rate_control_override(c),
         crop_image_subs(c),
         downscale_after_crop(c),
+        delay_with_reencode(c),
     ]
     .into_iter()
     .flatten()
@@ -804,7 +825,7 @@ pub fn apply_fix(fix: Fix, p: &ProbeInfo, s: &mut EncodeSettings, sel: &mut Sele
             }
         }
         // Not settings: the window turns cropping off or installs alass.
-        Fix::NoCrop | Fix::InstallAlass => {}
+        Fix::NoCrop | Fix::InstallAlass | Fix::TracksOnly => {}
     }
 }
 
@@ -821,45 +842,35 @@ pub fn offer_alass_install(issues: &mut [Issue], installable: bool) {
     }
 }
 
-/// Checks for external subtitle files and subtitles-only jobs.
+/// Checks for external subtitle files and fix-tracks jobs. `delays`: some
+/// audio track has a delay set.
 pub fn external_issues(
     video: &std::path::Path,
     settings: &EncodeSettings,
     mode: crate::subs::JobMode,
     externals: &[crate::subs::ExternalSub],
+    delays: bool,
     alass: bool,
 ) -> Vec<Issue> {
     use crate::subs::{self, JobMode, SubsTarget};
     let selected: Vec<_> = externals.iter().filter(|e| e.selected).collect();
     let mut v: Vec<Option<Issue>> = Vec::new();
-    if let JobMode::Subtitles(target) = mode {
-        if selected.is_empty() {
+    if let JobMode::Fix(target) = mode {
+        if let Err(e) = subs::fix_problem(video, target, externals, delays) {
+            let id = match target {
+                _ if e == subs::NOTHING_TO_FIX => "nosubs",
+                SubsTarget::Sidecar if delays => "sidecardelay",
+                SubsTarget::Sidecar => "sidecarclash",
+                _ => "embedcontainer",
+            };
+            v.push(issue(id, Severity::Strong, e, None));
+        } else if target.remuxes() && selected.iter().any(|e| e.is_sidecar_of(video)) {
             v.push(issue(
-                "nosubs",
-                Severity::Strong,
-                "No subtitle files to add. Use “Add Subtitle File…” or put files like Movie.no.srt next to the video.",
+                "sidecarstays",
+                Severity::Info,
+                "The .srt files next to the video stay where they are; Plex will list those subtitles twice until you remove them.",
                 None,
             ));
-        }
-        match target {
-            SubsTarget::Sidecar => {
-                if let Err(e) = subs::sidecar_outputs(video, externals) {
-                    v.push(issue("sidecarclash", Severity::Strong, e, None));
-                }
-            }
-            SubsTarget::Embed => match subs::embed_container(video) {
-                Err(e) => v.push(issue("embedcontainer", Severity::Strong, e, None)),
-                Ok(_) => {
-                    if selected.iter().any(|e| e.is_sidecar_of(video)) {
-                        v.push(issue(
-                            "sidecarstays",
-                            Severity::Info,
-                            "The .srt files next to the video stay where they are after embedding; Plex will list those subtitles twice until you remove them.",
-                            None,
-                        ));
-                    }
-                }
-            },
         }
     } else if !selected.is_empty() && settings.container == Container::Mp4 {
         v.push(issue(
@@ -1039,6 +1050,23 @@ mod tests {
         assert!(super::hdr_to_h264(&f.input()).is_none());
         let i = hdr_to_eight(&f.input()).unwrap();
         assert_eq!((i.severity, i.fix), (Severity::Warning, None));
+    }
+
+    #[test]
+    fn audio_delay_with_reencode_suggests_copy() {
+        let mut f = Fx::new(sdr_1080("hevc", 8_000_000), EncodeSettings::default());
+        assert!(delay_with_reencode(&f.input()).is_none());
+        f.sel.audio[0].offset_ms = -100;
+        let i = delay_with_reencode(&f.input()).unwrap();
+        assert_eq!(i.severity, Severity::Info);
+        assert_eq!(i.fix, Some(Fix::Codec(VideoCodec::Copy)));
+        assert_eq!(i.alt_fix, Some(Fix::TracksOnly));
+        // A delay on an unselected track, or a copied video, says nothing.
+        f.sel.audio[0].selected = false;
+        assert!(delay_with_reencode(&f.input()).is_none());
+        f.sel.audio[0].selected = true;
+        f.s.codec = VideoCodec::Copy;
+        assert!(delay_with_reencode(&f.input()).is_none());
     }
 
     #[test]
@@ -1414,13 +1442,13 @@ mod tests {
         use std::path::Path;
         let v = Path::new("/nonexistent/Film.mkv");
         let ids = |mode, ext: &[ExternalSub], alass, s: &EncodeSettings| -> Vec<&'static str> {
-            external_issues(v, s, mode, ext, alass)
+            external_issues(v, s, mode, ext, false, alass)
                 .iter()
                 .map(|i| i.id)
                 .collect()
         };
         let s = EncodeSettings::default();
-        let sidecar = JobMode::Subtitles(SubsTarget::Sidecar);
+        let sidecar = JobMode::Fix(SubsTarget::Sidecar);
         assert_eq!(ids(sidecar, &[], true, &s), vec!["nosubs"]);
         let no = ExternalSub::from_path(v, "/nonexistent/Film.no.srt".into(), true);
         assert!(ids(sidecar, std::slice::from_ref(&no), true, &s).is_empty());
@@ -1441,14 +1469,33 @@ mod tests {
         let embed = external_issues(
             avi,
             &s,
-            JobMode::Subtitles(SubsTarget::Embed),
+            JobMode::Fix(SubsTarget::Embed),
             std::slice::from_ref(&no),
+            false,
             true,
         );
         assert_eq!(embed[0].id, "embedcontainer");
+        // A new file from an AVI becomes an MKV, so that's fine.
+        assert!(
+            external_issues(avi, &s, JobMode::Fix(SubsTarget::NewFile), &[], true, true).is_empty()
+        );
+        // Audio delays alone are enough to fix, but not next to the video.
+        let delay = |t| -> Vec<&'static str> {
+            external_issues(v, &s, JobMode::Fix(t), &[], true, true)
+                .iter()
+                .map(|i| i.id)
+                .collect()
+        };
+        assert!(delay(SubsTarget::Embed).is_empty());
+        assert!(delay(SubsTarget::NewFile).is_empty());
+        assert_eq!(delay(SubsTarget::Sidecar), vec!["sidecardelay"]);
+        assert_eq!(
+            ids(JobMode::Fix(SubsTarget::NewFile), &[], true, &s),
+            vec!["nosubs"]
+        );
         // Embedding the video's own sidecar: it stays on disk (decided from
         // the names, without reading the folder).
-        let embed = JobMode::Subtitles(SubsTarget::Embed);
+        let embed = JobMode::Fix(SubsTarget::Embed);
         assert_eq!(
             ids(embed, std::slice::from_ref(&no), true, &s),
             vec!["sidecarstays"]

@@ -57,8 +57,8 @@ pub const LANGUAGES: &str = "Languages to keep, in order, separated by commas, e
 
 pub const PGS: &str = "Image-based PGS subtitles: Plex usually burns them into the video when they're turned on, which forces a transcode. SRT is preferred.";
 
-pub const JOB_MODE: &str = "Re-encode or remux writes a new, smaller file (external subtitles are muxed in). Add subtitles only leaves the video as it is: the subtitle files are synced and either saved next to the video or embedded into it.";
-pub const SUBS_TARGET: &str = "Save next to the video writes Movie.no.srt (Plex picks it up, the video isn't touched, takes seconds). Embed remuxes the subtitles into the video file: a new copy is written next to it, checked, and then replaces the original, so it needs free space for one more copy.";
+pub const JOB_MODE: &str = "Re-encode or remux writes a new, smaller file (external subtitles are muxed in). Fix tracks only never re-encodes anything: it adds and syncs subtitle files and shifts out-of-sync audio, copying every stream as it is. Takes seconds to a few minutes, with no quality loss.";
+pub const SUBS_TARGET: &str = "Write a new file remuxes into the output folder with the usual suffix and leaves the original alone. Replace the original remuxes into a copy next to the video, checks it, and then replaces the original, so it needs free space for one more copy. Subtitles next to the video only writes Movie.no.srt (Plex picks it up, takes seconds); the video isn't touched, so audio delays can't be applied that way.";
 pub const EXTERNAL_SUBS: &str = "SRT files from outside the video. Language and kind are read from names like Movie.no.srt, Movie.en.forced.srt or Movie.en.sdh.srt; change them if they're wrong. Files next to the video are added automatically.";
 pub const SUB_LANGUAGE: &str =
     "Language tag in the output and in the saved file name. Plex shows it in the subtitle menu.";

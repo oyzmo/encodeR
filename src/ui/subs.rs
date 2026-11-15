@@ -12,34 +12,34 @@ use crate::tracks;
 use crate::ui::widgets::{combo_row, spin_row, switch_row};
 use crate::window::App;
 
-/// "Re-encode or remux" vs "Subtitles only", and where subtitles-only jobs
-/// put the files.
+/// "Re-encode or remux" vs "Fix tracks only", and where fix-tracks jobs put
+/// the result.
 pub fn mode_group(app: &Rc<App>, id: u64, job: &Job) -> adw::PreferencesGroup {
     let g = adw::PreferencesGroup::new();
     let modes = vec![
         "Re-encode or remux".to_string(),
-        "Add subtitles only".to_string(),
+        "Fix tracks only".to_string(),
     ];
     let row = combo_row(
         "Job",
         help::JOB_MODE,
         &modes,
-        usize::from(job.mode.subtitles_only()),
+        usize::from(job.mode.fix_only()),
     );
-    row.set_subtitle(if job.mode.subtitles_only() {
-        "The video isn't re-encoded"
+    row.set_subtitle(if job.mode.fix_only() {
+        "Subtitles and audio timing; nothing is re-encoded"
     } else {
         "Writes a new file"
     });
     let target = match job.mode {
-        JobMode::Subtitles(t) => t,
+        JobMode::Fix(t) => t,
         JobMode::Encode => app.state.borrow().prefs.subs_target,
     };
     {
         let a = app.clone();
         row.connect_selected_notify(move |r| {
             let mode = if r.selected() == 1 {
-                JobMode::Subtitles(target)
+                JobMode::Fix(target)
             } else {
                 JobMode::Encode
             };
@@ -48,7 +48,7 @@ pub fn mode_group(app: &Rc<App>, id: u64, job: &Job) -> adw::PreferencesGroup {
         });
     }
     g.add(&row);
-    if job.mode.subtitles_only() {
+    if job.mode.fix_only() {
         let labels: Vec<String> = SubsTarget::ALL
             .iter()
             .map(|t| t.label().to_string())
@@ -57,14 +57,15 @@ pub fn mode_group(app: &Rc<App>, id: u64, job: &Job) -> adw::PreferencesGroup {
             .iter()
             .position(|t| *t == target)
             .unwrap_or(0);
-        let t = combo_row("Subtitles", help::SUBS_TARGET, &labels, pos);
+        let t = combo_row("Result", help::SUBS_TARGET, &labels, pos);
         t.set_subtitle(match target {
-            SubsTarget::Sidecar => "Movie.no.srt next to the video; Plex finds it",
-            SubsTarget::Embed => "Remuxed into the file, which is then replaced",
+            SubsTarget::Sidecar => "Movie.no.srt next to the video; the video isn't touched",
+            SubsTarget::Embed => "Remuxed, checked, then it replaces the original",
+            SubsTarget::NewFile => "Remuxed into the output folder; the original stays",
         });
         let a = app.clone();
         t.connect_selected_notify(move |r| {
-            let mode = JobMode::Subtitles(SubsTarget::ALL[r.selected() as usize]);
+            let mode = JobMode::Fix(SubsTarget::ALL[r.selected() as usize]);
             let a = a.clone();
             glib::idle_add_local_once(move || a.set_mode(id, mode));
         });
@@ -107,13 +108,13 @@ fn edit_ext(app: &Rc<App>, id: u64, k: usize, f: impl FnOnce(&mut ExternalSub) +
 /// The job's SRT files: include, language, kind, sync and offset per file.
 pub fn externals_group(app: &Rc<App>, id: u64, job: &Job, alass: bool) -> adw::PreferencesGroup {
     let g = adw::PreferencesGroup::new();
-    g.set_title(if job.mode.subtitles_only() {
+    g.set_title(if job.mode.fix_only() {
         "Subtitle Files"
     } else {
         "External Subtitles"
     });
-    g.set_description(Some(match (job.mode.subtitles_only(), alass) {
-        (true, true) => "Synced to the video, then saved or embedded",
+    g.set_description(Some(match (job.mode.fix_only(), alass) {
+        (true, true) => "Synced to the video, then saved next to it or embedded",
         (true, false) => "Install alass to sync them automatically",
         (false, true) => "SRT files added to the output, synced to the video first",
         (false, false) => {

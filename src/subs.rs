@@ -115,24 +115,32 @@ impl ExternalSub {
     }
 }
 
-/// What a "subtitles only" job produces.
+/// Where a "fix tracks only" job puts its result.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SubsTarget {
     /// `Movie.no.srt` next to the video; the video isn't touched.
     #[default]
     Sidecar,
-    /// Remux the subtitles into the video file, replacing it.
+    /// Remux into the video file, replacing it once the copy checks out.
     Embed,
+    /// Remux into a new file in the output folder; the original stays.
+    NewFile,
 }
 
 impl SubsTarget {
-    pub const ALL: [SubsTarget; 2] = [Self::Sidecar, Self::Embed];
+    pub const ALL: [SubsTarget; 3] = [Self::NewFile, Self::Embed, Self::Sidecar];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Sidecar => "Save next to the video",
-            Self::Embed => "Embed into the video file",
+            Self::Sidecar => "Subtitles next to the video",
+            Self::Embed => "Replace the original file",
+            Self::NewFile => "Write a new file",
         }
+    }
+
+    /// Does this target remux the video (so audio timing can change)?
+    pub fn remuxes(self) -> bool {
+        self != Self::Sidecar
     }
 }
 
@@ -142,13 +150,59 @@ pub enum JobMode {
     /// Re-encode or remux into a new file (external subtitles are muxed in).
     #[default]
     Encode,
-    /// Only add or sync subtitles; the video is never re-encoded.
-    Subtitles(SubsTarget),
+    /// Fix tracks only: add or sync subtitles and shift audio timing. Every
+    /// stream is copied; the video is never re-encoded.
+    Fix(SubsTarget),
 }
 
 impl JobMode {
-    pub fn subtitles_only(self) -> bool {
-        matches!(self, Self::Subtitles(_))
+    pub fn fix_only(self) -> bool {
+        matches!(self, Self::Fix(_))
+    }
+
+    /// Writes next to or into its own input rather than to the output folder.
+    pub fn in_place(self) -> bool {
+        matches!(self, Self::Fix(SubsTarget::Sidecar | SubsTarget::Embed))
+    }
+}
+
+/// Audio delays a fix-tracks job applies: every track with an offset, selected
+/// or not, since that mode keeps every track.
+pub fn audio_delays(sel: &Selection) -> Vec<(usize, i64)> {
+    sel.audio
+        .iter()
+        .filter(|c| c.offset_ms != 0)
+        .map(|c| (c.index, c.offset_ms))
+        .collect()
+}
+
+/// Why a fix-tracks job can't run, if it can't.
+pub fn fix_problem(
+    video: &Path,
+    target: SubsTarget,
+    externals: &[ExternalSub],
+    delays: bool,
+) -> Result<(), String> {
+    let subs = externals.iter().any(|e| e.selected);
+    match target {
+        SubsTarget::Sidecar if delays => Err(
+            "Audio delays need the file to be remuxed: pick “Replace the original file” or “Write a new file”.".into(),
+        ),
+        SubsTarget::Sidecar if !subs => Err(NOTHING_TO_FIX.into()),
+        SubsTarget::Sidecar => sidecar_outputs(video, externals).map(|_| ()),
+        _ if !subs && !delays => Err(NOTHING_TO_FIX.into()),
+        _ => fix_container(video, target).map(|_| ()),
+    }
+}
+
+pub const NOTHING_TO_FIX: &str = "Nothing to fix: add subtitle files (or put files like Movie.no.srt next to the video), or set an audio delay on a track.";
+
+/// Container for a fix-tracks remux: the input's own, or MKV for a new file
+/// from a container that can't hold text subtitles.
+pub fn fix_container(video: &Path, target: SubsTarget) -> Result<Container, String> {
+    match (embed_container(video), target) {
+        (Err(_), SubsTarget::NewFile) => Ok(Container::Mkv),
+        (r, _) => r,
     }
 }
 
