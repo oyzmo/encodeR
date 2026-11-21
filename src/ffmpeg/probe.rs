@@ -90,6 +90,9 @@ pub struct ProbeInfo {
     pub streams: Vec<(usize, String)>,
     /// Cover art streams.
     pub covers: Vec<Cover>,
+    /// Incomplete or damaged file (from the damage check after probing).
+    /// When the end is missing, `duration` is where the data really ends.
+    pub damage: Option<crate::damage::Damage>,
 }
 
 /// Cover art: a picture stream flagged `attached_pic` (an MKV image
@@ -131,6 +134,17 @@ impl Cover {
 }
 
 impl ProbeInfo {
+    /// Record the damage check's verdict. A cut-off file is as long as its
+    /// data, for progress, bitrate maths, sample points and output checks.
+    pub fn set_damage(&mut self, d: Option<crate::damage::Damage>) {
+        if let Some(d) = &d
+            && d.truncated()
+        {
+            self.duration = d.data_end;
+        }
+        self.damage = d;
+    }
+
     pub fn audio_by_index(&self, index: usize) -> Option<&AudioStream> {
         self.audio.iter().find(|a| a.index == index)
     }
@@ -217,7 +231,9 @@ pub fn run(ffprobe: &str, path: &Path) -> Result<ProbeInfo, String> {
         .output()
         .map_err(|e| format!("Could not run ffprobe: {e}"))?;
     if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(crate::damage::explain_probe_error(&err)
+            .map_or_else(|| err.trim().to_string(), str::to_string));
     }
     let mut info = parse(&String::from_utf8_lossy(&out.stdout))?;
     info.path = path.to_path_buf();

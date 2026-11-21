@@ -132,6 +132,15 @@ pub fn scale_height(job: &EncodeJob) -> Option<u32> {
 
 /// Decode mode actually used: CPU-only filters (inverse telecine, `bwdif`)
 /// need frames in system memory.
+/// Input options for a damaged source: drop packets the demuxer flags as
+/// corrupt, rebuild missing timestamps, and keep decoding past errors.
+const TOLERANT_INPUT: &[&str] = &[
+    "-fflags",
+    "+discardcorrupt+genpts",
+    "-err_detect",
+    "ignore_err",
+];
+
 pub fn effective_decode(job: &EncodeJob) -> DecodeMode {
     if job.scan.needs_cpu() {
         DecodeMode::Software
@@ -290,6 +299,10 @@ pub fn build(job: &EncodeJob) -> Result<Vec<OsString>, String> {
         a.kv("-ss", format!("{start:.3}"));
         a.kv("-t", format!("{len:.3}"));
     }
+    let damaged = p.damage.is_some();
+    if damaged {
+        a.add(TOLERANT_INPUT);
+    }
     a.kv("-i", &p.path);
     let externals: Vec<&ExternalSub> = if job.video_only || job.raw_hevc {
         Vec::new()
@@ -314,6 +327,9 @@ pub fn build(job: &EncodeJob) -> Result<Vec<OsString>, String> {
             a.kv("-t", format!("{len:.3}"));
         }
         a.kv("-itsoffset", format!("{:.3}", *ms as f64 / 1000.0));
+        if damaged {
+            a.add(TOLERANT_INPUT);
+        }
         a.kv("-i", &p.path);
     }
     // MP4 cover art: the picture as an input, stream-copied as `attached_pic`.
@@ -584,6 +600,10 @@ pub fn build(job: &EncodeJob) -> Result<Vec<OsString>, String> {
 
     if mp4 {
         a.add(&["-movflags", "+faststart"]);
+    }
+    if damaged {
+        // Don't give up when many frames fail to decode around a hole.
+        a.add(&["-max_error_rate", "1"]);
     }
     if job.progress {
         a.add(&["-progress", "pipe:1", "-nostats"]);
@@ -1204,6 +1224,56 @@ mod tests {
             &args_for(&s8, |j| j.decode = DecodeMode::Software),
             &["-vf", "format=nv12,hwupload"]
         ));
+    }
+
+    #[test]
+    fn damaged_source_gets_tolerant_input_options() {
+        let s = EncodeSettings::default();
+        let mut p = sample_4k();
+        let (sel, _, _) = auto_select(&p, &langs(), &s);
+        let out = Path::new("/out/movie-reencoded.mkv");
+        let args = |p: &ProbeInfo| -> Vec<String> {
+            let mut job = EncodeJob::new(p, &s, &sel, out, "/dev/dri/renderD128");
+            job.video_kbps = Some(4000);
+            build(&job)
+                .unwrap()
+                .into_iter()
+                .map(|a| a.into_string().unwrap())
+                .collect()
+        };
+        let clean = args(&p);
+        assert!(!clean.contains(&"+discardcorrupt+genpts".to_string()));
+        assert!(!clean.contains(&"-max_error_rate".to_string()));
+        p.damage = Some(crate::damage::Damage {
+            header_duration: 100.0,
+            data_end: 100.0,
+            errors: 1,
+            ..Default::default()
+        });
+        let a = args(&p);
+        assert!(has(
+            &a,
+            &[
+                "-fflags",
+                "+discardcorrupt+genpts",
+                "-err_detect",
+                "ignore_err",
+                "-i"
+            ]
+        ));
+        assert!(has(&a, &["-max_error_rate", "1"]));
+        // Copy (remux) gets the same input options: rebuilt timestamps help there too.
+        let copy = EncodeSettings {
+            codec: VideoCodec::Copy,
+            ..Default::default()
+        };
+        let job = EncodeJob::new(&p, &copy, &sel, out, "/dev/dri/renderD128");
+        let c: Vec<String> = build(&job)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect();
+        assert!(has(&c, &["-err_detect", "ignore_err", "-i"]));
     }
 
     #[test]

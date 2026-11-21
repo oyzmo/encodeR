@@ -64,6 +64,8 @@ pub struct Capabilities {
     pub missing_filters: Vec<String>,
     pub dovi_tool: bool,
     pub mkvpropedit: bool,
+    /// mpv, for tuning lip-sync live.
+    pub mpv: bool,
     /// Subtitle sync tool (`alass`, `alass-cli` from `cargo install`, or the
     /// copy the app installed).
     pub alass: Option<String>,
@@ -304,6 +306,7 @@ pub fn detect(ffmpeg: &str, ffprobe: &str, configured_device: Option<&str>) -> C
         ffprobe: runner::which(ffprobe),
         dovi_tool: runner::which("dovi_tool"),
         mkvpropedit: runner::which("mkvpropedit"),
+        mpv: runner::which("mpv"),
         alass: crate::alass::find(),
         devices: render_devices(),
         ..Default::default()

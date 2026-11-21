@@ -4,9 +4,13 @@ mod checks;
 mod cli;
 mod cover;
 mod crop;
+mod damage;
 mod ffmpeg;
 mod hdr;
 mod help;
+mod match_source;
+mod mediainfo;
+mod mpv;
 mod presets;
 mod queue;
 mod scan;
@@ -25,6 +29,7 @@ use adw::prelude::*;
 const USAGE: &str = "Usage: encoder [FILE…]
        encoder --print-command FILE [--preset NAME] [--out DIR] [--subs SRT]…
        encoder --encode FILE [--preset NAME] [--out DIR] [--subs SRT]…
+       encoder --match FILE [--preset NAME]
        encoder --add-subs VIDEO [SRT|ZIP…] [--embed] [--no-sync]
        encoder --version";
 
@@ -41,6 +46,8 @@ fn run_cli(mode: &str, rest: &[String]) -> gtk::glib::ExitCode {
     let result = cli::parse_options(rest).and_then(|o| {
         if mode == "--encode" {
             cli::encode(&o)
+        } else if mode == "--match" {
+            cli::match_quality(&o)
         } else {
             cli::print_command(&o)
         }
@@ -68,7 +75,7 @@ fn main() -> gtk::glib::ExitCode {
                 println!("{USAGE}");
                 return gtk::glib::ExitCode::SUCCESS;
             }
-            "--print-command" | "--encode" | "--add-subs" => {
+            "--print-command" | "--encode" | "--match" | "--add-subs" => {
                 return run_cli(&args[i], &args[i + 1..]);
             }
             a if a.starts_with('-') => {

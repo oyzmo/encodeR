@@ -55,7 +55,7 @@ SRT files next to the video (`Movie.no.srt`, `Movie.en.forced.srt`, `Movie.en.sd
 <details>
 <summary><b>Lip-sync:</b> Delays individual audio tracks to fix out-of-sync sources, without re-encoding them.</summary>
 
-If the source itself is out of sync, each audio track can get a delay (clock button in the track picker). It uses the same sign as mpv and VLC: find the value while watching, then type it in. The track is read from a second, time-shifted copy of the input (`-itsoffset`), so copied tracks stay copies and Atmos is kept. A delay that stays the same through the film is covered; drift that grows over the film (a 25 vs 23.976 fps mismatch) isn't. To only fix the timing, use *Fix tracks only*: its *Audio Timing* group lists every track. A normal job that would re-encode the video just for a delay says so, with a one-click *Copy (remux only)*.
+If the source itself is out of sync, each audio track can get a delay (clock button in the track picker). It uses the same sign as mpv and VLC. With mpv installed, *Tune in mpv* opens the film on that track: Ctrl + and Ctrl − shift the sound 50 ms at a time (the same step as the spin button), and the delay follows live over mpv's IPC socket. Close mpv when the lips match. The track is read from a second, time-shifted copy of the input (`-itsoffset`), so copied tracks stay copies and Atmos is kept. A delay that stays the same through the film is covered; drift that grows over the film (a 25 vs 23.976 fps mismatch) isn't. To only fix the timing, use *Fix tracks only*: its *Audio Timing* group lists every track. A normal job that would re-encode the video just for a delay says so, with a one-click *Copy (remux only)*.
 
 </details>
 
@@ -109,6 +109,13 @@ Detected automatically from the picture with `idet`, which runs in the same pass
 </details>
 
 <details>
+<summary><b>Damaged files:</b> Finds incomplete or damaged files (an unfinished download) and gets past the damage.</summary>
+
+After probing, every file gets a quick read with ffprobe that lists the video packets without decoding them. It takes seconds for a local file and longer over a network. A file whose data stops before the length in its header is marked *Incomplete*. Missing pieces in the middle, which read back as zeros and break the container, are marked *Damaged*, with the times where they are. A damaged file is decoded in software with errors ignored (`-fflags +discardcorrupt+genpts -err_detect ignore_err`, `-max_error_rate 1`), because VA-API tends to fail on broken frames. Expect a short glitch where data is missing. For a file that's only cut off at the end, the app suggests *Copy (remux only)*, which rebuilds the index in a minute. For damage in the middle with Copy chosen, it suggests re-encoding, because a copy keeps the broken frames and the Apple TV can stall on them. Missing data can't be brought back, so finish the download if you can. Damage inside a frame that leaves the container intact only shows up when decoding, and this check doesn't look for it. A cut-off MP4 with its index at the end can't be read at all, and the app says so.
+
+</details>
+
+<details>
 <summary><b>Black bars:</b> Detects letterboxing and can crop it away.</summary>
 
 `cropdetect` runs on 6 segments and keeps the least aggressive crop (union). Results are rounded to even sizes, and crops that save under 2% are ignored. Cropping is off by default, and there's a preview with the crop outlined.
@@ -119,6 +126,13 @@ Detected automatically from the picture with `idet`, which runs in the same pass
 <summary><b>VMAF (opt-in):</b> Scores the visual quality of sample encodes before you commit to a full encode.</summary>
 
 Sample encodes are scored against the source (4K model for 2160p). The app shows the mean and the worst segment. A post-encode check can be turned on.
+
+</details>
+
+<details>
+<summary><b>Media info:</b> Shows everything in the source file in a collapsible row at the top of each job.</summary>
+
+Container, duration, size and bitrate; the video's codec, resolution, frame rate, bit depth, colour and HDR/Dolby Vision metadata; and each audio and subtitle track with language, format, bitrate, size and flags. The copy button puts it on the clipboard as plain text.
 
 </details>
 
@@ -169,6 +183,7 @@ Headless modes, useful for checking a machine:
 ```sh
 encoder --print-command FILE [--preset NAME] [--out DIR]   # the exact ffmpeg argv
 encoder --encode FILE [--preset NAME] [--out DIR]          # run it, report estimate vs actual, HDR check
+encoder --match FILE [--preset NAME]                       # "match source quality": estimate, then the VMAF search
 ```
 
 ## Tests

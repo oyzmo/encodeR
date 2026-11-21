@@ -87,6 +87,17 @@ pub enum EstimateState {
     Failed(String),
 }
 
+/// "Match source quality" VMAF search.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MatchState {
+    None,
+    /// What it's trying right now.
+    Running(String),
+    /// With the match key it was measured for (see `State::match_key`).
+    Ready(String, crate::match_source::Found),
+    Failed(String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum VmafState {
     None,
@@ -113,8 +124,11 @@ pub struct Job {
     /// From idet analysis; `None` until analysed or when inconclusive.
     pub scan_detected: Option<ScanType>,
     pub scan_override: ScanOverride,
+    /// The damage check is reading the file (the verdict lands in `probe.damage`).
+    pub damage_checking: bool,
     pub estimate: EstimateState,
     pub vmaf: VmafState,
+    pub match_check: MatchState,
     pub progress: Option<Progress>,
     pub stage: Option<String>,
     pub decode_used: Option<DecodeMode>,
@@ -133,6 +147,8 @@ pub struct Job {
     /// Files a subtitles-only job may replace, as the user approved them.
     /// Anything the job would replace that isn't listed is asked about again.
     pub subs_ok: Vec<PathBuf>,
+    /// A file the user picked with Save As, instead of `<folder>/<name><suffix>`.
+    pub output_override: Option<PathBuf>,
 }
 
 impl Job {
@@ -159,8 +175,10 @@ impl Job {
             dv_preserve: false,
             scan_detected: None,
             scan_override: ScanOverride::Auto,
+            damage_checking: false,
             estimate: EstimateState::None,
             vmaf: VmafState::None,
+            match_check: MatchState::None,
             progress: None,
             stage: None,
             decode_used: None,
@@ -173,6 +191,7 @@ impl Job {
             externals: Vec::new(),
             cover: Default::default(),
             subs_ok: Vec::new(),
+            output_override: None,
         }
     }
 
@@ -354,6 +373,30 @@ pub fn output_path_avoiding(
     out
 }
 
+/// A path the user picked: its extension follows the container, and it is
+/// never the input or one of `taken`. Clashes become `name-2.ext`, `-3`…
+pub fn override_path(
+    chosen: &Path,
+    input: &Path,
+    container: Container,
+    taken: &[PathBuf],
+) -> PathBuf {
+    let ext = container.extension();
+    let dir = chosen.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = chosen
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "output".into());
+    let clash = |p: &Path| same_file(p, input) || taken.iter().any(|t| same_file(p, t));
+    let mut out = dir.join(format!("{stem}.{ext}"));
+    let mut n = 2;
+    while clash(&out) {
+        out = dir.join(format!("{stem}-{n}.{ext}"));
+        n += 1;
+    }
+    out
+}
+
 /// A file-name suffix can't leave the output folder or name a subfolder.
 pub fn sanitize_suffix(s: &str) -> String {
     s.chars().filter(|c| !matches!(c, '/' | '\0')).collect()
@@ -385,12 +428,14 @@ fn resolve(p: &Path) -> Option<PathBuf> {
 
 /// The next job to encode: the first pending one, in queue order.
 pub fn next_pending(jobs: &[Job]) -> Option<u64> {
-    // Wait for open subtitle questions and the interlace/crop analysis.
+    // Wait for open subtitle questions, the interlace/crop analysis and the
+    // damage check (a damaged file is decoded differently).
     jobs.iter()
         .find(|j| {
             j.state == JobState::Pending
                 && j.pgs_pending.is_empty()
                 && j.crop != CropState::Detecting
+                && !j.damage_checking
         })
         .map(|j| j.id)
 }
@@ -466,6 +511,29 @@ mod tests {
         let out = output_path_avoiding(&input, &p, Container::Mkv, std::slice::from_ref(&other));
         assert_eq!(out, link.join("Film-reencoded-2.mkv"));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn picked_output_follows_container_and_avoids_clashes() {
+        let input = Path::new("/m/Film.mkv");
+        assert_eq!(
+            override_path(Path::new("/o/Mine.mkv"), input, Container::Mp4, &[]),
+            PathBuf::from("/o/Mine.mp4")
+        );
+        assert_eq!(
+            override_path(Path::new("/o/Mine"), input, Container::Mkv, &[]),
+            PathBuf::from("/o/Mine.mkv")
+        );
+        // Picking the input itself, or another job's file, gets a number.
+        assert_eq!(
+            override_path(input, input, Container::Mkv, &[]),
+            PathBuf::from("/m/Film-2.mkv")
+        );
+        let taken = [PathBuf::from("/o/Mine.mkv"), PathBuf::from("/o/Mine-2.mkv")];
+        assert_eq!(
+            override_path(Path::new("/o/Mine.mkv"), input, Container::Mkv, &taken),
+            PathBuf::from("/o/Mine-3.mkv")
+        );
     }
 
     #[test]

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.14.0
+
+- **Match source quality** row under Target size: the size that keeps about the source's quality. It starts as an instant estimate from the source's video bitrate and how much more bitrate the chosen codec needs than the source's codec (AV1 → HEVC about 1.5×, H.264 → HEVC about 0.75×), and accounts for downscaling. *Check* measures it instead: it encodes the sample segments at up to five bitrates and scores them with VMAF, keeping the smallest size where the average is ≥ 95 and the worst segment ≥ 93. *Use* sets the target to the measured size if there is one, otherwise the estimate.
+- `encoder --match FILE` runs the same estimate and search from the terminal, and prints the measured bitrate multiplier so the estimates can be calibrated.
+
+## 0.13.2
+
+- The "won't save space" warning now has fixes: *Copy (remux only)*, and in target-size mode a target about ¾ of the source. This happens with efficient sources, e.g. a 2.2 GB AV1 file and the default 2.5 GB target.
+
+## 0.13.1
+
+- Progress no longer sits at 0% on files with many subtitle tracks. ffmpeg holds its time counter back until every subtitle track has had a cue, so progress, ETA and speed now come from the video frame count.
+
+## 0.13.0
+
+- New **Output file** row at the top of each queued job shows exactly where the result will be written. *Save As…* picks another name or folder for that job only; the undo button goes back to the output folder and suffix from Preferences. The extension follows the container, the input file is never chosen, and a name another job already uses gets a number. If you agreed to replace an existing file in the save dialog, you aren't asked again at Start.
+
+## 0.12.0
+
+- **Damaged and incomplete files**: each file is checked for missing data after it's read. The job row gets an *Incomplete* (end cut off) or *Damaged* (holes in the middle, with the times) badge, and a warning explains what to expect. Damaged files are decoded in software with errors ignored, so the encode gets past the holes with a short glitch instead of failing. For a file that's only cut off at the end, *Copy (remux only)* is offered, since it rebuilds the index in a minute. With Copy chosen on a file with holes, re-encoding is offered instead.
+- A cut-off file's real length is used for the progress bar, the target-size bitrate, sample points and the remux length check, which used to reject it.
+- A cut-off MP4 that can't be read at all now says why, instead of showing ffmpeg's error.
+
+## 0.11.0
+
+- **Tune in mpv** in the audio delay popover: opens the film in mpv on that track. Ctrl + and Ctrl − shift the sound 50 ms at a time, and the delay in the app follows live, so you don't have to type the value in. Close mpv when the lips match. Needs mpv (`sudo dnf install mpv`).
+
+## 0.10.0
+
+- New **Media info** row at the top of every job: expand it to see everything ffprobe found in the file — container, duration, size and bitrate, the video's codec, resolution, frame rate, bit depth, colour and HDR/Dolby Vision metadata, and each audio and subtitle track with language, format, bitrate, size and flags. The copy button puts it on the clipboard as text.
+
 ## 0.9.0
 
 - New **Cover Art** group on every job: keep the source's cover, choose a new picture (*Choose…*, or drop an image on the window), or remove it. A new picture is converted to a JPEG of at most 1000 pixels on the long side and is never enlarged.

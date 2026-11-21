@@ -68,6 +68,8 @@ pub struct Limiter {
 pub static PROBES: Limiter = Limiter::new(4);
 /// Crop/interlace analysis, sample encodes and VMAF: CPU/GPU heavy.
 pub static HEAVY: Limiter = Limiter::new(2);
+/// Damage checks read whole files: two at a time, so a NAS isn't swamped.
+pub static SCANS: Limiter = Limiter::new(2);
 
 pub struct Slot(&'static Limiter);
 

@@ -6,10 +6,34 @@ pub struct Progress {
     pub speed: Option<f64>,
     pub fps: Option<f64>,
     pub total_size: Option<u64>,
+    /// Video frames written so far (counted for stream copy too).
+    pub frame: Option<u64>,
     pub finished: bool,
 }
 
 impl Progress {
+    /// Fill in media time and speed from the frame count. ffmpeg's
+    /// `out_time` is the minimum over all output streams, so a copied
+    /// subtitle track holds it at `N/A` until its first cue and then at its
+    /// last one; with dozens of subtitle tracks it barely moves. The video
+    /// frame count doesn't have that problem. Filters here keep or lower the
+    /// frame rate (`bwdif` send_frame, `decimate`), so this never runs ahead.
+    pub fn with_source_fps(mut self, fps: Option<f64>) -> Self {
+        let (Some(fps), Some(frame)) = (fps.filter(|f| *f > 0.0), self.frame) else {
+            return self;
+        };
+        let us = (frame as f64 / fps * 1e6) as i64;
+        if self.out_time_us.is_none_or(|t| t < us) {
+            self.out_time_us = Some(us);
+        }
+        if self.speed.is_none_or(|s| s <= 0.0)
+            && let Some(f) = self.fps.filter(|f| *f > 0.0)
+        {
+            self.speed = Some(f / fps);
+        }
+        self
+    }
+
     /// Fraction done (0..1) against the probed duration.
     pub fn fraction(&self, duration: f64) -> f64 {
         match self.out_time_us {
@@ -48,6 +72,7 @@ impl ProgressParser {
             }
             "speed" => self.current.speed = v.trim_end_matches('x').trim().parse().ok(),
             "fps" => self.current.fps = v.parse().ok(),
+            "frame" => self.current.frame = v.parse().ok(),
             "total_size" => self.current.total_size = v.parse().ok(),
             "progress" => {
                 self.current.finished = v == "end";
@@ -114,6 +139,46 @@ mod tests {
         p.feed("out_time_us=200000000");
         let s = p.feed("progress=continue").unwrap();
         assert_eq!(s.fraction(100.0), 1.0);
+    }
+
+    #[test]
+    fn frames_stand_in_when_subtitles_hold_out_time() {
+        // Real ffmpeg 8.1 output with a copied subtitle track that hasn't
+        // reached its first cue yet.
+        let mut p = ProgressParser::default();
+        let mut snap = None;
+        for l in "frame=1200\nfps=480.0\nout_time_us=N/A\nspeed=N/A\nprogress=continue".lines() {
+            snap = p.feed(l).or(snap);
+        }
+        let s = snap.unwrap().with_source_fps(Some(24.0));
+        assert_eq!(s.out_time_us, Some(50_000_000));
+        assert_eq!(s.speed, Some(20.0));
+        assert!((s.fraction(100.0) - 0.5).abs() < 1e-9);
+        // A stuck out_time behind the frames is overridden; one ahead is kept.
+        let stuck = Progress {
+            frame: Some(240),
+            out_time_us: Some(2_000_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            stuck.clone().with_source_fps(Some(24.0)).out_time_us,
+            Some(10_000_000)
+        );
+        let ahead = Progress {
+            frame: Some(240),
+            out_time_us: Some(12_000_000),
+            speed: Some(3.0),
+            ..Default::default()
+        };
+        let a = ahead.with_source_fps(Some(24.0));
+        assert_eq!((a.out_time_us, a.speed), (Some(12_000_000), Some(3.0)));
+        // No frames (audio-only job) or no fps: unchanged.
+        let audio = Progress {
+            out_time_us: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(audio.clone().with_source_fps(Some(24.0)), audio);
+        assert_eq!(stuck.with_source_fps(None).out_time_us, Some(2_000_000));
     }
 
     #[test]

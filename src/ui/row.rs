@@ -120,10 +120,20 @@ impl JobRow {
             Some(crate::scan::ScanType::Telecine { .. }) => Some("Telecine"),
             _ => None,
         };
-        let badge = match (job.probe.as_ref().and_then(|p| p.hdr.badge()), scan_badge) {
-            (Some(h), Some(s)) => Some(format!("{h} · {s}")),
-            (h, s) => h.or(s.map(str::to_string)),
-        };
+        let damage_badge = job
+            .probe
+            .as_ref()
+            .and_then(|p| p.damage.as_ref())
+            .map(|d| d.badge().to_string());
+        let badge: Vec<String> = [
+            damage_badge,
+            job.probe.as_ref().and_then(|p| p.hdr.badge()),
+            scan_badge.map(str::to_string),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let badge = (!badge.is_empty()).then(|| badge.join(" · "));
         self.badge.set_visible(badge.is_some());
         self.badge.set_label(badge.as_deref().unwrap_or(""));
         let mut status = job.state.label().to_string();
@@ -157,6 +167,9 @@ impl JobRow {
             }
             JobState::Pending if !job.pgs_pending.is_empty() => {
                 status = "Waiting for a subtitle choice".into()
+            }
+            JobState::Pending if job.damage_checking => {
+                status = "Checking the file for damage…".into()
             }
             JobState::Pending => {
                 if let Some(d) = job.decode_used {

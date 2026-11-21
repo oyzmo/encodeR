@@ -13,7 +13,7 @@ use crate::ffmpeg::progress::format_eta;
 use crate::ffmpeg::vmaf;
 use crate::help;
 use crate::presets;
-use crate::queue::{CropState, EstimateState, Job, JobState, VmafState};
+use crate::queue::{CropState, EstimateState, Job, JobState, MatchState, VmafState};
 use crate::scan::{Scan, ScanOverride};
 use crate::settings::{
     Container, Downscale, MultichannelFallback, RateControl, SizeMode, VideoCodec,
@@ -45,8 +45,11 @@ pub struct Editor {
     crop_row: Option<(adw::SwitchRow, gtk::Button)>,
     scan_row: Option<(adw::ComboRow, adw::SwitchRow)>,
     vmaf_row: Option<(adw::ActionRow, gtk::Button, adw::Spinner)>,
+    /// "Match source quality": row, Use, Check with VMAF, spinner.
+    match_row: Option<(adw::ActionRow, gtk::Button, gtk::Button, adw::Spinner)>,
     command: Option<gtk::TextBuffer>,
     progress: Option<(gtk::ProgressBar, gtk::Label)>,
+    output_row: Option<adw::ActionRow>,
 }
 
 fn group(title: &str, description: &str) -> adw::PreferencesGroup {
@@ -130,6 +133,57 @@ fn command_group(app: &Rc<App>) -> (adw::PreferencesGroup, gtk::TextBuffer) {
     (cmd_group, buffer)
 }
 
+/// Collapsed "Media info" row listing everything ffprobe found, copyable.
+fn media_info_row(app: &Rc<App>, probe: &crate::ffmpeg::probe::ProbeInfo) -> adw::ExpanderRow {
+    let sections = crate::mediainfo::sections(probe);
+    let exp = adw::ExpanderRow::builder()
+        .title("Media info")
+        .subtitle("Everything ffprobe found in the file")
+        .tooltip_text(help::MEDIA_INFO)
+        .build();
+    exp.add_prefix(&gtk::Image::from_icon_name("dialog-information-symbolic"));
+    let copy = gtk::Button::from_icon_name("edit-copy-symbolic");
+    copy.add_css_class("flat");
+    copy.set_valign(gtk::Align::Center);
+    copy.set_tooltip_text(Some("Copy media info"));
+    {
+        let text = crate::mediainfo::to_text(&sections);
+        let a = app.clone();
+        copy.connect_clicked(move |b| {
+            b.clipboard().set_text(&text);
+            a.toast("Media info copied");
+        });
+    }
+    exp.add_suffix(&copy);
+    for sec in &sections {
+        let head = gtk::Label::builder()
+            .label(&sec.title)
+            .xalign(0.0)
+            .margin_top(12)
+            .margin_bottom(6)
+            .margin_start(12)
+            .build();
+        head.add_css_class("heading");
+        exp.add_row(
+            &gtk::ListBoxRow::builder()
+                .child(&head)
+                .activatable(false)
+                .selectable(false)
+                .build(),
+        );
+        for (k, v) in &sec.fields {
+            let row = adw::ActionRow::builder()
+                .title(glib::markup_escape_text(k))
+                .subtitle(glib::markup_escape_text(v))
+                .subtitle_selectable(true)
+                .build();
+            row.add_css_class("property");
+            exp.add_row(&row);
+        }
+    }
+    exp
+}
+
 impl Editor {
     pub fn scroll_position(&self) -> f64 {
         self.scroller
@@ -157,8 +211,10 @@ impl Editor {
                 crop_row: None,
                 scan_row: None,
                 vmaf_row: None,
+                match_row: None,
                 command: None,
                 progress: None,
+                output_row: None,
             })
         };
         let Some(job) = st.job(id).cloned() else {
@@ -201,6 +257,7 @@ impl Editor {
             l.set_valign(gtk::Align::Center);
             status.set_header_suffix(Some(&l));
         }
+        status.add(&media_info_row(app, &probe));
         let mut progress = None;
         match job.state {
             JobState::Running => {
@@ -313,6 +370,10 @@ impl Editor {
             }
             _ => {}
         }
+        let output_row = (job.state.editable()).then(|| output_file_row(app, id));
+        if let Some(r) = &output_row {
+            status.add(r);
+        }
         content.append(&status);
 
         let issues = DynGroup::new("Checks");
@@ -350,8 +411,10 @@ impl Editor {
                 crop_row: None,
                 scan_row: None,
                 vmaf_row: None,
+                match_row: None,
                 command: Some(buffer),
                 progress,
+                output_row,
             });
             ed.refresh(app);
             ed.update_progress(&app.state.borrow());
@@ -454,6 +517,7 @@ impl Editor {
         out.add(&codec_exp);
 
         let encoding = s.codec != VideoCodec::Copy;
+        let mut match_row = None;
         if encoding {
             let mode_row = adw::ActionRow::builder()
                 .title("Size")
@@ -521,6 +585,42 @@ impl Editor {
                     a.edit(id, |j| j.settings.target_gb = v);
                 });
                 out.add(&target);
+
+                let row = adw::ActionRow::builder()
+                    .title("Match source quality")
+                    .tooltip_text(help::MATCH_SOURCE)
+                    .subtitle_lines(3)
+                    .build();
+                let spin = adw::Spinner::new();
+                spin.set_visible(false);
+                let check = gtk::Button::with_label("Check");
+                check.set_valign(gtk::Align::Center);
+                check.set_tooltip_text(Some(help::MATCH_CHECK));
+                let use_btn = gtk::Button::with_label("Use");
+                use_btn.set_valign(gtk::Align::Center);
+                {
+                    let a = app.clone();
+                    check.connect_clicked(move |b| {
+                        if b.label().as_deref() == Some("Cancel") {
+                            a.cancel_match(id);
+                        } else {
+                            a.start_match(id);
+                        }
+                    });
+                    let a = app.clone();
+                    let t = target.clone();
+                    use_btn.connect_clicked(move |_| {
+                        let gb = match_gb(&a.state.borrow(), id).map(|(gb, _)| gb);
+                        if let Some(gb) = gb {
+                            t.set_value(gb);
+                        }
+                    });
+                }
+                row.add_suffix(&spin);
+                row.add_suffix(&check);
+                row.add_suffix(&use_btn);
+                out.add(&row);
+                match_row = Some((row, use_btn, check, spin));
             } else {
                 let q = adw::ActionRow::builder()
                     .title("Quality")
@@ -1266,8 +1366,10 @@ impl Editor {
             crop_row,
             scan_row,
             vmaf_row,
+            match_row,
             command: Some(buffer),
             progress,
+            output_row,
         });
         ed.refresh(app);
         ed.update_progress(&app.state.borrow());
@@ -1337,6 +1439,14 @@ impl Editor {
                 g.add(&row);
             }
             g.group.set_visible(!g.is_empty());
+        }
+
+        if let Some(row) = &self.output_row {
+            row.set_visible(job.writes_output());
+            if job.writes_output() {
+                let out = st.output_for(job);
+                row.set_subtitle(&glib::markup_escape_text(&out.display().to_string()));
+            }
         }
 
         if let Some((row, spin)) = &self.estimate_row {
@@ -1488,6 +1598,29 @@ impl Editor {
             preview.set_sensitive(true);
         }
 
+        if let Some((row, use_btn, check, spin)) = &self.match_row {
+            let est = st.match_estimate_kbps(job);
+            row.set_visible(est.is_some());
+            let running = matches!(job.match_check, MatchState::Running(_));
+            spin.set_visible(running);
+            check.set_label(if running { "Cancel" } else { "Check" });
+            let codec_ok = st
+                .caps
+                .as_ref()
+                .is_some_and(|c| c.codec(job.settings.codec).available);
+            let has_vmaf = st.caps.as_ref().is_some_and(|c| c.libvmaf);
+            check.set_sensitive(running || (has_vmaf && codec_ok));
+            if !has_vmaf {
+                check.set_tooltip_text(Some(help::VMAF_MISSING));
+            }
+            let picked = match_gb(&st, self.job);
+            use_btn.set_sensitive(picked.is_some());
+            if let Some((gb, _)) = picked {
+                use_btn.set_tooltip_text(Some(&format!("Set the target to {gb:.1} GB")));
+            }
+            row.set_subtitle(&match_subtitle(&st, job, p, picked));
+        }
+
         if let Some((row, btn, spin)) = &self.vmaf_row {
             let running = job.vmaf == VmafState::Running;
             spin.set_visible(running);
@@ -1624,6 +1757,7 @@ fn offset_button(app: &Rc<App>, id: u64, index: usize, offset_ms: i64) -> gtk::M
             let ms = s.value().round() as i64;
             set_look(&b, ms);
             r.set_sensitive(ms != 0);
+            crate::ui::tune::spin_changed(id, index, ms);
             ap.edit(id, |j| {
                 if let Some(ch) = j.selection.audio.iter_mut().find(|ch| ch.index == index) {
                     ch.offset_ms = ms;
@@ -1635,14 +1769,28 @@ fn offset_button(app: &Rc<App>, id: u64, index: usize, offset_ms: i64) -> gtk::M
     title.add_css_class("heading");
     title.set_halign(gtk::Align::Start);
     let hint = gtk::Label::new(Some(
-        "Positive if voices come before the lips move,\nnegative if they come after. Same sign as mpv.",
+        "Positive if voices come before the lips move,\nnegative if they come after. In mpv, Ctrl + and\nCtrl − step 50 ms and the value follows live.",
     ));
     hint.add_css_class("dim-label");
     hint.add_css_class("caption");
     hint.set_halign(gtk::Align::Start);
+    let has_mpv = app.state.borrow().caps.as_ref().is_some_and(|c| c.mpv);
+    let tune = gtk::Button::with_label("Tune in mpv");
+    tune.set_sensitive(has_mpv);
+    tune.set_tooltip_text(Some(if has_mpv {
+        help::MPV_TUNE
+    } else {
+        help::MPV_MISSING
+    }));
+    {
+        let ap = app.clone();
+        tune.connect_clicked(move |_| crate::ui::tune::toggle(&ap, id, index));
+    }
+    crate::ui::tune::register(id, index, &spin, &tune);
     let line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     line.append(&spin);
     line.append(&reset);
+    line.append(&tune);
     let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
     content.set_margin_top(6);
     content.set_margin_bottom(6);
@@ -1655,6 +1803,100 @@ fn offset_button(app: &Rc<App>, id: u64, index: usize, offset_ms: i64) -> gtk::M
     pop.set_child(Some(&content));
     button.set_popover(Some(&pop));
     button
+}
+
+/// Where the job's file goes, with Save As to pick another name or folder.
+/// `Editor::refresh` fills in the path.
+fn output_file_row(app: &Rc<App>, id: u64) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title("Output file")
+        .subtitle_selectable(true)
+        .tooltip_text(help::OUTPUT_FILE)
+        .build();
+    let choose = gtk::Button::with_label("Save As…");
+    choose.set_valign(gtk::Align::Center);
+    let reset = gtk::Button::from_icon_name("edit-undo-symbolic");
+    reset.set_tooltip_text(Some(
+        "Back to the output folder and suffix from Preferences",
+    ));
+    reset.add_css_class("flat");
+    reset.set_valign(gtk::Align::Center);
+    reset.set_visible(
+        app.state
+            .borrow()
+            .job(id)
+            .is_some_and(|j| j.output_override.is_some()),
+    );
+    {
+        let a = app.clone();
+        choose.connect_clicked(move |_| {
+            let (current, ext) = {
+                let st = a.state.borrow();
+                let Some(j) = st.job(id) else { return };
+                (st.output_for(j), j.output_container().extension())
+            };
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some(&format!("{} video", ext.to_uppercase())));
+            filter.add_suffix(ext);
+            let filters = gio::ListStore::new::<gtk::FileFilter>();
+            filters.append(&filter);
+            let fd = gtk::FileDialog::builder()
+                .title("Save Output As")
+                .modal(true)
+                .filters(&filters)
+                .default_filter(&filter)
+                .build();
+            if current.parent().is_some_and(|p| p.is_dir()) {
+                fd.set_initial_folder(current.parent().map(gio::File::for_path).as_ref());
+            }
+            if let Some(name) = current.file_name() {
+                fd.set_initial_name(Some(&name.to_string_lossy()));
+            }
+            let a = a.clone();
+            fd.save(
+                Some(&a.window.clone()),
+                None::<&gio::Cancellable>,
+                move |r| {
+                    let Some(p) = r.ok().and_then(|f| f.path()) else {
+                        return;
+                    };
+                    {
+                        let mut st = a.state.borrow_mut();
+                        let Some(j) = st.job_mut(id) else { return };
+                        if crate::queue::same_file(&p, &j.input) {
+                            drop(st);
+                            a.toast("That's the input file. Pick another name.");
+                            return;
+                        }
+                        j.output_override = Some(p.clone());
+                        // The save dialog already asked about replacing it.
+                        let resolved = st.job(id).map(|j| st.output_for(j));
+                        if resolved.as_ref() == Some(&p)
+                            && p.exists()
+                            && let Some(j) = st.job_mut(id)
+                        {
+                            j.replace_ok = Some(p);
+                        }
+                    }
+                    a.update_row(id);
+                    a.rebuild_editor();
+                },
+            );
+        });
+    }
+    {
+        let a = app.clone();
+        reset.connect_clicked(move |_| {
+            if let Some(j) = a.state.borrow_mut().job_mut(id) {
+                j.output_override = None;
+            }
+            a.update_row(id);
+            a.rebuild_editor();
+        });
+    }
+    row.add_suffix(&reset);
+    row.add_suffix(&choose);
+    row
 }
 
 fn help_button(text: &str) -> gtk::MenuButton {
@@ -1680,4 +1922,59 @@ fn help_button(text: &str) -> gtk::MenuButton {
         .build();
     b.add_css_class("flat");
     b
+}
+
+/// Target size the "Use" button applies: the VMAF result when it's fresh and
+/// found one, otherwise the instant estimate. The bool says it's measured.
+fn match_gb(st: &crate::window::State, id: u64) -> Option<(f64, bool)> {
+    let job = st.job(id)?;
+    if let MatchState::Ready(key, f) = &job.match_check
+        && *key == st.match_key(job)
+        && let Some(k) = f.kbps
+    {
+        return Some((st.match_target_gb(job, k)?, true));
+    }
+    let k = st.match_estimate_kbps(job)?;
+    Some((st.match_target_gb(job, k)?, false))
+}
+
+fn match_subtitle(
+    st: &crate::window::State,
+    job: &Job,
+    p: &crate::ffmpeg::probe::ProbeInfo,
+    picked: Option<(f64, bool)>,
+) -> String {
+    let Some(v) = p.video.as_ref() else {
+        return String::new();
+    };
+    let factor = crate::match_source::factor(&v.codec, job.settings.codec).unwrap_or(1.0);
+    let from = format!(
+        "{} → {} needs about {factor:.1}× the bitrate",
+        v.codec.to_uppercase(),
+        job.settings.codec.label()
+    );
+    let hdr = if p.hdr.is_hdr() {
+        " (approximate for HDR)"
+    } else {
+        ""
+    };
+    match (&job.match_check, picked) {
+        (MatchState::Running(line), _) => format!("Checking with VMAF{hdr}: {line}"),
+        (MatchState::Failed(e), Some((gb, _))) => format!("≈ {gb:.1} GB · VMAF check failed: {e}"),
+        (MatchState::Ready(key, f), Some((gb, true))) if *key == st.match_key(job) => format!(
+            "{gb:.1} GB keeps the quality, checked with VMAF{hdr}: mean {:.1}, worst segment {:.1}",
+            f.score.mean, f.score.worst
+        ),
+        (MatchState::Ready(key, f), Some((gb, false))) if *key == st.match_key(job) => {
+            let top = st
+                .match_target_gb(job, f.tried_max)
+                .map_or(String::new(), |g| format!(" at {g:.1} GB"));
+            format!(
+                "≈ {gb:.1} GB estimated, but VMAF didn't reach transparent even{top} (worst segment {:.1}). Hard-to-compress source; consider Copy.",
+                f.score.worst
+            )
+        }
+        (_, Some((gb, _))) => format!("≈ {gb:.1} GB · {from}"),
+        (_, None) => String::new(),
+    }
 }

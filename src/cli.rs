@@ -11,7 +11,7 @@ use crate::scan::{self, ScanOverride, ScanType};
 use crate::settings::{EncodeSettings, Prefs, RateControl, VideoCodec};
 use crate::subs::{self, ExternalSub, JobMode, SubsTarget};
 use crate::worker::{self, Request, Tools, Update};
-use crate::{checks, presets, queue, tracks};
+use crate::{checks, match_source, presets, queue, tracks};
 
 pub struct Options {
     pub file: PathBuf,
@@ -42,7 +42,22 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
         None => prefs.last_settings.clone(),
     };
     let tools = Tools::default();
-    let p = probe::run(&tools.ffprobe, &o.file)?;
+    let mut p = probe::run(&tools.ffprobe, &o.file)?;
+    if let Some(v) = &p.video {
+        let d = crate::damage::check(
+            &tools.ffprobe,
+            &p.path,
+            v.index,
+            p.duration,
+            &Cancel::default(),
+        )?;
+        eprintln!(
+            "damage  {}",
+            d.as_ref()
+                .map_or_else(|| "none found".into(), |d| d.describe())
+        );
+        p.set_damage(d);
+    }
     let (mut sel, _, questions) = tracks::auto_select(&p, &prefs.preferred_languages, &settings);
     let externals: Vec<ExternalSub> = o
         .subs
@@ -177,6 +192,54 @@ pub fn print_command(o: &Options) -> Result<(), String> {
     let p = prepare(o)?;
     println!("{}", command_line(&p.req, &p.tools)?);
     print_checks(&p.req, p.limits, p.detected, None);
+    Ok(())
+}
+
+/// `--match`: the "match source quality" estimate, then the VMAF search.
+pub fn match_quality(o: &Options) -> Result<(), String> {
+    let Prepared { req, tools, .. } = prepare(o)?;
+    let p = &req.probe;
+    let v = p.video.as_ref().ok_or("No video")?;
+    let src = p.video_bit_rate().ok_or("Unknown source video bitrate")? as f64 / 1000.0;
+    let codec = req.settings.codec;
+    let factor = match_source::factor(&v.codec, codec)
+        .ok_or_else(|| format!("No efficiency figure for {} → {}", v.codec, codec.label()))?;
+    let kbps = match_source::estimate_kbps(p, &req.settings).ok_or("No estimate")?;
+    let (audio, subs) = (
+        req.selection.audio_bytes(p),
+        req.selection.subtitle_bytes(p),
+    );
+    let gb = |k| match_source::target_gb(k, p.duration, audio, subs);
+    println!(
+        "source  {} {:.0} kb/s video · {}",
+        v.codec,
+        src,
+        estimate::format_bytes(p.size_bytes)
+    );
+    println!(
+        "estimate  {} needs {factor:.2}× → {kbps} kb/s video → {:.1} GB",
+        codec.label(),
+        gb(kbps)
+    );
+    let found = worker::match_quality(&tools, &req, kbps, &Cancel::default(), |line| {
+        eprintln!("· {line}")
+    })?;
+    match found.kbps {
+        Some(k) => println!(
+            "vmaf  {k} kb/s → {:.1} GB (mean {:.2}, worst {:.2}); measured factor {:.2}×",
+            gb(k),
+            found.score.mean,
+            found.score.worst,
+            k as f64 / src
+        ),
+        None => println!(
+            "vmaf  not transparent even at {} kb/s ({:.1} GB): mean {:.2}, worst {:.2}",
+            found.tried_max,
+            gb(found.tried_max),
+            found.score.mean,
+            found.score.worst
+        ),
+    }
     Ok(())
 }
 

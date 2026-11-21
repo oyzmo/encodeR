@@ -14,7 +14,9 @@ pub const CONTAINER: &str = "MKV holds every kind of audio and subtitle track an
 pub const APPLE_AUDIO: &str = "Converts audio Apple TV can't play natively (TrueHD, DTS, DTS-HD MA, Opus) so the NAS never has to transcode. Compatible tracks (AAC, AC-3, E-AC-3 incl. Atmos, FLAC) are copied as they are.";
 pub const DOWNMIX: &str = "Converts every multichannel track (5.1, 7.1) to stereo AAC at 224 kb/s, whatever its codec. Small and plays everywhere, good for TV speakers or headphones, but surround and Atmos are lost. Stereo tracks follow the normal rules. You can still change each track below.";
 pub const FALLBACK: &str = "What multichannel TrueHD/DTS becomes. E-AC-3 5.1 at 640 kb/s is small and plays everywhere, but 7.1 is folded to 5.1 and Atmos is lost. AAC 7.1 keeps all channels (lossy). FLAC 7.1 is lossless but large.";
-pub const AUDIO_OFFSET: &str = "Fixes lip-sync when the source itself is out of sync. Positive = the sound comes later (use it when voices are heard before the lips move), negative = earlier. Same sign as the audio delay in mpv (Ctrl + and Ctrl −) and VLC, so find the value there and type it in. Copied tracks stay copies; nothing is re-encoded for this.";
+pub const AUDIO_OFFSET: &str = "Fixes lip-sync when the source itself is out of sync. Positive = the sound comes later (use it when voices are heard before the lips move), negative = earlier. Same sign as the audio delay in mpv and VLC. Easiest: “Tune in mpv” opens the film on this track; press Ctrl + or Ctrl − (50 ms steps) until the lips match and the value fills in by itself. Copied tracks stay copies; nothing is re-encoded for this.";
+pub const MPV_TUNE: &str = "Opens the film in mpv on this track. Ctrl + and Ctrl − shift the sound 50 ms at a time, and the delay here follows live. Close mpv when the lips match.";
+pub const MPV_MISSING: &str = "Needs mpv: sudo dnf install mpv";
 pub const AUDIO_ACTION: &str = "Copy keeps the track exactly as it is. Converting makes it smaller, or playable on Apple TV when the source is TrueHD or DTS.";
 
 pub const RATE_CONTROL: &str = "How the encoder spends bits. Automatic uses VBR for target size and CQP for constant quality. CBR wastes bits on easy scenes; QVBR is VBR with a quality floor. Only modes your driver accepts are listed.";
@@ -26,6 +28,8 @@ pub const BFRAMES: &str = "B-frames improve compression a bit. Leave on Automati
 pub const METADATA: &str = "Keeps chapters and global tags (film title, release info). Turn off to drop them. Track languages and titles are always kept.";
 pub const EXTRA_ARGS: &str = "Extra ffmpeg arguments, added before the output file. Quote values with spaces like in a shell (it is never run through a shell). Mistakes here can make the encode fail.";
 pub const COMMAND: &str = "The exact command that will run. Copy it to try it in a terminal.";
+
+pub const MEDIA_INFO: &str = "What the source file contains, as ffprobe reports it: container, video, every audio and subtitle track, HDR metadata and attachments. The copy button puts it all on the clipboard as text.";
 
 pub const ESTIMATE: &str = "Estimated output size from short sample encodes at 20%, 50% and 80% into the file. Grainy or high-motion scenes elsewhere can make the real size differ.";
 pub const ESTIMATE_BITRATE: &str = "Calculated from the bitrate and the track sizes. Hardware VBR is single-pass, so the real size can be off by a few percent.";
@@ -41,6 +45,8 @@ pub const CROP_DV: &str =
 pub const DV_PRESERVE: &str = "Experimental. Extracts the Dolby Vision metadata (RPU) with dovi_tool, re-encodes the video, injects the RPU back and checks the result. Profile 7 is converted to 8.1, which Apple TV plays. Needs HEVC and no scaling.";
 pub const DV_MISSING: &str = "Install dovi_tool to keep Dolby Vision. It is not packaged for Fedora; get it from https://github.com/quietvoid/dovi_tool/releases and put it on your PATH.";
 
+pub const MATCH_SOURCE: &str = "The target size that keeps about the source's quality. The first number is a quick estimate: the source's video bitrate times how many more bits the chosen codec needs than the source's (AV1 → HEVC about 1.5×, H.264 → HEVC about 0.75×). Check measures it instead. Use sets the target.";
+pub const MATCH_CHECK: &str = "Encode the sample segments at a few bitrates and score them with VMAF, to find the smallest size that still looks like the source (mean ≥ 95, worst segment ≥ 93). Runs on the CPU and tries up to 5 bitrates, so it takes a few minutes, longer for 4K.";
 pub const VMAF: &str = "Scores sample encodes against the source with Netflix's VMAF. ≥ 95 = visually transparent, 90–95 = very good, 80–90 = good with visible loss on close inspection, below 80 = poor. The worst segment matters more than the average. Runs on the CPU, so it's slow; it never blocks encoding.";
 pub const VMAF_HDR: &str =
     "VMAF models are trained on SDR video, so scores for HDR sources are approximate.";
@@ -50,6 +56,7 @@ pub const VMAF_AFTER: &str = "After each encode, scores a few segments of the fi
 
 pub const OUTPUT_DIR: &str =
     "Where the new files go. Empty = next to each input file. The input is never overwritten.";
+pub const OUTPUT_FILE: &str = "Where this job's file goes. By default it's the output folder plus the file name suffix from Preferences; Save As picks another name or folder for this job only. The extension follows the container, and the input is never overwritten.";
 pub const SUFFIX: &str = "Added to the file name, e.g. Movie-reencoded.mkv.";
 pub const DEVICE: &str =
     "The GPU used for decoding and encoding. Automatic picks the first AMD render device.";

@@ -229,12 +229,19 @@ pub fn output_not_smaller(c: &CheckInput) -> Option<Issue> {
         _ => c.estimate?.lo,
     };
     (input > 0 && est >= input).then_some(())?;
-    issue(
-        "bigger",
-        Severity::Warning,
-        "The estimated output is not smaller than the input, so this won't save space.",
-        None,
-    )
+    let msg = "The estimated output is not smaller than the input, so this won't save space.";
+    if !c.encoding() {
+        return issue("bigger", Severity::Warning, msg, None);
+    }
+    // A target about 3/4 of the source, rounded down to 0.5 GB. Below 1 GB
+    // it would mostly add artefacts, so only Copy is offered then.
+    let smaller = (input as f64 / estimate::GB * 0.75 * 2.0).floor() / 2.0;
+    let copy = Fix::Codec(VideoCodec::Copy);
+    if c.settings.size_mode == SizeMode::TargetSize && smaller >= 1.0 {
+        issue2("bigger", Severity::Warning, msg, copy, Fix::Target(smaller))
+    } else {
+        issue("bigger", Severity::Warning, msg, Some(copy))
+    }
 }
 
 pub fn low_bitrate_source(c: &CheckInput) -> Option<Issue> {
@@ -705,8 +712,51 @@ pub fn downscale_after_crop(c: &CheckInput) -> Option<Issue> {
     )
 }
 
+/// Incomplete or damaged source: say what's wrong and what the job does about it.
+pub fn damaged(c: &CheckInput) -> Option<Issue> {
+    let d = c.probe.damage.as_ref()?;
+    let what = d.describe();
+    if d.mid_damage() {
+        if c.encoding() {
+            return issue(
+                "damaged",
+                Severity::Warning,
+                format!(
+                    "{what} Expect a short glitch or skip there. The video is decoded in software with errors ignored, which is slower but gets past the damage."
+                ),
+                None,
+            );
+        }
+        return issue(
+            "damaged",
+            Severity::Warning,
+            format!(
+                "{what} Copy keeps the broken frames, which can make the Apple TV stall or stop there. Re-encoding replaces them with a short glitch."
+            ),
+            Some(Fix::HevcTenBit),
+        );
+    }
+    if c.encoding() {
+        return issue(
+            "damaged",
+            Severity::Warning,
+            format!(
+                "{what} The output ends there too. If you only want it to play and seek properly, Copy (remux only) rebuilds the index in a minute."
+            ),
+            Some(Fix::Codec(VideoCodec::Copy)),
+        );
+    }
+    issue(
+        "damaged",
+        Severity::Warning,
+        format!("{what} The remux ends there too, with a fresh index so it seeks properly."),
+        None,
+    )
+}
+
 pub fn run(c: &CheckInput) -> Vec<Issue> {
     let mut v: Vec<Issue> = [
+        damaged(c),
         eight_to_ten(c),
         hdr_to_eight(c),
         hdr_to_h264(c),
@@ -965,6 +1015,46 @@ mod tests {
     }
 
     #[test]
+    fn damaged_source_advice_depends_on_where_and_on_copy() {
+        use crate::damage::Damage;
+        let mut f = Fx::new(sdr_1080("h264", 8_000_000), EncodeSettings::default());
+        assert_eq!(damaged(&f.input()), None);
+        // Cut off at the end, re-encoding: offer a remux instead.
+        f.p.damage = Some(Damage {
+            header_duration: 6000.0,
+            data_end: 5400.0,
+            ..Default::default()
+        });
+        let i = damaged(&f.input()).unwrap();
+        assert_eq!(i.severity, Severity::Warning);
+        assert_eq!(i.fix, Some(Fix::Codec(VideoCodec::Copy)));
+        assert!(
+            i.message
+                .starts_with("The file is incomplete: the data ends at 1:30:00 of 1:40:00")
+        );
+        // …and with Copy already chosen, nothing to fix.
+        f.s.codec = VideoCodec::Copy;
+        assert_eq!(damaged(&f.input()).unwrap().fix, None);
+        // Damage in the middle with Copy: re-encode to get rid of the broken frames.
+        f.p.damage = Some(Damage {
+            header_duration: 6000.0,
+            data_end: 6000.0,
+            holes: vec![1234.0],
+            errors: 2,
+            ..Default::default()
+        });
+        let i = damaged(&f.input()).unwrap();
+        assert_eq!(i.fix, Some(Fix::HevcTenBit));
+        assert!(i.message.contains("damaged around 20:34"), "{}", i.message);
+        // Re-encoding a damaged file: just the explanation.
+        f.s.codec = VideoCodec::Hevc;
+        let i = damaged(&f.input()).unwrap();
+        assert_eq!(i.fix, None);
+        assert!(i.message.contains("decoded in software"));
+        assert!(run(&f.input()).iter().any(|i| i.id == "damaged"));
+    }
+
+    #[test]
     fn bitrate_checks_use_the_encoded_picture() {
         let f = Fx::new(sdr_1080("h264", 20_000_000), EncodeSettings::default());
         let mut c = f.input();
@@ -1089,7 +1179,16 @@ mod tests {
     fn output_not_smaller_than_input() {
         // ~2.6 GB input, 4 GB target.
         let f = Fx::new(sdr_1080("h264", 3_000_000), EncodeSettings::default());
-        assert!(output_not_smaller(&f.input()).is_some());
+        let i = output_not_smaller(&f.input()).unwrap();
+        // Copy first; a target under the source as the alternative.
+        assert_eq!(i.fix, Some(Fix::Codec(VideoCodec::Copy)));
+        let Some(Fix::Target(gb)) = i.alt_fix else {
+            panic!("no smaller target: {:?}", i.alt_fix)
+        };
+        assert!(
+            gb >= 1.0 && gb * estimate::GB < f.p.size_bytes as f64,
+            "{gb}"
+        );
         let f = Fx::new(sdr_1080("h264", 30_000_000), EncodeSettings::default());
         assert!(output_not_smaller(&f.input()).is_none());
         // Quality mode uses the estimate.

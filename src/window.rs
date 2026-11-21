@@ -19,7 +19,7 @@ use crate::ffmpeg::runner;
 use crate::ffmpeg::runner::{Cancel, Helpers};
 use crate::ffmpeg::vmaf::VmafResult;
 use crate::presets;
-use crate::queue::{self, CropState, EstimateState, Event, Job, JobState, VmafState};
+use crate::queue::{self, CropState, EstimateState, Event, Job, JobState, MatchState, VmafState};
 use crate::settings::{EncodeSettings, Prefs, VideoCodec, cache_dir};
 use crate::subs::{self, ExternalSub, JobMode, SubsTarget};
 use crate::tracks::{self, PgsQuestion};
@@ -35,9 +35,14 @@ pub enum Msg {
     /// Probe result, plus the sidecar subtitle files found next to the video.
     Probed(u64, Result<Box<ProbeInfo>, String>, Vec<ExternalSub>),
     Analyzed(u64, Result<worker::Analysis, String>),
+    /// Damage check verdict (`Ok(None)`: the file is whole).
+    DamageChecked(u64, Result<Option<crate::damage::Damage>, String>),
     Estimate(u64, String, Result<SizeRange, String>),
     /// The estimate key the score was measured with, checked on arrival.
     Vmaf(u64, String, Result<VmafResult, String>),
+    /// "Match source quality" search: a step line, then the result with its match key.
+    MatchStep(u64, String),
+    Matched(u64, String, Result<crate::match_source::Found, String>),
     Progress(u64, Progress),
     Stage(u64, String),
     Finished(u64, Outcome),
@@ -105,7 +110,9 @@ pub struct State {
     est_cancel: HashMap<u64, Cancel>,
     est_cache: HashMap<String, SizeRange>,
     pub vmaf_cancel: Option<(u64, Cancel)>,
+    match_cancel: HashMap<u64, Cancel>,
     crop_cancel: HashMap<u64, Cancel>,
+    damage_cancel: HashMap<u64, Cancel>,
     /// Post-encode VMAF runs, which never hold up the queue.
     post_vmaf: HashMap<u64, Cancel>,
     pgs_session: HashMap<String, bool>,
@@ -169,6 +176,10 @@ impl State {
                 .and_then(|v| v.into_iter().next());
             return first.unwrap_or_else(|| job.input.clone());
         }
+        let plan = |j: &Job, taken: &[std::path::PathBuf]| match &j.output_override {
+            Some(p) => queue::override_path(p, &j.input, j.output_container(), taken),
+            None => queue::output_path_avoiding(&j.input, &self.prefs, j.output_container(), taken),
+        };
         let mut taken: Vec<std::path::PathBuf> =
             self.jobs.iter().map(|j| j.input.clone()).collect();
         for j in &self.jobs {
@@ -178,11 +189,9 @@ impl State {
             let written = matches!(j.state, JobState::Running | JobState::Done)
                 .then(|| j.output.clone())
                 .flatten();
-            taken.push(written.unwrap_or_else(|| {
-                queue::output_path_avoiding(&j.input, &self.prefs, j.output_container(), &taken)
-            }));
+            taken.push(written.unwrap_or_else(|| plan(j, &taken)));
         }
-        queue::output_path_avoiding(&job.input, &self.prefs, job.output_container(), &taken)
+        plan(job, &taken)
     }
 
     pub fn request(&self, job: &Job) -> Option<Request> {
@@ -564,7 +573,9 @@ pub fn build(app: &adw::Application, files: Vec<PathBuf>) {
             est_cancel: HashMap::new(),
             est_cache: HashMap::new(),
             vmaf_cancel: None,
+            match_cancel: HashMap::new(),
             crop_cancel: HashMap::new(),
+            damage_cancel: HashMap::new(),
             post_vmaf: HashMap::new(),
             pgs_session: HashMap::new(),
             pgs_batch: HashMap::new(),
@@ -1298,6 +1309,7 @@ impl App {
         {
             let mut st = self.state.borrow_mut();
             let dovi_tool = st.caps.as_ref().is_some_and(|c| c.dovi_tool);
+            let match_before = st.job(id).map(|j| st.match_key(j));
             let Some(j) = st.job_mut(id) else { return };
             if !j.state.editable() && j.state != JobState::Probing {
                 return;
@@ -1314,6 +1326,15 @@ impl App {
                 && let Some((_, c)) = st.vmaf_cancel.take()
             {
                 c.cancel();
+            }
+            // A quality search measured for other video settings is no use.
+            if st.job(id).map(|j| st.match_key(j)) != match_before
+                && let Some(c) = st.match_cancel.remove(&id)
+            {
+                c.cancel();
+                if let Some(j) = st.job_mut(id) {
+                    j.match_check = MatchState::None;
+                }
             }
         }
         self.changed(id);
@@ -1350,6 +1371,7 @@ impl App {
                 self.update_start();
                 self.run_next();
             }
+            Msg::DamageChecked(id, r) => self.on_damage(id, r),
             Msg::Estimate(id, key, r) => {
                 {
                     let mut st = self.state.borrow_mut();
@@ -1394,6 +1416,27 @@ impl App {
                     }
                 }
                 self.update_row(id);
+                self.refresh_editor(id);
+            }
+            Msg::MatchStep(id, line) => {
+                if let Some(j) = self.state.borrow_mut().job_mut(id)
+                    && matches!(j.match_check, MatchState::Running(_))
+                {
+                    j.match_check = MatchState::Running(line);
+                }
+                self.refresh_editor(id);
+            }
+            Msg::Matched(id, key, r) => {
+                {
+                    let mut st = self.state.borrow_mut();
+                    st.match_cancel.remove(&id);
+                    if let Some(j) = st.job_mut(id) {
+                        j.match_check = match r {
+                            Ok(f) => MatchState::Ready(key, f),
+                            Err(e) => MatchState::Failed(e),
+                        };
+                    }
+                }
                 self.refresh_editor(id);
             }
             Msg::Progress(id, p) => {
@@ -1583,6 +1626,8 @@ impl App {
             .borrow()
             .job(id)
             .is_some_and(|j| j.mode == JobMode::Encode);
+        // Every job reads the file, so every job gets the damage check.
+        self.check_damage(id);
         // Crop/interlace analysis and size estimates only matter for encodes.
         if encode {
             self.detect_crop(id);
@@ -1687,6 +1732,67 @@ impl App {
     }
 
     // ---- Background helpers ----
+
+    /// Read the whole file for missing or damaged data (container only).
+    fn check_damage(&self, id: u64) {
+        let (ffprobe, path, video, duration) = {
+            let mut st = self.state.borrow_mut();
+            let ffprobe = st.tools.ffprobe.clone();
+            let Some(j) = st.job_mut(id) else { return };
+            let Some(p) = &j.probe else { return };
+            let Some(v) = &p.video else { return };
+            let args = (p.path.clone(), v.index, p.duration);
+            j.damage_checking = true;
+            (ffprobe, args.0, args.1, args.2)
+        };
+        let cancel = Cancel::default();
+        self.state
+            .borrow_mut()
+            .damage_cancel
+            .insert(id, cancel.clone());
+        let tx = self.tx.clone();
+        let guard = self.helpers.enter();
+        std::thread::spawn(move || {
+            let _guard = guard;
+            let r = match runner::SCANS.acquire(Some(&cancel)) {
+                Some(_slot) => crate::damage::check(&ffprobe, &path, video, duration, &cancel),
+                None => Err("Cancelled".into()),
+            };
+            let _ = tx.send_blocking(Msg::DamageChecked(id, r));
+        });
+    }
+
+    fn on_damage(self: &Rc<Self>, id: u64, r: Result<Option<crate::damage::Damage>, String>) {
+        let found = {
+            let mut st = self.state.borrow_mut();
+            st.damage_cancel.remove(&id);
+            let Some(j) = st.job_mut(id) else { return };
+            j.damage_checking = false;
+            // A failed check (unreadable mid-way, cancelled) leaves the job as it was.
+            match (r, j.probe.as_mut()) {
+                (Ok(d), Some(p)) => {
+                    let found = d.as_ref().map(|d| (d.badge(), j.input.clone()));
+                    p.set_damage(d);
+                    found
+                }
+                _ => None,
+            }
+        };
+        if let Some((badge, path)) = found {
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            self.toast(&format!("{name}: {} file", badge.to_lowercase()));
+        }
+        // A shorter real length changes the bitrate maths and sample points.
+        self.schedule_estimate(id);
+        self.update_row(id);
+        self.refresh_editor(id);
+        self.update_start();
+        self.run_next();
+    }
 
     fn detect_crop(&self, id: u64) {
         let (tools, probe) = {
@@ -1836,6 +1942,55 @@ impl App {
         self.refresh_editor(id);
     }
 
+    /// Search for the target size that keeps the source's quality (VMAF).
+    pub fn start_match(self: &Rc<Self>, id: u64) {
+        let mut st = self.state.borrow_mut();
+        let Some(job) = st.job(id).cloned() else {
+            return;
+        };
+        let (Some(req), Some(kbps)) = (st.request(&job), st.match_estimate_kbps(&job)) else {
+            return;
+        };
+        let key = st.match_key(&job);
+        let cancel = Cancel::default();
+        if let Some(old) = st.match_cancel.insert(id, cancel.clone()) {
+            old.cancel();
+        }
+        let tools = st.tools.clone();
+        if let Some(j) = st.job_mut(id) {
+            j.match_check = MatchState::Running("Waiting for other checks to finish…".into());
+        }
+        drop(st);
+        let tx = self.tx.clone();
+        let guard = self.helpers.enter();
+        std::thread::spawn(move || {
+            let _guard = guard;
+            let r = match runner::HEAVY.acquire(Some(&cancel)) {
+                Some(_slot) => worker::match_quality(&tools, &req, kbps, &cancel, |line| {
+                    let _ = tx.send_blocking(Msg::MatchStep(id, line));
+                }),
+                None => Err("Cancelled".into()),
+            };
+            if !cancel.is_cancelled() {
+                let _ = tx.send_blocking(Msg::Matched(id, key, r));
+            }
+        });
+        self.refresh_editor(id);
+    }
+
+    pub fn cancel_match(self: &Rc<Self>, id: u64) {
+        {
+            let mut st = self.state.borrow_mut();
+            if let Some(c) = st.match_cancel.remove(&id) {
+                c.cancel();
+            }
+            if let Some(j) = st.job_mut(id) {
+                j.match_check = MatchState::None;
+            }
+        }
+        self.refresh_editor(id);
+    }
+
     pub fn cancel_vmaf(self: &Rc<Self>) {
         if let Some(id) = self.stop_vmaf() {
             self.update_row(id);
@@ -1860,6 +2015,7 @@ impl App {
     /// threads a moment to kill ffmpeg and delete sample files before exiting.
     fn cancel_background(&self) {
         self.flush_prefs();
+        crate::ui::tune::stop(None);
         {
             let mut guard = self.state.borrow_mut();
             let st = &mut *guard;
@@ -1867,7 +2023,9 @@ impl App {
                 .est_cancel
                 .values()
                 .chain(st.crop_cancel.values())
+                .chain(st.damage_cancel.values())
                 .chain(st.post_vmaf.values())
+                .chain(st.match_cancel.values())
             {
                 c.cancel();
             }
@@ -2177,6 +2335,7 @@ impl App {
             let tools = st.tools.clone();
             let cancel = Cancel::default();
             st.running = Some((id, cancel));
+            crate::ui::tune::stop(Some(id));
             let j = st.job_mut(id).expect("job exists");
             j.apply(Event::Start);
             j.progress = None;
@@ -2313,10 +2472,17 @@ impl App {
     }
 
     fn remove_job(self: &Rc<Self>, id: u64) {
+        crate::ui::tune::stop(Some(id));
         {
             let mut guard = self.state.borrow_mut();
             let st = &mut *guard;
-            for map in [&mut st.est_cancel, &mut st.crop_cancel, &mut st.post_vmaf] {
+            for map in [
+                &mut st.est_cancel,
+                &mut st.crop_cancel,
+                &mut st.damage_cancel,
+                &mut st.post_vmaf,
+                &mut st.match_cancel,
+            ] {
                 if let Some(c) = map.remove(&id) {
                     c.cancel();
                 }
@@ -2589,6 +2755,34 @@ impl App {
 }
 
 impl State {
+    /// What a "match source quality" result depends on: the file and the
+    /// video settings, not the target size (that's what it picks) or audio.
+    pub fn match_key(&self, j: &Job) -> String {
+        format!(
+            "{}|{}|{:?}|{:?}",
+            j.input.display(),
+            j.settings.video_cache_key(),
+            j.active_crop(),
+            j.scan_plan()
+        )
+    }
+
+    /// Instant "match source quality" video bitrate for this job.
+    pub fn match_estimate_kbps(&self, j: &Job) -> Option<u32> {
+        crate::match_source::estimate_kbps(j.probe.as_ref()?, &j.settings)
+    }
+
+    /// Target size (GB) that gives `kbps` of video with this job's kept tracks.
+    pub fn match_target_gb(&self, j: &Job, kbps: u32) -> Option<f64> {
+        let p = j.probe.as_ref()?;
+        Some(crate::match_source::target_gb(
+            kbps,
+            p.duration,
+            j.selection.audio_bytes(p),
+            j.selection.subtitle_bytes(p) + j.external_bytes(),
+        ))
+    }
+
     /// Cache key for sample estimates: file + video settings + the bitrate a
     /// target size resolves to (it depends on the kept audio) + crop + scan plan.
     pub fn estimate_key(&self, j: &Job) -> String {

@@ -15,8 +15,9 @@ use crate::ffmpeg::progress::Progress;
 use crate::ffmpeg::runner::{self, Cancel};
 use crate::ffmpeg::vmaf::{self, VmafResult};
 use crate::hdr;
+use crate::match_source;
 use crate::scan::{self, Scan, ScanType};
-use crate::settings::{Container, EncodeSettings, VideoCodec, cache_dir};
+use crate::settings::{Container, EncodeSettings, RateControl, SizeMode, VideoCodec, cache_dir};
 use crate::subs::{self, ExternalSub, JobMode, SubsTarget};
 use crate::tracks::Selection;
 
@@ -80,7 +81,8 @@ impl Request {
 
     pub fn first_decode(&self) -> DecodeMode {
         let v = self.probe.video.as_ref();
-        if self.scan.needs_cpu() {
+        // The software decoders hide damage; VA-API tends to fail on it.
+        if self.scan.needs_cpu() || self.probe.damage.is_some() {
             DecodeMode::Software
         } else if v.is_some_and(|v| checks::hw_decodable(&v.codec, &v.pix_fmt, v.bit_depth)) {
             DecodeMode::Hardware
@@ -130,7 +132,9 @@ fn run_with_fallback(
             update(Update::Stage(format!("Encoding · {}", decode.label())));
         }
         let r = runner::run_ffmpeg(&tools.ffmpeg, &args, cancel, |p| {
-            update(Update::Progress(p))
+            update(Update::Progress(
+                p.with_source_fps(req.probe.video.as_ref().map(|v| v.fps)),
+            ))
         });
         if r.cancelled {
             let _ = std::fs::remove_file(output);
@@ -597,7 +601,11 @@ fn extract_reference(
         &tools.ffmpeg,
         &subs::reference_args(&req.probe.path, r, &file),
         cancel,
-        |p| update(Update::Progress(p)),
+        |p| {
+            update(Update::Progress(
+                p.with_source_fps(req.probe.video.as_ref().map(|v| v.fps)),
+            ))
+        },
     );
     if res.cancelled {
         return Err(cancelled());
@@ -813,7 +821,9 @@ fn remux_fix(
         .into(),
     ));
     let r = runner::run_ffmpeg(&tools.ffmpeg, &args, cancel, |p| {
-        update(Update::Progress(p))
+        update(Update::Progress(
+            p.with_source_fps(req.probe.video.as_ref().map(|v| v.fps)),
+        ))
     });
     if r.cancelled {
         let _ = std::fs::remove_file(&part);
@@ -1139,7 +1149,11 @@ fn encode_dv(
         update(Update::Stage("Dolby Vision · muxing".into()));
         let mux = command::build_dv_mux(&req.job(&req.output, decode), &injected)
             .map_err(|e| fail(e, Vec::new()))?;
-        let r = runner::run_ffmpeg(&tools.ffmpeg, &mux, cancel, |p| update(Update::Progress(p)));
+        let r = runner::run_ffmpeg(&tools.ffmpeg, &mux, cancel, |p| {
+            update(Update::Progress(
+                p.with_source_fps(req.probe.video.as_ref().map(|v| v.fps)),
+            ))
+        });
         if r.cancelled {
             let _ = std::fs::remove_file(&req.output);
             return Err(Outcome {
@@ -1272,6 +1286,45 @@ fn threads() -> usize {
 
 /// Before encoding: encode the sample segments and score them against the source.
 pub fn vmaf_samples(tools: &Tools, req: &Request, cancel: &Cancel) -> Result<VmafResult, String> {
+    score_samples(tools, req, cancel)
+}
+
+/// Find the lowest target size whose sample encodes still score as
+/// transparent against the source (see `match_source::Search`). Each step
+/// re-encodes the samples at a bitrate and scores them; `on_step` gets a
+/// line for the UI.
+pub fn match_quality(
+    tools: &Tools,
+    req: &Request,
+    estimate_kbps: u32,
+    cancel: &Cancel,
+    mut on_step: impl FnMut(String),
+) -> Result<match_source::Found, String> {
+    let mut search = match_source::Search::new(estimate_kbps);
+    let mut req = Request {
+        settings: EncodeSettings {
+            size_mode: SizeMode::TargetSize,
+            rate_control: RateControl::Auto,
+            ..req.settings.clone()
+        },
+        ..req.clone()
+    };
+    while let Some(kbps) = search.next() {
+        on_step(format!(
+            "Trying {:.1} Mb/s (step {} of up to {})…",
+            kbps as f64 / 1000.0,
+            search.steps() + 1,
+            match_source::MAX_STEPS
+        ));
+        req.video_kbps = Some(kbps);
+        let r = score_samples(tools, &req, cancel)?;
+        search.record(kbps, r);
+    }
+    search.result().ok_or_else(|| "No VMAF scores".into())
+}
+
+/// Encode the sample segments with `req`'s settings and score them against the source.
+fn score_samples(tools: &Tools, req: &Request, cancel: &Cancel) -> Result<VmafResult, String> {
     let v = req.probe.video.as_ref().ok_or("No video")?;
     let job = req.job(Path::new("/dev/null"), req.first_decode());
     let samples = estimate::encode_samples(&tools.ffmpeg, &job, cancel, true)?;
@@ -1466,6 +1519,86 @@ mod media_tests {
 
     fn tools() -> Tools {
         Tools::default()
+    }
+
+    /// The damage check on real broken files, then a stream-copy encode and a
+    /// fix-tracks remux of each (no VA-API needed): both succeed, and the
+    /// remux's length check expects the cut-off length, not the header's.
+    #[test]
+    #[ignore]
+    fn damaged_files_are_found_and_still_remux() {
+        let t = tools();
+        let checked = |name: &str| {
+            let mut p = probe::run(&t.ffprobe, &media(name)).unwrap();
+            let v = p.video.as_ref().unwrap().index;
+            let d = crate::damage::check(&t.ffprobe, &p.path, v, p.duration, &Cancel::default())
+                .unwrap();
+            p.set_damage(d);
+            p
+        };
+        let cut = checked("damaged-truncated.mkv");
+        let d = cut.damage.clone().expect("cut-off file found");
+        assert!(d.truncated() && !d.mid_damage(), "{d:?}");
+        assert!(
+            (cut.duration - 21.0).abs() < 0.5,
+            "length is the data: {}",
+            cut.duration
+        );
+        let holes = checked("damaged-holes.mkv");
+        let d = holes.damage.clone().expect("holes found");
+        assert!(d.mid_damage() && !d.truncated(), "{d:?}");
+        assert_eq!(d.holes.len(), 2, "{d:?}");
+        let fast = checked("damaged-fast-trunc.mp4");
+        assert!(fast.damage.as_ref().is_some_and(|d| d.truncated()));
+        assert!(checked("sample.mkv").damage.is_none());
+        let err = probe::run(&t.ffprobe, &media("damaged-full-trunc.mp4")).unwrap_err();
+        assert!(err.starts_with("This MP4 is incomplete"), "{err}");
+
+        let dir = std::env::temp_dir().join(format!("encoder-damage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (n, p) in [&cut, &holes].into_iter().enumerate() {
+            let settings = EncodeSettings {
+                codec: VideoCodec::Copy,
+                ..Default::default()
+            };
+            let (sel, _, _) = auto_select(p, &["eng".into()], &settings);
+            let base = Request {
+                probe: p.clone(),
+                settings,
+                selection: sel,
+                output: dir.join(format!("copy{n}.mkv")),
+                device: "/dev/dri/renderD128".into(),
+                crop: None,
+                crop_on_gpu: false,
+                scan: Scan::Progressive,
+                video_kbps: None,
+                dv_preserve: false,
+                mkvpropedit: false,
+                externals: Vec::new(),
+                mode: JobMode::Encode,
+                alass: None,
+                cover: Default::default(),
+                covers: Vec::new(),
+            };
+            let o = encode(&t, &base, &Cancel::default(), |_| {});
+            assert!(o.success, "copy {n}: {:?} {:?}", o.error, o.stderr_tail);
+            let out = probe::run(&t.ffprobe, &base.output).unwrap();
+            assert!(
+                (out.duration - p.duration).abs() < 1.0,
+                "{} vs {}",
+                out.duration,
+                p.duration
+            );
+            let fix = Request {
+                output: dir.join(format!("fix{n}.mkv")),
+                externals: vec![ExternalSub::from_path(&p.path, media("eng.srt"), false)],
+                mode: JobMode::Fix(SubsTarget::NewFile),
+                ..base
+            };
+            let o = encode(&t, &fix, &Cancel::default(), |_| {});
+            assert!(o.success, "fix {n}: {:?} {:?}", o.error, o.stderr_tail);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
