@@ -1,6 +1,8 @@
 # encodeR
 
-A small GNOME app (Rust, GTK 4, libadwaita) that turns big video files, typically 10–20 GB 4K/1080p MKVs, into 2–5 GB library copies. It encodes on the GPU through VA-API (developed on AMD RDNA4, see [Hardware support](#hardware-support)), and the output is tuned to **direct-play on an Apple TV 4K** streaming from a NAS through Plex.
+A small GNOME app (Rust, GTK 4, libadwaita) that re-encodes video on the GPU through VA-API (developed on AMD RDNA4, see [Hardware support](#hardware-support)). It takes whatever ffmpeg can read and writes H.264, HEVC or AV1 (8- or 10-bit) to MKV or MP4. You can also remux without re-encoding. You choose a target size or a constant quality, and which audio and subtitle tracks to keep, copy or convert.
+
+It's built to make one job easy: turning big files, typically 10–20 GB 4K/1080p MKVs, into 2–5 GB library copies. The defaults also make the output **direct-play on an Apple TV 4K through Plex**: audio Apple TV can't play is converted, SRT subtitles are preferred over PGS, and HEVC is the default codec. These are defaults, not limits: the audio conversion has its own switch, and you can change the codec or the track picks per job.
 
 App ID: `no.oyzmo.EncodeR` · Version: see `Cargo.toml` (shown in the header bar).
 
@@ -170,8 +172,6 @@ scripts/install.sh --native            # ~/.local/bin + desktop entry + icon
 scripts/install.sh --make-flatpak      # → flatpak/no.oyzmo.EncodeR-<version>.flatpak (not installed)
 scripts/install.sh --install-flatpak   # install that bundle for this user
 scripts/install.sh --uninstall         # removes the native install and the user Flatpak
-scripts/bump.sh patch|minor   # version lives only in Cargo.toml
-scripts/deploy-github.sh [--dry-run] [--release]   # publish a clean snapshot of main to GitHub; --release tags a source-only release
 ```
 
 The Flatpak (`build-aux/flatpak/no.oyzmo.EncodeR.yml`, GNOME 50 runtime) bundles its own ffmpeg 8.1.3 with VA-API and libvmaf, plus `dovi_tool` 2.3.4. The GPU driver comes from the runtime's GL extension, so the startup check shows whether hardware encoding works inside the sandbox. It has `--filesystem=host` so outputs can be written next to the inputs. It also bundles alass (the official static build, pinned by checksum) for subtitle syncing. `mkvpropedit` isn't included, so the MKV HDR repair is unavailable there. HEVC and AV1 keep HDR10 metadata on their own, and if they ever don't, the post-encode check reports it. Run `scripts/hw-verify.sh --flatpak` to run the hardware tests through the installed Flatpak. That run (0.1.5) matched the native results for HEVC, AV1 and H.264, size estimates, HDR10 and CPU deinterlacing. It also showed the bundled ffmpeg needs `--enable-gpl` for `cropdetect`. 0.1.6 adds that, and with it the Flatpak passes every test: detection, deinterlacing and inverse telecine are all correct, and 4K encodes of the heavy H.264 test clip ran about 1.4–1.9× faster than native. Building needs network access (Flathub runtimes, ffmpeg/libvmaf sources, crates.io); `flatpak-builder` is installed from Flathub when it's missing. Installing the Flatpak removes a native install, because its desktop entry would hide the Flatpak's.
