@@ -41,8 +41,12 @@ pub const CROP_GPU: &str = "The crop runs on the GPU, so it costs no speed.";
 pub const CROP_CPU: &str = "Your driver can't crop on the GPU, so frames make a round trip through system memory. Expect roughly 20–40% slower encoding.";
 pub const CROP_DV: &str =
     "Cropping is turned off for this job: the Dolby Vision metadata describes the full frame.";
+pub const CROP_HDR10PLUS: &str =
+    "Cropping is turned off for this job: the HDR10+ metadata describes the full frame.";
 
-pub const DV_PRESERVE: &str = "Experimental. Extracts the Dolby Vision metadata (RPU) with dovi_tool, re-encodes the video, injects the RPU back and checks the result. Profile 7 is converted to 8.1, which Apple TV plays. Needs HEVC and no scaling.";
+pub const DV_PRESERVE: &str = "Experimental. Extracts the Dolby Vision metadata (RPU) with dovi_tool, re-encodes the video, injects the RPU back and checks the result. Profile 7 is converted to 8.1, which Apple TV plays. Needs HEVC and no scaling. B-frames are turned off for this job so the raw stream can be muxed; that only matters if you set B-frames in Advanced (the AMD encoder doesn't use them by default).";
+pub const HDR10PLUS_PRESERVE: &str = "Experimental. HDR10+ adds scene-by-scene brightness hints that help TVs dimmer than the film's mastering display; without it the TV uses the static HDR10 values, which still look right. The hardware encoder can't write HDR10+, so this extracts it with hdr10plus_tool, re-encodes the video, injects it back and checks the result. Needs HEVC 10-bit and no scaling. B-frames are turned off for this job; that only matters if you set them in Advanced (the AMD encoder doesn't use them by default). Only TVs that support HDR10+ (e.g. Samsung, Panasonic, some Philips and TCL) use it.";
+pub const HDR10PLUS_MISSING: &str = "Install hdr10plus_tool to keep HDR10+. It is not packaged for Fedora; get it from https://github.com/quietvoid/hdr10plus_tool/releases and put it on your PATH. Without it the output keeps static HDR10, which every HDR TV plays.";
 pub const DV_MISSING: &str = "Install dovi_tool to keep Dolby Vision. It is not packaged for Fedora; get it from https://github.com/quietvoid/dovi_tool/releases and put it on your PATH.";
 
 pub const MATCH_SOURCE: &str = "The target size that keeps about the source's quality. The first number is a quick estimate: the source's video bitrate times how many more bits the chosen codec needs than the source's (AV1 → HEVC about 1.5×, H.264 → HEVC about 0.75×). Check measures it instead. Use sets the target.";

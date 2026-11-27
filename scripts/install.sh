@@ -4,6 +4,7 @@
 #   --uninstall        remove the native install and the user Flatpak
 #   --make-flatpak     build flatpak/no.oyzmo.EncodeR-<version>.flatpak (does not install)
 #   --install-flatpak  install that bundle for this user (makes it first if needed)
+#   --hdr-tools        install dovi_tool and hdr10plus_tool to ~/.local/bin (native install)
 set -euo pipefail
 SELF="$(realpath "$0")"
 cd "$(dirname "$0")/.."
@@ -84,6 +85,49 @@ install_native() {
     if flatpak_installed; then
         echo "note: the Flatpak is installed too; this native entry hides it in the app grid."
     fi
+    local missing
+    missing=$(missing_hdr_tools | paste -sd ' ' -)
+    if [ -n "$missing" ]; then
+        echo "note: $missing not found; Keep Dolby Vision / Keep HDR10+ need them."
+        echo "      Install with: scripts/install.sh --hdr-tools (menu item 5)"
+    fi
+}
+
+# Release builds for the experimental Dolby Vision / HDR10+ paths, pinned by
+# checksum (the Flatpak builds the same versions from source). Neither is
+# packaged for Fedora.
+HDR_TOOLS=(
+    "dovi_tool 2.3.4 https://github.com/quietvoid/dovi_tool/releases/download/2.3.4/dovi_tool-2.3.4-x86_64-unknown-linux-musl.tar.gz 1844258e13c26607b32224bf1fa82b595d3b35949f5467405fda560daad32b3f"
+    "hdr10plus_tool 1.7.2 https://github.com/quietvoid/hdr10plus_tool/releases/download/1.7.2/hdr10plus_tool-1.7.2-x86_64-unknown-linux-musl.tar.gz 06385f37a639d61ba21d4be3150c863846933bc3b58110e094d8fc8f1c2249f2"
+)
+
+missing_hdr_tools() {
+    local t
+    for t in "${HDR_TOOLS[@]}"; do
+        set -- $t
+        command -v "$1" >/dev/null || echo "$1"
+    done
+}
+
+install_hdr_tools() {
+    [ "$(uname -m)" = x86_64 ] || { echo "error: the pinned builds are for x86_64; install dovi_tool and hdr10plus_tool yourself" >&2; exit 1; }
+    local tmp t name ver url sum
+    tmp=$(mktemp -d)
+    trap "rm -rf '$tmp'" EXIT
+    for t in "${HDR_TOOLS[@]}"; do
+        read -r name ver url sum <<<"$t"
+        echo "Downloading $name $ver…"
+        curl -fsSL -o "$tmp/$name.tar.gz" "$url"
+        if ! echo "$sum  $tmp/$name.tar.gz" | sha256sum -c --status; then
+            echo "error: $name download doesn't match the pinned checksum; not installed" >&2
+            exit 1
+        fi
+        tar xzf "$tmp/$name.tar.gz" -C "$tmp" "./$name" 2>/dev/null || tar xzf "$tmp/$name.tar.gz" -C "$tmp" "$name"
+        install -Dm755 "$tmp/$name" "$BIN/$name"
+        echo "Installed $("$BIN/$name" --version) to $BIN"
+    done
+    case ":$PATH:" in *":$BIN:"*) ;; *) echo "note: $BIN is not on your PATH; encodeR won't find the tools until it is." ;; esac
+    echo "Restart encodeR to pick them up."
 }
 
 uninstall() {
@@ -97,7 +141,7 @@ uninstall() {
 
 # Everything the build needs is fetched automatically: flatpak-builder (from
 # Flathub if it isn't installed), the GNOME SDK and Rust extension, and the
-# ffmpeg, libvmaf, dovi_tool and crate sources.
+# ffmpeg, libvmaf, dovi_tool, hdr10plus_tool and crate sources.
 make_flatpak() {
     command -v flatpak >/dev/null || { echo "error: flatpak is missing: sudo dnf install flatpak" >&2; exit 1; }
     flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
@@ -209,6 +253,7 @@ menu() {
         echo "  2) Uninstall"
         echo "  3) Make flatpak"
         echo "  4) Install flatpak"
+        echo "  5) Install dovi_tool + hdr10plus_tool (for the native install)"
         if is_author; then
             bold "── Release (in this order) ──────────────"
             echo " 11) Bump version (commits)"
@@ -226,6 +271,7 @@ menu() {
             2) run_step --uninstall ;;
             3) run_step --make-flatpak ;;
             4) run_step --install-flatpak ;;
+            5) run_step --hdr-tools ;;
             9) if is_author; then run_step --release-github; else echo "Unknown choice."; fi ;;
             10) if is_author; then run_step --update-github; else echo "Unknown choice."; fi ;;
             11) if is_author; then run_step --bump; else echo "Unknown choice."; fi ;;
@@ -241,13 +287,14 @@ case "${1:-}" in
     --uninstall) uninstall ;;
     --make-flatpak) make_flatpak ;;
     --install-flatpak) install_flatpak ;;
+    --hdr-tools) install_hdr_tools ;;
     --bump) bump_version ;;
     --release-github) release_github ;;
     --full-release) full_release ;;
     --update-github) update_github ;;
     "")
         if [ -t 0 ]; then menu
-        else sed -n '2,6p' "$SELF" | sed 's/^# \{0,1\}//'; exit 1; fi
+        else sed -n '2,7p' "$SELF" | sed 's/^# \{0,1\}//'; exit 1; fi
         ;;
-    *) sed -n '2,6p' "$SELF" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *) sed -n '2,7p' "$SELF" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

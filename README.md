@@ -99,7 +99,14 @@ Colour tags are passed through. After each encode the output is probed to check 
 <details>
 <summary><b>Dolby Vision (experimental):</b> Keeps Dolby Vision when dovi_tool is installed, and warns that it's removed when it isn't.</summary>
 
-With `dovi_tool` on `PATH` the pipeline is: extract the RPU (profile 7 → 8.1), encode to raw HEVC, check frame counts, inject the RPU, mux, and verify the DV profile. Without `dovi_tool`, DV is removed and the app warns you.
+With `dovi_tool` on `PATH` the pipeline is: extract the RPU (profile 7 → 8.1) and check it covers the source's frames, encode to raw HEVC, check frame counts, inject the RPU, mux, and verify the DV profile and every frame's metadata in the output. Without `dovi_tool`, DV is removed and the app warns you.
+
+</details>
+
+<details>
+<summary><b>HDR10+ (experimental):</b> Keeps HDR10+ when hdr10plus_tool is installed, and warns that it's removed when it isn't.</summary>
+
+The hardware encoders write static HDR10 metadata but not HDR10+'s per-frame (SMPTE ST 2094-40) metadata, so a plain re-encode keeps HDR10 and drops HDR10+. With [`hdr10plus_tool`](https://github.com/quietvoid/hdr10plus_tool/releases) on `PATH` (`scripts/install.sh --hdr-tools` installs it and `dovi_tool` for a native install; the Flatpak bundles both), *Keep HDR10+* runs the same kind of pipeline as Dolby Vision: extract the metadata to JSON and check it covers the source's frames, encode to raw HEVC, check frame counts, inject, mux, and read the output back to check every frame carries HDR10+. A source with both Dolby Vision and HDR10+ keeps both, with one read of the source for both extractions. It needs HEVC 10-bit without downscaling and without double-rate deinterlacing or inverse telecine (they change the frame count), and turns cropping off. The raw stream in these pipelines is encoded without B-frames, because ffmpeg can't timestamp reordered frames in raw HEVC when muxing. On the RX 9070 this costs nothing: `hevc_vaapi` doesn't use B-frames by default (`has_b_frames=0` in `hw-verify.sh`, 0.15.1). It only overrides a B-frames value set in Advanced.
 
 </details>
 
@@ -141,7 +148,7 @@ Container, duration, size and bitrate; the video's codec, resolution, frame rate
 <details>
 <summary><b>Startup check:</b> Tests what your GPU and ffmpeg can actually do and turns off whatever fails.</summary>
 
-A test encode per codec, the 10-bit profiles, each rate-control mode, cropping on the GPU, plus libvmaf, dovi_tool, mkvpropedit and alass. Codecs that fail are disabled and say why.
+A test encode per codec, the 10-bit profiles, each rate-control mode, cropping on the GPU, plus libvmaf, dovi_tool, hdr10plus_tool, mkvpropedit and alass. Codecs that fail are disabled and say why.
 
 </details>
 
@@ -154,7 +161,7 @@ git clone https://github.com/oyzmo/encodeR.git && cd encodeR
 scripts/install.sh            # menu: 4) Install flatpak is the easiest
 ```
 
-**Flatpak (recommended).** `scripts/install.sh --install-flatpak` fetches everything it needs by itself: `flatpak-builder` (from Flathub if it isn't installed), the GNOME SDK, the Rust toolchain and the ffmpeg, libvmaf and dovi_tool sources and the alass binary. It then builds and installs the app for your user. You only need `flatpak` and an internet connection. The first build compiles ffmpeg, so it takes a while and a few GB of disk; later builds are much faster.
+**Flatpak (recommended).** `scripts/install.sh --install-flatpak` fetches everything it needs by itself: `flatpak-builder` (from Flathub if it isn't installed), the GNOME SDK, the Rust toolchain and the ffmpeg, libvmaf, dovi_tool and hdr10plus_tool sources and the alass binary. It then builds and installs the app for your user. You only need `flatpak` and an internet connection. The first build compiles ffmpeg, so it takes a while and a few GB of disk; later builds are much faster.
 
 **Native.** `scripts/install.sh --native` builds with your system's Rust and installs to `~/.local`. It uses your system ffmpeg, which on Fedora must be the RPM Fusion build (see below).
 
@@ -174,7 +181,7 @@ scripts/install.sh --install-flatpak   # install that bundle for this user
 scripts/install.sh --uninstall         # removes the native install and the user Flatpak
 ```
 
-The Flatpak (`build-aux/flatpak/no.oyzmo.EncodeR.yml`, GNOME 50 runtime) bundles its own ffmpeg 8.1.3 with VA-API and libvmaf, plus `dovi_tool` 2.3.4. The GPU driver comes from the runtime's GL extension, so the startup check shows whether hardware encoding works inside the sandbox. It has `--filesystem=host` so outputs can be written next to the inputs. It also bundles alass (the official static build, pinned by checksum) for subtitle syncing. `mkvpropedit` isn't included, so the MKV HDR repair is unavailable there. HEVC and AV1 keep HDR10 metadata on their own, and if they ever don't, the post-encode check reports it. Run `scripts/hw-verify.sh --flatpak` to run the hardware tests through the installed Flatpak. That run (0.1.5) matched the native results for HEVC, AV1 and H.264, size estimates, HDR10 and CPU deinterlacing. It also showed the bundled ffmpeg needs `--enable-gpl` for `cropdetect`. 0.1.6 adds that, and with it the Flatpak passes every test: detection, deinterlacing and inverse telecine are all correct, and 4K encodes of the heavy H.264 test clip ran about 1.4–1.9× faster than native. Building needs network access (Flathub runtimes, ffmpeg/libvmaf sources, crates.io); `flatpak-builder` is installed from Flathub when it's missing. Installing the Flatpak removes a native install, because its desktop entry would hide the Flatpak's.
+The Flatpak (`build-aux/flatpak/no.oyzmo.EncodeR.yml`, GNOME 50 runtime) bundles its own ffmpeg 8.1.3 with VA-API and libvmaf, plus `dovi_tool` 2.3.4 and `hdr10plus_tool` 1.7.2. The GPU driver comes from the runtime's GL extension, so the startup check shows whether hardware encoding works inside the sandbox. It has `--filesystem=host` so outputs can be written next to the inputs. It also bundles alass (the official static build, pinned by checksum) for subtitle syncing. `mkvpropedit` isn't included, so the MKV HDR repair is unavailable there. HEVC and AV1 keep HDR10 metadata on their own, and if they ever don't, the post-encode check reports it. Run `scripts/hw-verify.sh --flatpak` to run the hardware tests through the installed Flatpak. That run (0.1.5) matched the native results for HEVC, AV1 and H.264, size estimates, HDR10 and CPU deinterlacing. It also showed the bundled ffmpeg needs `--enable-gpl` for `cropdetect`. 0.1.6 adds that, and with it the Flatpak passes every test: detection, deinterlacing and inverse telecine are all correct, and 4K encodes of the heavy H.264 test clip ran about 1.4–1.9× faster than native. Building needs network access (Flathub runtimes, ffmpeg/libvmaf sources, crates.io); `flatpak-builder` is installed from Flathub when it's missing. Installing the Flatpak removes a native install, because its desktop entry would hide the Flatpak's.
 
 Settings, the last-used options and user presets are stored in `$XDG_CONFIG_HOME/encoder/config.json`.
 
@@ -183,6 +190,7 @@ Headless modes, useful for checking a machine:
 ```sh
 encoder --print-command FILE [--preset NAME] [--out DIR]   # the exact ffmpeg argv
 encoder --encode FILE [--preset NAME] [--out DIR]          # run it, report estimate vs actual, HDR check
+# add --keep-dv / --keep-hdr10plus to either for the experimental metadata pipelines
 encoder --match FILE [--preset NAME]                       # "match source quality": estimate, then the VMAF search
 ```
 
@@ -196,7 +204,7 @@ cargo clippy --all-targets -- -D warnings && cargo fmt --check
 scripts/hw-verify.sh [SDR_CLIP] [HDR10_CLIP]   # on the machine with the AMD GPU
 ```
 
-`scripts/hw-verify.sh` encodes with HEVC (target size and CQ), H.264 1080p, AV1 (CQ and target size) and checks HDR10 metadata before and after with `ffprobe -show_frames -read_intervals %+#1`. Everything goes through the app's own `--encode` path. It writes a report to `/tmp/encoder-hw.*/report.txt`. Set `DV_CLIP=…` to also test Dolby Vision when `dovi_tool` is installed.
+`scripts/hw-verify.sh` encodes with HEVC (target size and CQ), H.264 1080p, AV1 (CQ and target size) and checks HDR10 metadata before and after with `ffprobe -show_frames -read_intervals %+#1`. Everything goes through the app's own `--encode` path. It writes a report to `/tmp/encoder-hw.*/report.txt`. Set `DV_CLIP=…` to also test Dolby Vision when `dovi_tool` is installed. It reports whether `hevc_vaapi` emits B-frames on your GPU. With `hdr10plus_tool` installed it also runs a synthetic HDR10+ clip (made with libx265, or `HDR10P_CLIP=…`) through the HDR10+ pipeline and checks the output still has HDR10+.
 
 ## Verified on hardware (RX 9070, Mesa 26.2.5, ffmpeg 8.1.3, 2026-10-25)
 

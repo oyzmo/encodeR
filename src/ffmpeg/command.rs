@@ -618,9 +618,9 @@ pub fn build(job: &EncodeJob) -> Result<Vec<OsString>, String> {
     Ok(a.0)
 }
 
-/// Dolby Vision mux step: video from the RPU-injected raw HEVC (input 1),
-/// everything else from the source (input 0).
-pub fn build_dv_mux(job: &EncodeJob, raw_video: &Path) -> Result<Vec<OsString>, String> {
+/// Mux step of the metadata-injection pipelines (Dolby Vision, HDR10+): video
+/// from the injected raw HEVC, everything else from the source (input 0).
+pub fn build_raw_mux(job: &EncodeJob, raw_video: &Path) -> Result<Vec<OsString>, String> {
     let fps = job
         .probe
         .video
@@ -1458,7 +1458,7 @@ mod tests {
         assert!(has(&a, &["-f", "hevc", "/tmp/v.hevc"]));
         let final_out = Path::new("/out/x.mkv");
         let mux_job = EncodeJob::new(&p, &s, &sel, final_out, "/d");
-        let m: Vec<String> = build_dv_mux(&mux_job, Path::new("/tmp/v_dv.hevc"))
+        let m: Vec<String> = build_raw_mux(&mux_job, Path::new("/tmp/v_dv.hevc"))
             .unwrap()
             .into_iter()
             .map(|x| x.into_string().unwrap())
@@ -1557,7 +1557,7 @@ mod tests {
         };
         let (sel, _, _) = auto_select(&p, &langs(), &s);
         let job = EncodeJob::new(&p, &s, &sel, Path::new("/out/x.mkv"), "/d");
-        let m: Vec<String> = build_dv_mux(&job, Path::new("/tmp/v_dv.hevc"))
+        let m: Vec<String> = build_raw_mux(&job, Path::new("/tmp/v_dv.hevc"))
             .unwrap()
             .into_iter()
             .map(|x| x.into_string().unwrap())
@@ -1697,7 +1697,7 @@ mod tests {
         let externals = vec![ext("/s/F.no.srt", Some("nor"), ExtKind::Full)];
         let mut job = EncodeJob::new(&p, &s, &sel, Path::new("/out/x.mkv"), "/d");
         job.externals = &externals;
-        let m = strings(build_dv_mux(&job, Path::new("/tmp/v_dv.hevc")).unwrap());
+        let m = strings(build_raw_mux(&job, Path::new("/tmp/v_dv.hevc")).unwrap());
         // Source = 0, subtitle = 1, raw video = 2.
         assert!(has(&m, &["-i", "/s/F.no.srt", "-fflags", "+genpts"]));
         assert!(has(&m, &["-map", "2:v:0"]));
@@ -2021,7 +2021,7 @@ mod tests {
         assert!(has(&a, &["-map", "2:4", "-map", "2:2"]));
 
         // Dolby Vision mux: the raw stream comes after the shifted input.
-        let m = strings(build_dv_mux(&job, Path::new("/tmp/v_dv.hevc")).unwrap());
+        let m = strings(build_raw_mux(&job, Path::new("/tmp/v_dv.hevc")).unwrap());
         assert!(has(&m, &["-map", "3:v:0", "-map", "2:4"]));
         assert!(has(&m, &["-itsoffset", "0.300", "-i", &src, "-fflags"]));
 

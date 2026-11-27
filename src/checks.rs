@@ -108,6 +108,9 @@ pub struct CheckInput<'a> {
     pub estimate: Option<SizeRange>,
     pub vmaf: Option<f64>,
     pub dv_preserve: bool,
+    pub hdr10plus_preserve: bool,
+    /// Why *Keep HDR10+* is unavailable for this job, if it is.
+    pub hdr10plus_blocked: Option<&'static str>,
     pub crop: bool,
     /// The crop that will be applied, for the output size.
     pub active_crop: Option<crate::crop::Crop>,
@@ -528,7 +531,7 @@ pub fn dolby_vision(c: &CheckInput) -> Vec<Issue> {
         return v;
     }
     if c.dv_preserve {
-        v.extend(issue("dvexp", Severity::Info, "Dolby Vision preservation is experimental. The output's DV profile is checked after muxing.", None));
+        v.extend(issue("dvexp", Severity::Info, "Dolby Vision preservation is experimental. After muxing, the output's DV profile and every frame's metadata are checked.", None));
         if c.crop {
             v.extend(issue("dvcrop", Severity::Info, "Cropping is turned off for this job because the Dolby Vision metadata describes the full frame.", None));
         }
@@ -542,23 +545,34 @@ pub fn dolby_vision(c: &CheckInput) -> Vec<Issue> {
     } else {
         v.extend(issue("dv", Severity::Strong, "Dolby Vision will be removed; the output will be HDR10. Apple TV will still play it in HDR10.", None));
     }
-    if c.probe.hdr.hdr10plus {
-        v.extend(issue(
-            "hdr10plus",
-            Severity::Warning,
-            "HDR10+ dynamic metadata will be lost; static HDR10 remains.",
-            None,
-        ));
-    }
     v
 }
 
 pub fn hdr10plus(c: &CheckInput) -> Option<Issue> {
-    (c.encoding() && c.probe.hdr.hdr10plus && c.probe.hdr.dovi.is_none()).then_some(())?;
+    (c.encoding() && c.probe.hdr.hdr10plus).then_some(())?;
+    if c.hdr10plus_preserve {
+        let crop = if c.crop {
+            " Cropping is turned off for this job because the HDR10+ metadata describes the full frame."
+        } else {
+            ""
+        };
+        return issue(
+            "hdr10plusexp",
+            Severity::Info,
+            format!(
+                "HDR10+ preservation is experimental. After muxing, every frame of the output is checked for HDR10+.{crop}"
+            ),
+            None,
+        );
+    }
+    let how = match c.hdr10plus_blocked {
+        Some(why) => format!("Keep HDR10+ isn't available: {why}."),
+        None => "Turn on Keep HDR10+ to keep it.".into(),
+    };
     issue(
         "hdr10plus",
         Severity::Warning,
-        "HDR10+ dynamic metadata will be lost; static HDR10 remains.",
+        format!("HDR10+ dynamic metadata will be lost; static HDR10 remains. {how}"),
         None,
     )
 }
@@ -1005,6 +1019,8 @@ mod tests {
                 estimate: None,
                 vmaf: None,
                 dv_preserve: false,
+                hdr10plus_preserve: false,
+                hdr10plus_blocked: None,
                 crop: false,
                 active_crop: None,
                 encoder_limits: None,
@@ -1348,6 +1364,40 @@ mod tests {
         p5.hdr.dovi.as_mut().unwrap().profile = 5;
         let f5 = Fx::new(p5, EncodeSettings::default());
         assert_eq!(ids(&dolby_vision(&f5.input())), vec!["dv5"]);
+    }
+
+    #[test]
+    fn hdr10plus_warning_and_preservation() {
+        let mut p = sample_4k();
+        p.hdr.hdr10plus = true;
+        let f = Fx::new(p.clone(), EncodeSettings::default());
+        let mut c = f.input();
+        let w = hdr10plus(&c).unwrap();
+        assert_eq!((w.id, w.severity), ("hdr10plus", Severity::Warning));
+        assert!(w.message.ends_with("Turn on Keep HDR10+ to keep it."));
+        c.hdr10plus_blocked = Some("hdr10plus_tool is not installed");
+        assert!(
+            hdr10plus(&c)
+                .unwrap()
+                .message
+                .ends_with("isn't available: hdr10plus_tool is not installed.")
+        );
+        c.hdr10plus_blocked = None;
+        // Alongside Dolby Vision the HDR10+ warning still appears, once.
+        assert_eq!(ids(&dolby_vision(&c)), vec!["dv"]);
+        c.hdr10plus_preserve = true;
+        let i = hdr10plus(&c).unwrap();
+        assert_eq!((i.id, i.severity), ("hdr10plusexp", Severity::Info));
+        assert!(!i.message.contains("Cropping"));
+        c.crop = true;
+        assert!(hdr10plus(&c).unwrap().message.contains("Cropping"));
+        let copy = EncodeSettings {
+            codec: VideoCodec::Copy,
+            ..Default::default()
+        };
+        assert!(hdr10plus(&Fx::new(p, copy).input()).is_none());
+        let plain = Fx::new(sample_4k(), EncodeSettings::default());
+        assert!(hdr10plus(&plain.input()).is_none());
     }
 
     #[test]

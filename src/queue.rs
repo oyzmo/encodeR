@@ -121,6 +121,7 @@ pub struct Job {
     pub crop: CropState,
     pub crop_enabled: bool,
     pub dv_preserve: bool,
+    pub hdr10plus_preserve: bool,
     /// From idet analysis; `None` until analysed or when inconclusive.
     pub scan_detected: Option<ScanType>,
     pub scan_override: ScanOverride,
@@ -173,6 +174,7 @@ impl Job {
             crop: CropState::Unknown,
             crop_enabled: false,
             dv_preserve: false,
+            hdr10plus_preserve: false,
             scan_detected: None,
             scan_override: ScanOverride::Auto,
             damage_checking: false,
@@ -254,20 +256,42 @@ impl Job {
         )
     }
 
+    /// What the metadata-injection pipelines need to know about this job.
+    fn inject_job(&self) -> Option<crate::hdr::InjectJob> {
+        let p = self.probe.as_ref()?;
+        Some(crate::hdr::InjectJob::new(
+            &self.settings,
+            p,
+            self.scan_plan(),
+        ))
+    }
+
     /// Why Dolby Vision can't be kept with the current settings, if it can't.
     pub fn dv_blocker(&self, dovi_tool: bool) -> Option<&'static str> {
-        let p = self.probe.as_ref()?;
-        let v = p.video.as_ref()?;
-        crate::hdr::dv_blocker(
-            p.hdr.dovi,
-            self.settings.codec == crate::settings::VideoCodec::Hevc,
-            self.settings.output_ten_bit(),
-            self.settings
-                .downscale
-                .height()
-                .is_some_and(|h| h < v.height),
-            dovi_tool,
-        )
+        crate::hdr::dv_blocker(self.probe.as_ref()?.hdr.dovi, self.inject_job()?, dovi_tool)
+    }
+
+    /// Why HDR10+ can't be kept with the current settings, if it can't.
+    pub fn hdr10plus_blocker(&self, tool: bool) -> Option<&'static str> {
+        crate::hdr::hdr10plus_blocker(self.probe.as_ref()?.hdr.hdr10plus, self.inject_job()?, tool)
+    }
+
+    /// Turns off Dolby Vision / HDR10+ preservation that the current settings
+    /// rule out (AV1, downscaling, a scan plan that changes the frame count).
+    /// A flag left on would send the job down a pipeline that can only fail,
+    /// and would keep crop off.
+    pub fn drop_blocked_metadata(&mut self, dovi_tool: bool, hdr10plus_tool: bool) {
+        if self.dv_preserve && self.dv_blocker(dovi_tool).is_some() {
+            self.dv_preserve = false;
+        }
+        if self.hdr10plus_preserve && self.hdr10plus_blocker(hdr10plus_tool).is_some() {
+            self.hdr10plus_preserve = false;
+        }
+    }
+
+    /// Per-frame metadata will be injected, so the frame must stay uncropped.
+    pub fn injects_metadata(&self) -> bool {
+        self.dv_preserve || self.hdr10plus_preserve
     }
 
     /// After external subtitles change: an SRT replaces the embedded PGS of
@@ -330,7 +354,7 @@ impl Job {
 
     /// The crop that will actually be applied.
     pub fn active_crop(&self) -> Option<Crop> {
-        match (&self.crop, self.crop_enabled && !self.dv_preserve) {
+        match (&self.crop, self.crop_enabled && !self.injects_metadata()) {
             (CropState::Found(c), true) => Some(*c),
             _ => None,
         }

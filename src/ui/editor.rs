@@ -811,6 +811,27 @@ impl Editor {
                 });
                 pic.add(&dv);
             }
+            if probe.hdr.hdr10plus {
+                let has_tool = caps.as_ref().is_some_and(|c| c.hdr10plus_tool);
+                let blocker = job.hdr10plus_blocker(has_tool);
+                let row = switch_row(
+                    "Keep HDR10+",
+                    blocker.unwrap_or("Experimental · scene-by-scene HDR metadata"),
+                    if has_tool {
+                        help::HDR10PLUS_PRESERVE
+                    } else {
+                        help::HDR10PLUS_MISSING
+                    },
+                    job.hdr10plus_preserve && blocker.is_none(),
+                );
+                row.set_sensitive(blocker.is_none());
+                let a = app.clone();
+                row.connect_active_notify(move |r| {
+                    let v = r.is_active();
+                    a.edit(id, |j| j.hdr10plus_preserve = v);
+                });
+                pic.add(&row);
+            }
             settings_box.append(&pic);
         }
 
@@ -1590,11 +1611,13 @@ impl Editor {
             };
             let text = if job.dv_preserve && available {
                 format!("{text} · {}", help::CROP_DV)
+            } else if job.hdr10plus_preserve && available {
+                format!("{text} · {}", help::CROP_HDR10PLUS)
             } else {
                 text
             };
             row.set_subtitle(&text);
-            row.set_sensitive(available && !job.dv_preserve);
+            row.set_sensitive(available && !job.injects_metadata());
             preview.set_sensitive(true);
         }
 

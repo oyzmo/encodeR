@@ -304,10 +304,12 @@ pub fn run_capture(program: &str, args: &[OsString], cancel: &Cancel) -> Result<
     })
 }
 
-/// `a | b` without a shell: a's stdout feeds b's stdin.
-pub fn run_pipe(
+/// `a | consumers…`: `a`'s stdout feeds every consumer (one read of a large
+/// source for several tools). A consumer that exits early ends the
+/// copy, and the run counts as failed. Consumers' stdout is concatenated.
+pub fn run_tee(
     a: (&str, &[OsString]),
-    b: (&str, &[OsString]),
+    consumers: &[(&str, &[OsString])],
     cancel: &Cancel,
 ) -> Result<Captured, String> {
     let mut first = command(a.0)
@@ -317,38 +319,87 @@ pub fn run_pipe(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Could not start {}: {e}", a.0))?;
-    let pipe = first.stdout.take().expect("piped");
-    let mut second = match command(b.0)
-        .args(b.1)
-        .stdin(Stdio::from(pipe))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = first.kill();
-            let _ = first.wait();
-            return Err(format!("Could not start {}: {e}", b.0));
+    let mut kids: Vec<Child> = Vec::new();
+    for (program, args) in consumers {
+        match command(program)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => kids.push(c),
+            Err(e) => {
+                for c in kids.iter_mut().chain([&mut first]) {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                return Err(format!("Could not start {program}: {e}"));
+            }
         }
-    };
+    }
+    let mut src = first.stdout.take().expect("piped");
+    let mut sinks: Vec<ChildStdin> = kids
+        .iter_mut()
+        .map(|c| c.stdin.take().expect("piped"))
+        .collect();
+    // Dropping the sinks closes the consumers' stdin; dropping `src` makes
+    // the producer stop with a broken pipe if a consumer gave up.
+    let copier = thread::spawn(move || {
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            match src.read(&mut buf) {
+                Ok(0) => return true,
+                Ok(n) => {
+                    for s in &mut sinks {
+                        if s.write_all(&buf[..n]).is_err() {
+                            return false;
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return false,
+            }
+        }
+    });
     let err1 = read_all(first.stderr.take().expect("piped"));
-    let out2 = read_all(second.stdout.take().expect("piped"));
-    let err2 = read_all(second.stderr.take().expect("piped"));
-    let (st2, cancelled) = wait_cancellable(&mut second, cancel);
-    if cancelled {
-        let _ = first.kill();
+    let outs: Vec<_> = kids
+        .iter_mut()
+        .map(|c| {
+            (
+                read_all(c.stdout.take().expect("piped")),
+                read_all(c.stderr.take().expect("piped")),
+            )
+        })
+        .collect();
+    let mut ok = true;
+    let mut cancelled = false;
+    for i in 0..kids.len() {
+        let (st, c) = wait_cancellable(&mut kids[i], cancel);
+        ok &= st.is_some_and(|s| s.success());
+        if c {
+            cancelled = true;
+            let _ = first.kill();
+            for k in kids.iter_mut() {
+                let _ = k.kill();
+                let _ = k.wait();
+            }
+            break;
+        }
     }
     let st1 = first.wait().ok();
+    let copied = copier.join().unwrap_or(false);
+    let mut stdout = String::new();
+    let mut stderr = err1.join().unwrap_or_default();
+    for (o, e) in outs {
+        stdout.push_str(&o.join().unwrap_or_default());
+        stderr.push_str(&e.join().unwrap_or_default());
+    }
     Ok(Captured {
-        success: !cancelled && st1.is_some_and(|s| s.success()) && st2.is_some_and(|s| s.success()),
+        success: !cancelled && ok && copied && st1.is_some_and(|s| s.success()),
         cancelled,
-        stdout: out2.join().unwrap_or_default(),
-        stderr: format!(
-            "{}{}",
-            err1.join().unwrap_or_default(),
-            err2.join().unwrap_or_default()
-        ),
+        stdout,
+        stderr,
     })
 }
 
@@ -415,6 +466,31 @@ pub fn is_executable(p: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tee_feeds_every_consumer_the_same_bytes() {
+        let os = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
+        let src = os(&["-c", "3000000", "/dev/urandom"]);
+        let none = os(&[]);
+        let r = run_tee(
+            ("head", &src),
+            &[("sha256sum", &none), ("sha256sum", &none)],
+            &Cancel::default(),
+        )
+        .unwrap();
+        assert!(r.success, "{}", r.stderr);
+        let sums: Vec<&str> = r.stdout.lines().collect();
+        assert_eq!(sums.len(), 2);
+        assert_eq!(sums[0], sums[1]);
+        // A consumer that fails fails the run (and doesn't hang the producer).
+        let r = run_tee(
+            ("head", &src),
+            &[("sha256sum", &none), ("false", &none)],
+            &Cancel::default(),
+        )
+        .unwrap();
+        assert!(!r.success && !r.cancelled);
+    }
 
     #[test]
     fn limiter_caps_and_cancels() {

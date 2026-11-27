@@ -27,8 +27,8 @@ use std::path::PathBuf;
 use adw::prelude::*;
 
 const USAGE: &str = "Usage: encoder [FILE…]
-       encoder --print-command FILE [--preset NAME] [--out DIR] [--subs SRT]…
-       encoder --encode FILE [--preset NAME] [--out DIR] [--subs SRT]…
+       encoder --print-command FILE [--preset NAME] [--out DIR] [--subs SRT]… [--keep-dv] [--keep-hdr10plus]
+       encoder --encode FILE [--preset NAME] [--out DIR] [--subs SRT]… [--keep-dv] [--keep-hdr10plus]
        encoder --match FILE [--preset NAME]
        encoder --add-subs VIDEO [SRT|ZIP…] [--embed] [--no-sync]
        encoder --version";

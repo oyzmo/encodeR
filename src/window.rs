@@ -203,7 +203,15 @@ impl State {
             crop_on_gpu: self.crop_on_gpu(),
             scan: job.scan_plan(),
             video_kbps: self.video_kbps(job),
-            dv_preserve: job.dv_preserve,
+            // Never hand the worker a pipeline the settings rule out.
+            dv_preserve: job.dv_preserve
+                && job
+                    .dv_blocker(self.caps.as_ref().is_some_and(|c| c.dovi_tool))
+                    .is_none(),
+            hdr10plus_preserve: job.hdr10plus_preserve
+                && job
+                    .hdr10plus_blocker(self.caps.as_ref().is_some_and(|c| c.hdr10plus_tool))
+                    .is_none(),
             mkvpropedit: self.caps.as_ref().is_some_and(|c| c.mkvpropedit),
             externals: job.externals.clone(),
             mode: job.mode,
@@ -249,6 +257,9 @@ impl State {
             estimate,
             vmaf,
             dv_preserve: job.dv_preserve,
+            hdr10plus_preserve: job.hdr10plus_preserve,
+            hdr10plus_blocked: job
+                .hdr10plus_blocker(self.caps.as_ref().is_some_and(|c| c.hdr10plus_tool)),
             crop: job.crop_enabled,
             active_crop: job.active_crop(),
             scan_detected: job.scan_detected,
@@ -364,17 +375,8 @@ impl State {
         let note = poster_note(&req.output);
         req.covers =
             crate::cover::plan(&req.probe, &job.cover, job.settings.container, false, temp).embed;
-        // The same job the encode will run, so the shown command can't drift.
-        let j = req.job(&req.output, req.first_decode());
-        let mut text = match command::build(&j) {
-            Ok(a) => command::display_command(&self.tools.ffmpeg, &a),
-            Err(e) => format!("# {e}"),
-        };
-        if req.dv_preserve {
-            text = format!(
-                "# Dolby Vision pipeline: ffmpeg | dovi_tool extract-rpu → encode to raw HEVC → dovi_tool inject-rpu → mux.\n# The final mux keeps these audio/subtitle settings:\n{text}"
-            );
-        }
+        // Built by the same functions the encode runs, so it can't drift.
+        let text = req.describe_commands(&self.tools.ffmpeg);
         text + &note
     }
 }
@@ -1309,17 +1311,14 @@ impl App {
         {
             let mut st = self.state.borrow_mut();
             let dovi_tool = st.caps.as_ref().is_some_and(|c| c.dovi_tool);
+            let hdr10plus_tool = st.caps.as_ref().is_some_and(|c| c.hdr10plus_tool);
             let match_before = st.job(id).map(|j| st.match_key(j));
             let Some(j) = st.job_mut(id) else { return };
             if !j.state.editable() && j.state != JobState::Probing {
                 return;
             }
             f(j);
-            // Switching to AV1 or downscaling rules Dolby Vision out; a flag left on
-            // would still send the job down the DV pipeline (and keep crop off).
-            if j.dv_preserve && j.dv_blocker(dovi_tool).is_some() {
-                j.dv_preserve = false;
-            }
+            j.drop_blocked_metadata(dovi_tool, hdr10plus_tool);
             // Settings edits invalidate the quality score, including one being measured.
             j.vmaf = VmafState::None;
             if st.vmaf_cancel.as_ref().is_some_and(|(v, _)| *v == id)
@@ -1351,6 +1350,10 @@ impl App {
             Msg::Analyzed(id, r) => {
                 let mut st = self.state.borrow_mut();
                 st.crop_cancel.remove(&id);
+                let tools = st
+                    .caps
+                    .as_ref()
+                    .map_or((false, false), |c| (c.dovi_tool, c.hdr10plus_tool));
                 if let Some(j) = st.job_mut(id) {
                     let (crop, scan) = match r {
                         Ok(a) => (a.crop, a.scan),
@@ -1362,6 +1365,8 @@ impl App {
                         Err(e) => CropState::Failed(e),
                     };
                     j.scan_detected = scan;
+                    // A detected interlace can rule out metadata injection.
+                    j.drop_blocked_metadata(tools.0, tools.1);
                 }
                 drop(st);
                 // The scan plan changes the filters, so the estimate and command change too.

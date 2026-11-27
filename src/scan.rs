@@ -71,6 +71,18 @@ pub enum Scan {
 }
 
 impl Scan {
+    /// One output frame per input frame (progressive or single-rate deinterlacing).
+    pub fn keeps_frame_count(self) -> bool {
+        matches!(
+            self,
+            Self::Progressive
+                | Self::Deinterlace {
+                    double_rate: false,
+                    ..
+                }
+        )
+    }
+
     /// Output frame rate as a multiple of the input rate.
     pub fn rate_factor(self) -> f64 {
         match self {

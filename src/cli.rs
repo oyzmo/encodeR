@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::ffmpeg::capabilities::SizeLimits;
 use crate::ffmpeg::estimate::{self, SizeRange};
 use crate::ffmpeg::runner::Cancel;
-use crate::ffmpeg::{capabilities, command, probe};
+use crate::ffmpeg::{capabilities, probe};
 use crate::scan::{self, ScanOverride, ScanType};
 use crate::settings::{EncodeSettings, Prefs, RateControl, VideoCodec};
 use crate::subs::{self, ExternalSub, JobMode, SubsTarget};
@@ -19,6 +19,10 @@ pub struct Options {
     pub out_dir: Option<PathBuf>,
     /// External SRT files to mux in (`--subs`).
     pub subs: Vec<PathBuf>,
+    /// `--keep-dv` / `--keep-hdr10plus`: the experimental metadata pipelines,
+    /// off by default like the app's switches.
+    pub keep_dv: bool,
+    pub keep_hdr10plus: bool,
 }
 
 struct Prepared {
@@ -26,6 +30,8 @@ struct Prepared {
     tools: Tools,
     limits: Option<SizeLimits>,
     detected: Option<ScanType>,
+    /// Why HDR10+ can't be kept, for the checks.
+    hdr10plus_blocked: Option<&'static str>,
 }
 
 fn prepare(o: &Options) -> Result<Prepared, String> {
@@ -106,6 +112,33 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
         detected.map_or("inconclusive", |d| d.label()),
         scan_plan.describe(fps)
     );
+    let inject = crate::hdr::InjectJob::new(&settings, &p, scan_plan);
+    let dv_blocked = crate::hdr::dv_blocker(p.hdr.dovi, inject, caps.dovi_tool);
+    let hdr10plus_blocked =
+        crate::hdr::hdr10plus_blocker(p.hdr.hdr10plus, inject, caps.hdr10plus_tool);
+    let refuse = |flag: &str, what: &str, has: bool, why: Option<&str>| {
+        if !has {
+            Err(format!("{flag}: the source has no {what}"))
+        } else {
+            why.map_or(Ok(()), |w| Err(format!("{flag}: {w}")))
+        }
+    };
+    if o.keep_dv {
+        refuse(
+            "--keep-dv",
+            "Dolby Vision",
+            p.hdr.dovi.is_some(),
+            dv_blocked,
+        )?;
+    }
+    if o.keep_hdr10plus {
+        refuse(
+            "--keep-hdr10plus",
+            "HDR10+",
+            p.hdr.hdr10plus,
+            hdr10plus_blocked,
+        )?;
+    }
     let req = Request {
         scan: scan_plan,
         output: queue::output_path(&p.path, &prefs, settings.container),
@@ -116,17 +149,8 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
         crop: None,
         crop_on_gpu: caps.crop_on_gpu,
         video_kbps: kbps,
-        dv_preserve: p.hdr.dovi.is_some()
-            && crate::hdr::dv_blocker(
-                p.hdr.dovi,
-                settings.codec == VideoCodec::Hevc,
-                settings.output_ten_bit(),
-                p.video
-                    .as_ref()
-                    .is_some_and(|v| settings.downscale.height().is_some_and(|h| h < v.height)),
-                caps.dovi_tool,
-            )
-            .is_none(),
+        dv_preserve: o.keep_dv,
+        hdr10plus_preserve: o.keep_hdr10plus,
         mkvpropedit: caps.mkvpropedit,
         externals,
         mode: JobMode::Encode,
@@ -153,15 +177,12 @@ fn prepare(o: &Options) -> Result<Prepared, String> {
         tools,
         limits,
         detected,
+        hdr10plus_blocked,
     })
 }
 
-fn command_line(req: &Request, tools: &Tools) -> Result<String, String> {
-    let j = req.job(&req.output, req.first_decode());
-    Ok(command::display_command(
-        &tools.ffmpeg,
-        &command::build(&j)?,
-    ))
+fn command_line(req: &Request, tools: &Tools) -> String {
+    req.describe_commands(&tools.ffmpeg)
 }
 
 fn print_checks(
@@ -169,6 +190,7 @@ fn print_checks(
     limits: Option<SizeLimits>,
     detected: Option<ScanType>,
     est: Option<SizeRange>,
+    hdr10plus_blocked: Option<&'static str>,
 ) {
     for i in checks::run(&checks::CheckInput {
         probe: &req.probe,
@@ -178,6 +200,8 @@ fn print_checks(
         estimate: est,
         vmaf: None,
         dv_preserve: req.dv_preserve,
+        hdr10plus_preserve: req.hdr10plus_preserve,
+        hdr10plus_blocked,
         crop: false,
         active_crop: None,
         encoder_limits: limits,
@@ -190,8 +214,8 @@ fn print_checks(
 
 pub fn print_command(o: &Options) -> Result<(), String> {
     let p = prepare(o)?;
-    println!("{}", command_line(&p.req, &p.tools)?);
-    print_checks(&p.req, p.limits, p.detected, None);
+    println!("{}", command_line(&p.req, &p.tools));
+    print_checks(&p.req, p.limits, p.detected, None, p.hdr10plus_blocked);
     Ok(())
 }
 
@@ -249,9 +273,10 @@ pub fn encode(o: &Options) -> Result<(), String> {
         tools,
         limits,
         detected,
+        hdr10plus_blocked,
     } = prepare(o)?;
     println!("input   {}", req.probe.path.display());
-    println!("command {}", command_line(&req, &tools)?);
+    println!("command {}", command_line(&req, &tools));
     let audio = req.selection.audio_bytes(&req.probe);
     let subs = req.selection.subtitle_bytes(&req.probe);
     let rc = req.settings.effective_rate_control();
@@ -278,7 +303,7 @@ pub fn encode(o: &Options) -> Result<(), String> {
     }
     // Like the app: size-dependent checks (output not smaller, same codec)
     // need the estimate.
-    print_checks(&req, limits, detected, est);
+    print_checks(&req, limits, detected, est, hdr10plus_blocked);
     let started = std::time::Instant::now();
     let mut last = -1i64;
     let out = worker::encode(&tools, &req, &Cancel::default(), |u| match u {
@@ -321,12 +346,15 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
     let mut preset = None;
     let mut out_dir = None;
     let mut subs = Vec::new();
+    let (mut keep_dv, mut keep_hdr10plus) = (false, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--preset" => preset = Some(it.next().ok_or("--preset needs a name")?.clone()),
             "--subs" => subs.push(PathBuf::from(it.next().ok_or("--subs needs a file")?)),
             "--out" => out_dir = Some(PathBuf::from(it.next().ok_or("--out needs a folder")?)),
+            "--keep-dv" => keep_dv = true,
+            "--keep-hdr10plus" => keep_hdr10plus = true,
             f if !f.starts_with("--") && file.is_none() => file = Some(PathBuf::from(f)),
             other => return Err(format!("Unexpected argument {other}")),
         }
@@ -340,6 +368,8 @@ pub fn parse_options(args: &[String]) -> Result<Options, String> {
         preset,
         out_dir,
         subs,
+        keep_dv,
+        keep_hdr10plus,
     })
 }
 
@@ -421,6 +451,7 @@ pub fn add_subs(args: &[String]) -> Result<(), String> {
         scan: crate::scan::Scan::Progressive,
         video_kbps: None,
         dv_preserve: false,
+        hdr10plus_preserve: false,
         mkvpropedit: false,
         externals,
         mode: JobMode::Fix(target),

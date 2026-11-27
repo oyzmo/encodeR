@@ -81,11 +81,11 @@ cat > "$XDG_CONFIG_HOME/encoder/config.json" <<JSON
   ] }
 JSON
 
-run() { # clip preset
+run() { # clip preset [extra encoder flags…]
     local name="$2"
-    echo "=== $name · $(basename "$1")" | tee -a "$LOG"
+    echo "=== $name · $(basename "$1") ${*:3}" | tee -a "$LOG"
     mkdir -p "$OUT/${name// /_}"
-    "${BIN[@]}" --encode "$1" --preset "$name" --out "$OUT/${name// /_}" 2>&1 | tee -a "$LOG"
+    "${BIN[@]}" --encode "$1" --preset "$name" --out "$OUT/${name// /_}" "${@:3}" 2>&1 | tee -a "$LOG"
     echo "exit ${PIPESTATUS[0]}" | tee -a "$LOG"
 }
 
@@ -147,7 +147,62 @@ for mode in bob motion_adaptive motion_compensated default cpu-bwdif; do
 done
 
 if command -v dovi_tool >/dev/null && [ -n "${DV_CLIP:-}" ]; then
-    run "$DV_CLIP" "T hevc cq"
+    run "$DV_CLIP" "T hevc cq" --keep-dv
+fi
+
+# Does hevc_vaapi emit B-frames here? The Dolby Vision / HDR10+ pipelines
+# encode with -bf 0 because ffmpeg can't mux raw HEVC that has them.
+echo "--- hevc_vaapi B-frames (default settings; has_b_frames > 0 means reordered frames)" | tee -a "$LOG"
+ffmpeg -hide_banner -v error -y -vaapi_device /dev/dri/renderD128 -f lavfi -i testsrc2=size=1280x720:rate=24 \
+    -frames:v 48 -vf format=nv12,hwupload -c:v hevc_vaapi -rc_mode CQP -qp 25 -f hevc "$OUT/bframes.hevc" 2>&1 | tee -a "$LOG"
+echo "has_b_frames=$(ffprobe -v error -select_streams v:0 -show_entries stream=has_b_frames -of csv=p=0 "$OUT/bframes.hevc" 2>/dev/null)" | tee -a "$LOG"
+
+# HDR10+ preservation: a synthetic libx265 HDR10+ clip (or HDR10P_CLIP=…)
+# through the app's pipeline, then HDR10+ must be in the output.
+echo "--- HDR10+ preservation" | tee -a "$LOG"
+if [ "$FLATPAK" = 1 ]; then
+    HAS_H10P=$(flatpak run --command=sh no.oyzmo.EncodeR -c 'command -v hdr10plus_tool' 2>/dev/null)
+else
+    HAS_H10P=$(command -v hdr10plus_tool)
+fi
+# Captured first: `ffmpeg | grep -q` fails under pipefail when grep quits early.
+ENCODERS=$(ffmpeg -hide_banner -encoders 2>/dev/null)
+if [ -z "$HAS_H10P" ]; then
+    echo "skipped: hdr10plus_tool not found (scripts/install.sh --hdr-tools)" | tee -a "$LOG"
+else
+    H10P="${HDR10P_CLIP:-}"
+    if [ -z "$H10P" ] && ! grep -q libx265 <<<"$ENCODERS"; then
+        echo "skipped: this ffmpeg has no libx265 to make the test clip; set HDR10P_CLIP=…" | tee -a "$LOG"
+    elif [ -z "$H10P" ]; then
+        H10P="$OUT/hdr10plus.mkv"
+        n=96
+        python3 - "$n" > "$OUT/hdr10plus.json" <<'PY'
+import json, sys
+n = int(sys.argv[1])
+scene = lambda i: {"BezierCurveData": {"Anchors": [102, 205, 307, 410, 512, 614, 717, 819, 922], "KneePointX": 0, "KneePointY": 0},
+    "LuminanceParameters": {"AverageRGB": 1000 + i, "LuminanceDistributions": {"DistributionIndex": [1, 5, 10, 25, 50, 75, 90, 95, 99],
+        "DistributionValues": [0, 10, 50, 300, 900, 2000, 5000, 9000, 20000]}, "MaxScl": [30000, 30000, 30000]},
+    "NumberOfWindows": 1, "TargetedSystemDisplayMaximumLuminance": 400, "SceneFrameIndex": i, "SceneId": 0, "SequenceFrameIndex": i}
+print(json.dumps({"JSONInfo": {"HDR10plusProfile": "B", "Version": "1.0"}, "SceneInfo": [scene(i) for i in range(n)],
+    "SceneInfoSummary": {"SceneFirstFrameIndex": [0], "SceneFrameNumbers": [n]}, "ToolInfo": {"Tool": "hw-verify", "Version": "1"}}))
+PY
+        ffmpeg -hide_banner -v error -y \
+            -f lavfi -i "mandelbrot=s=1920x1080:r=24,setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc" \
+            -f lavfi -i "sine=f=440:d=4" -frames:v $n -pix_fmt yuv420p10le -c:v libx265 \
+            -x265-params "log-level=error:hdr10=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400:dhdr10-info=$OUT/hdr10plus.json" \
+            -c:a aac "$H10P" || { echo "FAIL: couldn't make the HDR10+ test clip" | tee -a "$LOG"; H10P=""; }
+    fi
+    if [ -n "$H10P" ]; then
+        run "$H10P" "T hevc cq" --keep-hdr10plus
+        out=$(ls -t "$OUT/T_hevc_cq/$(basename "${H10P%.*}")"*.mkv 2>/dev/null | head -1)
+        sd=$([ -n "$out" ] && ffprobe -v error -select_streams v:0 -show_frames -read_intervals %+#1 \
+            -show_entries frame=side_data_list "$out" 2>/dev/null)
+        if grep -q 2094-40 <<<"$sd"; then
+            echo "HDR10+ kept in $out" | tee -a "$LOG"
+        else
+            echo "FAIL: HDR10+ missing from the output (${out:-no output})" | tee -a "$LOG"
+        fi
+    fi
 fi
 
 # The app's GPU crop chain must really crop (exiting 0 isn't proof).

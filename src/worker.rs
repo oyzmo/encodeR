@@ -49,6 +49,7 @@ pub struct Request {
     pub scan: Scan,
     pub video_kbps: Option<u32>,
     pub dv_preserve: bool,
+    pub hdr10plus_preserve: bool,
     pub mkvpropedit: bool,
     /// External SRT files (the job's list; only selected ones are used).
     pub externals: Vec<ExternalSub>,
@@ -77,6 +78,87 @@ impl Request {
         j.externals = &self.externals;
         j.covers = &self.covers;
         j
+    }
+
+    /// The Dolby Vision RPU this encode injects, if it keeps Dolby Vision.
+    pub fn inject_dv(&self) -> Option<hdr::Dovi> {
+        self.probe.hdr.dovi.filter(|_| self.dv_preserve)
+    }
+
+    /// Does this encode inject HDR10+?
+    pub fn inject_hdr10plus(&self) -> bool {
+        self.hdr10plus_preserve && self.probe.hdr.hdr10plus
+    }
+
+    /// Settings of the raw-HEVC encode in the injection pipelines: no
+    /// B-frames, because ffmpeg's raw HEVC demuxer can't timestamp reordered
+    /// frames and the mux step would fail ("Can't write packet with unknown
+    /// timestamp").
+    pub fn raw_settings(&self) -> EncodeSettings {
+        EncodeSettings {
+            bframes: Some(0),
+            ..self.settings.clone()
+        }
+    }
+
+    /// The raw-HEVC encode of the injection pipelines (video only, full frame).
+    pub fn raw_encode_args(
+        &self,
+        raw_settings: &EncodeSettings,
+        out: &Path,
+        decode: DecodeMode,
+    ) -> Result<Vec<OsString>, String> {
+        let mut j = self.job(out, decode);
+        j.settings = raw_settings;
+        j.crop = None;
+        j.video_only = true;
+        j.raw_hevc = true;
+        command::build(&j)
+    }
+
+    /// What the encode will run, for the command view and `--print-command`.
+    /// Built with the same functions as the encode, so it can't drift.
+    pub fn describe_commands(&self, ffmpeg: &str) -> String {
+        let decode = self.first_decode();
+        let dv = self.inject_dv().is_some();
+        let h10p = self.inject_hdr10plus();
+        if !dv && !h10p {
+            return match command::build(&self.job(&self.output, decode)) {
+                Ok(a) => command::display_command(ffmpeg, &a),
+                Err(e) => format!("# {e}"),
+            };
+        }
+        let (mut tools, mut inject) = (Vec::new(), Vec::new());
+        if dv {
+            tools.push("dovi_tool extract-rpu");
+            inject.push("dovi_tool inject-rpu");
+        }
+        if h10p {
+            tools.push("hdr10plus_tool extract");
+            inject.push("hdr10plus_tool inject");
+        }
+        let show = |r: Result<Vec<OsString>, String>| match r {
+            Ok(a) => command::display_command(ffmpeg, &a),
+            Err(e) => format!("# {e}"),
+        };
+        let raw = Path::new("video.hevc");
+        let injected = Path::new("video_injected.hevc");
+        format!(
+            "# Experimental metadata pipeline (temporary files in the cache folder):\n\
+             # 1. One read of the source: ffmpeg | {}; the frame counts are checked against the source.\n\
+             # 2. Encode the video to raw HEVC. B-frames are off: ffmpeg can't mux raw HEVC with B-frames.\n\
+             {}\n\
+             # 3. Check frame counts, then {}.\n\
+             # 4. Mux with the audio and subtitles, then check every frame's metadata in the output.\n\
+             {}",
+            tools.join(" + "),
+            show(self.raw_encode_args(&self.raw_settings(), raw, decode)),
+            inject.join(" → "),
+            show(command::build_raw_mux(
+                &self.job(&self.output, decode),
+                injected
+            )),
+        )
     }
 
     pub fn first_decode(&self) -> DecodeMode {
@@ -227,8 +309,10 @@ pub fn encode(
         covers: cover.plan.embed.clone(),
         ..req.clone()
     };
-    let result = if work.dv_preserve && work.probe.hdr.dovi.is_some() {
-        encode_dv(tools, &work, cancel, &mut update)
+    let dv = work.inject_dv();
+    let hdr10plus = work.inject_hdr10plus();
+    let result = if dv.is_some() || hdr10plus {
+        encode_inject(tools, &work, dv, hdr10plus, cancel, &mut update)
     } else {
         run_with_fallback(
             tools,
@@ -1010,19 +1094,153 @@ fn hdr_report(tools: &Tools, req: &Request) -> Vec<String> {
     )]
 }
 
-fn encode_dv(
+/// Frame-count check before injecting per-frame metadata. An unreadable
+/// count is a failure too: injecting unverified would put the metadata on
+/// the wrong frames.
+fn check_frames(
+    what: &str,
+    encoded: Option<u64>,
+    meta: Option<u64>,
+    turn_off: &str,
+) -> Result<(), String> {
+    match (encoded, meta) {
+        (Some(a), Some(b)) if a == b => Ok(()),
+        (Some(a), Some(b)) => Err(format!(
+            "Frame counts differ: encoded {a}, {what} {b}. The metadata can't be injected safely. {turn_off}"
+        )),
+        (a, b) => {
+            let show = |n: Option<u64>| n.map_or("unreadable".to_string(), |n| n.to_string());
+            Err(format!(
+                "Couldn't verify the frame counts (encoded {}, {what} {}), so the metadata can't be injected safely. {turn_off}",
+                show(a),
+                show(b)
+            ))
+        }
+    }
+}
+
+/// Before the encode: does the extracted metadata cover the source's frames?
+/// Exact when the container states the frame count; otherwise duration × fps,
+/// within 1% plus 2 frames. Catches partial metadata or a damaged source in
+/// seconds instead of after the whole encode (the exact check still follows).
+fn source_frames_check(
+    what: &str,
+    meta: Option<u64>,
+    exact: Option<u64>,
+    duration: f64,
+    fps: f64,
+    turn_off: &str,
+) -> Result<(), String> {
+    let Some(m) = meta else {
+        return Err(format!(
+            "Couldn't read how many frames the {what} metadata covers. {turn_off}"
+        ));
+    };
+    if let Some(n) = exact {
+        return if m == n {
+            Ok(())
+        } else {
+            Err(format!(
+                "The {what} metadata covers {m} frames but the source has {n}. {turn_off}"
+            ))
+        };
+    }
+    let est = (duration * fps).round();
+    if est < 1.0 || (m as f64 - est).abs() <= est * 0.01 + 2.0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "The {what} metadata covers {m} frames but the source has about {est:.0}. {turn_off}"
+        ))
+    }
+}
+
+const DV_OFF: &str = "Turn off Dolby Vision preservation to get HDR10.";
+const HDR10PLUS_OFF: &str = "Turn off HDR10+ preservation to get static HDR10.";
+
+/// Frames covered by the Dolby Vision RPU and/or HDR10+ metadata of `input`'s
+/// video stream `stream`, read in one pass. `dv_profile` picks dovi_tool's
+/// conversion (7 → 8.1); outputs are read as profile 8 (no conversion).
+#[allow(clippy::too_many_arguments)]
+fn read_metadata(
+    tools: &Tools,
+    input: &Path,
+    stream: usize,
+    dv_profile: Option<u32>,
+    hdr10plus: bool,
+    rpu: &Path,
+    json: &Path,
+    cancel: &Cancel,
+) -> Result<(Option<u64>, Option<u64>), Outcome> {
+    let mut consumers: Vec<(&str, Vec<OsString>)> = Vec::new();
+    if let Some(p) = dv_profile {
+        consumers.push(("dovi_tool", hdr::extract_rpu_args(p, rpu)));
+    }
+    if hdr10plus {
+        consumers.push(("hdr10plus_tool", hdr::extract_hdr10plus_args(json)));
+    }
+    let refs: Vec<(&str, &[OsString])> = consumers.iter().map(|(p, a)| (*p, &a[..])).collect();
+    step(
+        runner::run_tee(
+            (&tools.ffmpeg, &hdr::extract_video_args(input, stream)),
+            &refs,
+            cancel,
+        ),
+        "Metadata extraction",
+    )?;
+    let rpu_frames = if dv_profile.is_some() {
+        let info = step(
+            runner::run_capture("dovi_tool", &hdr::rpu_info_args(rpu), cancel),
+            "dovi_tool info",
+        )?;
+        hdr::parse_rpu_frames(&info.stdout)
+    } else {
+        None
+    };
+    let json_frames = if hdr10plus {
+        std::fs::File::open(json)
+            .ok()
+            .and_then(hdr::hdr10plus_json_frames)
+    } else {
+        None
+    };
+    Ok((rpu_frames, json_frames))
+}
+
+/// A helper's result as an `Outcome` on failure, with its stderr tail.
+fn step(r: Result<runner::Captured, String>, what: &str) -> Result<runner::Captured, Outcome> {
+    match r {
+        Ok(c) if c.success => Ok(c),
+        Ok(c) if c.cancelled => Err(Outcome {
+            cancelled: true,
+            ..Default::default()
+        }),
+        Ok(c) => {
+            let lines: Vec<&str> = c.stderr.lines().collect();
+            let tail = lines[lines.len().saturating_sub(20)..]
+                .iter()
+                .map(|l| l.to_string())
+                .collect();
+            Err(fail(format!("{what} failed"), tail))
+        }
+        Err(e) => Err(fail(e, Vec::new())),
+    }
+}
+
+/// The experimental metadata pipeline: extract Dolby Vision RPU and/or HDR10+
+/// from the source in one read, check them against the source's frame count,
+/// encode to raw HEVC, check frame counts exactly, inject, mux, then read the
+/// output back and check every frame carries the metadata.
+fn encode_inject(
     tools: &Tools,
     req: &Request,
+    dovi: Option<hdr::Dovi>,
+    hdr10plus: bool,
     cancel: &Cancel,
     update: &mut impl FnMut(Update),
 ) -> Result<DecodeMode, Outcome> {
-    let dovi = req
-        .probe
-        .hdr
-        .dovi
-        .ok_or_else(|| fail("No Dolby Vision metadata", Vec::new()))?;
     let dir = cache_dir().join(format!(
-        "dv-{}-{}",
+        "inject-{}-{}",
         std::process::id(),
         req.probe.duration as u64
     ));
@@ -1031,66 +1249,45 @@ fn encode_dv(
         let _ = std::fs::remove_dir_all(&dir);
     };
     let rpu = dir.join("rpu.bin");
+    let json = dir.join("hdr10plus.json");
     let video = dir.join("video.hevc");
-    let injected = dir.join("video_dv.hevc");
-    let step =
-        |r: Result<runner::Captured, String>, what: &str| -> Result<runner::Captured, Outcome> {
-            match r {
-                Ok(c) if c.success => Ok(c),
-                Ok(c) if c.cancelled => Err(Outcome {
-                    cancelled: true,
-                    ..Default::default()
-                }),
-                Ok(c) => Err(fail(
-                    format!("{what} failed"),
-                    c.stderr
-                        .lines()
-                        .rev()
-                        .take(20)
-                        .map(String::from)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect(),
-                )),
-                Err(e) => Err(fail(e, Vec::new())),
-            }
-        };
+    let stage = match (dovi.is_some(), hdr10plus) {
+        (true, true) => "Dolby Vision + HDR10+",
+        (true, false) => "Dolby Vision",
+        _ => "HDR10+",
+    };
+    let v = req.probe.video.as_ref();
     let result = (|| {
-        update(Update::Stage("Dolby Vision · extracting RPU".into()));
-        step(
-            runner::run_pipe(
-                (
-                    &tools.ffmpeg,
-                    &hdr::extract_video_args(
-                        &req.probe.path,
-                        req.probe.video.as_ref().map_or(0, |v| v.index),
-                    ),
-                ),
-                ("dovi_tool", &hdr::extract_rpu_args(dovi.profile, &rpu)),
-                cancel,
-            ),
-            "RPU extraction",
+        update(Update::Stage(format!("{stage} · extracting metadata")));
+        let (rpu_frames, json_frames) = read_metadata(
+            tools,
+            &req.probe.path,
+            v.map_or(0, |v| v.index),
+            dovi.map(|d| d.profile),
+            hdr10plus,
+            &rpu,
+            &json,
+            cancel,
         )?;
+        let (exact, fps) = (v.and_then(|v| v.frame_count), v.map_or(0.0, |v| v.fps));
+        let early =
+            |what, n, off| source_frames_check(what, n, exact, req.probe.duration, fps, off);
+        if dovi.is_some() {
+            early("Dolby Vision", rpu_frames, DV_OFF).map_err(|e| fail(e, Vec::new()))?;
+        }
+        if hdr10plus {
+            early("HDR10+", json_frames, HDR10PLUS_OFF).map_err(|e| fail(e, Vec::new()))?;
+        }
+        let raw_settings = req.raw_settings();
         let decode = run_with_fallback(
             tools,
             req,
-            |d| {
-                let mut j = req.job(&video, d);
-                j.crop = None;
-                j.video_only = true;
-                j.raw_hevc = true;
-                command::build(&j)
-            },
+            |d| req.raw_encode_args(&raw_settings, &video, d),
             &video,
             cancel,
             update,
         )?;
-        update(Update::Stage("Dolby Vision · checking frame counts".into()));
-        let info = step(
-            runner::run_capture("dovi_tool", &hdr::rpu_info_args(&rpu), cancel),
-            "dovi_tool info",
-        )?;
+        update(Update::Stage(format!("{stage} · checking frame counts")));
         let count_args: Vec<OsString> = [
             "-v",
             "error",
@@ -1111,49 +1308,45 @@ fn encode_dv(
             "Frame count",
         )?;
         let encoded: Option<u64> = count.stdout.trim().parse().ok();
-        let rpu_frames = hdr::parse_rpu_frames(&info.stdout);
-        // An unreadable count is a failure too: injecting unverified would put
-        // per-frame metadata on the wrong frames.
-        match (encoded, rpu_frames) {
-            (Some(a), Some(b)) if a == b => {}
-            (Some(a), Some(b)) => {
-                return Err(fail(
-                    format!(
-                        "Frame counts differ: encoded {a}, RPU {b}. Dolby Vision can't be injected safely."
-                    ),
-                    Vec::new(),
-                ));
-            }
-            (a, b) => {
-                let show = |n: Option<u64>| n.map_or("unreadable".to_string(), |n| n.to_string());
-                return Err(fail(
-                    format!(
-                        "Couldn't verify the frame counts (encoded {}, RPU {}), so Dolby Vision can't be injected safely. Turn off Dolby Vision preservation to get HDR10.",
-                        show(a),
-                        show(b)
-                    ),
-                    info.stdout.lines().take(20).map(String::from).collect(),
-                ));
-            }
+        let mut current = video.clone();
+        if dovi.is_some() {
+            check_frames("RPU", encoded, rpu_frames, DV_OFF).map_err(|e| fail(e, Vec::new()))?;
+            update(Update::Stage("Dolby Vision · injecting RPU".into()));
+            let out = dir.join("video_dv.hevc");
+            step(
+                runner::run_capture(
+                    "dovi_tool",
+                    &hdr::inject_rpu_args(&current, &rpu, &out),
+                    cancel,
+                ),
+                "RPU injection",
+            )?;
+            let _ = std::fs::remove_file(&current);
+            current = out;
         }
-        update(Update::Stage("Dolby Vision · injecting RPU".into()));
-        step(
-            runner::run_capture(
-                "dovi_tool",
-                &hdr::inject_rpu_args(&video, &rpu, &injected),
-                cancel,
-            ),
-            "RPU injection",
-        )?;
-        let _ = std::fs::remove_file(&video);
-        update(Update::Stage("Dolby Vision · muxing".into()));
-        let mux = command::build_dv_mux(&req.job(&req.output, decode), &injected)
+        if hdr10plus {
+            check_frames("HDR10+", encoded, json_frames, HDR10PLUS_OFF)
+                .map_err(|e| fail(e, Vec::new()))?;
+            update(Update::Stage("HDR10+ · injecting metadata".into()));
+            let out = dir.join("video_hdr10plus.hevc");
+            step(
+                runner::run_capture(
+                    "hdr10plus_tool",
+                    &hdr::inject_hdr10plus_args(&current, &json, &out),
+                    cancel,
+                ),
+                "HDR10+ injection",
+            )?;
+            let _ = std::fs::remove_file(&current);
+            current = out;
+        }
+        update(Update::Stage(format!("{stage} · muxing")));
+        let mux = command::build_raw_mux(&req.job(&req.output, decode), &current)
             .map_err(|e| fail(e, Vec::new()))?;
         let r = runner::run_ffmpeg(&tools.ffmpeg, &mux, cancel, |p| {
-            update(Update::Progress(
-                p.with_source_fps(req.probe.video.as_ref().map(|v| v.fps)),
-            ))
+            update(Update::Progress(p.with_source_fps(v.map(|v| v.fps))))
         });
+        let _ = std::fs::remove_file(&current);
         if r.cancelled {
             let _ = std::fs::remove_file(&req.output);
             return Err(Outcome {
@@ -1165,33 +1358,89 @@ fn encode_dv(
             let _ = std::fs::remove_file(&req.output);
             return Err(fail("Muxing failed", r.stderr_tail));
         }
-        // Verify the DV configuration made it into the container. A failed
-        // check deletes the output like every other failure.
-        let expect = if dovi.profile == 5 { 5 } else { 8 };
-        let verdict = match probe::run(&tools.ffprobe, &req.output)
-            .ok()
-            .and_then(|p| p.hdr.dovi)
-        {
-            Some(d) if d.profile == expect => Ok(decode),
-            Some(d) => Err(fail(
-                format!(
-                    "Output has Dolby Vision profile {}, expected {expect}",
-                    d.profile
-                ),
-                Vec::new(),
-            )),
-            None => Err(fail(
-                "Dolby Vision metadata is missing from the output",
-                Vec::new(),
-            )),
-        };
-        if verdict.is_err() {
-            let _ = std::fs::remove_file(&req.output);
+        // Verify the metadata made it into the container: the DV profile and
+        // HDR10+ presence, then every frame. A failed check deletes the
+        // output like every other failure.
+        update(Update::Stage(format!("{stage} · checking the output")));
+        let verdict = (|| {
+            let out = probe::run(&tools.ffprobe, &req.output).ok();
+            verify_injected(out.as_ref().map(|p| &p.hdr), dovi, hdr10plus)
+                .map_err(|e| fail(e, Vec::new()))?;
+            let out_index = out.and_then(|p| p.video).map_or(0, |v| v.index);
+            let (rpu_out, json_out) = read_metadata(
+                tools,
+                &req.output,
+                out_index,
+                dovi.map(|_| 8),
+                hdr10plus,
+                &dir.join("rpu_out.bin"),
+                &dir.join("hdr10plus_out.json"),
+                cancel,
+            )?;
+            verify_output_frames(
+                encoded,
+                dovi.map(|_| rpu_out),
+                hdr10plus.then_some(json_out),
+            )
+            .map_err(|e| fail(e, Vec::new()))
+        })();
+        match verdict {
+            Ok(()) => Ok(decode),
+            Err(o) => {
+                let _ = std::fs::remove_file(&req.output);
+                Err(o)
+            }
         }
-        verdict
     })();
     cleanup();
     result
+}
+
+/// After muxing: every encoded frame must carry the injected metadata.
+/// `None` for a kind that wasn't injected; `Some(None)` for an unreadable count.
+fn verify_output_frames(
+    encoded: Option<u64>,
+    dv: Option<Option<u64>>,
+    hdr10plus: Option<Option<u64>>,
+) -> Result<(), String> {
+    for (what, got) in [("Dolby Vision", dv), ("HDR10+", hdr10plus)] {
+        let Some(got) = got else { continue };
+        if got.is_none() || got != encoded {
+            let show = |n: Option<u64>| n.map_or("unreadable".to_string(), |n| n.to_string());
+            return Err(format!(
+                "{what} metadata is on {} of {} frames in the output",
+                show(got),
+                show(encoded)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Did the injected metadata survive into the muxed output?
+fn verify_injected(
+    out: Option<&hdr::HdrInfo>,
+    dovi: Option<hdr::Dovi>,
+    hdr10plus: bool,
+) -> Result<(), String> {
+    let out = out.ok_or("Couldn't probe the output to verify the metadata")?;
+    if let Some(src) = dovi {
+        let expect = if src.profile == 5 { 5 } else { 8 };
+        match out.dovi {
+            Some(d) if d.profile == expect => {}
+            Some(d) => {
+                return Err(format!(
+                    "Output has Dolby Vision profile {}, expected {expect}",
+                    d.profile
+                ));
+            }
+            None => return Err("Dolby Vision metadata is missing from the output".into()),
+        }
+    }
+    if hdr10plus && !out.hdr10plus {
+        return Err("HDR10+ metadata is missing from the output".into());
+    }
+    Ok(())
 }
 
 /// Result of the background analysis after probing.
@@ -1408,6 +1657,75 @@ mod tests {
     use crate::ffmpeg::probe::tests::sample_4k;
 
     #[test]
+    fn injection_needs_matching_readable_frame_counts() {
+        assert_eq!(check_frames("HDR10+", Some(48), Some(48), ""), Ok(()));
+        let e = check_frames("HDR10+", Some(48), Some(50), "Turn it off.").unwrap_err();
+        assert!(e.contains("encoded 48, HDR10+ 50") && e.ends_with("Turn it off."));
+        let e = check_frames("RPU", None, Some(50), "").unwrap_err();
+        assert!(e.contains("encoded unreadable, RPU 50"));
+    }
+
+    #[test]
+    fn early_frame_check_against_the_source() {
+        // Exact count from the container: must match.
+        assert_eq!(
+            source_frames_check("HDR10+", Some(100), Some(100), 0.0, 0.0, ""),
+            Ok(())
+        );
+        let e = source_frames_check("HDR10+", Some(99), Some(100), 0.0, 0.0, "Off.").unwrap_err();
+        assert!(e.contains("covers 99 frames but the source has 100") && e.ends_with("Off."));
+        // Estimated from duration × fps: 1% + 2 frames of slack.
+        let est = |m| source_frames_check("HDR10+", Some(m), None, 7200.0, 24.0, "");
+        assert_eq!(est(172_800), Ok(()));
+        assert_eq!(est(172_800 + 1_729), Ok(()));
+        assert!(est(172_800 + 1_731).unwrap_err().contains("about 172800"));
+        assert!(est(100_000).is_err());
+        // No duration or rate: nothing to compare with.
+        assert_eq!(
+            source_frames_check("RPU", Some(5), None, 0.0, 0.0, ""),
+            Ok(())
+        );
+        assert!(source_frames_check("RPU", None, Some(5), 0.0, 0.0, "").is_err());
+    }
+
+    #[test]
+    fn output_must_carry_metadata_on_every_frame() {
+        assert_eq!(
+            verify_output_frames(Some(48), Some(Some(48)), Some(Some(48))),
+            Ok(())
+        );
+        assert_eq!(verify_output_frames(Some(48), None, Some(Some(48))), Ok(()));
+        let e = verify_output_frames(Some(48), None, Some(Some(1))).unwrap_err();
+        assert_eq!(e, "HDR10+ metadata is on 1 of 48 frames in the output");
+        assert!(verify_output_frames(Some(48), Some(None), None).is_err());
+        assert!(verify_output_frames(None, Some(None), None).is_err());
+    }
+
+    #[test]
+    fn injected_metadata_is_verified_in_the_output() {
+        let dv = sample_4k().hdr.dovi.unwrap();
+        let mut out = hdr::HdrInfo {
+            dovi: Some(hdr::Dovi { profile: 8, ..dv }),
+            ..Default::default()
+        };
+        let p7 = hdr::Dovi { profile: 7, ..dv };
+        assert_eq!(verify_injected(Some(&out), Some(p7), false), Ok(()));
+        assert!(
+            verify_injected(Some(&out), Some(p7), true)
+                .unwrap_err()
+                .contains("HDR10+")
+        );
+        out.hdr10plus = true;
+        assert_eq!(verify_injected(Some(&out), Some(p7), true), Ok(()));
+        assert_eq!(verify_injected(Some(&out), None, true), Ok(()));
+        let p5 = hdr::Dovi { profile: 5, ..dv };
+        assert!(verify_injected(Some(&out), Some(p5), true).is_err());
+        out.dovi = None;
+        assert!(verify_injected(Some(&out), Some(p7), false).is_err());
+        assert!(verify_injected(None, None, true).is_err());
+    }
+
+    #[test]
     fn embed_verdict_needs_every_stream_plus_the_new_subtitles() {
         let src = sample_4k();
         let mut out = src.clone();
@@ -1573,6 +1891,7 @@ mod media_tests {
                 scan: Scan::Progressive,
                 video_kbps: None,
                 dv_preserve: false,
+                hdr10plus_preserve: false,
                 mkvpropedit: false,
                 externals: Vec::new(),
                 mode: JobMode::Encode,
@@ -1686,6 +2005,7 @@ mod media_tests {
                 scan: Scan::Progressive,
                 video_kbps: None,
                 dv_preserve: false,
+                hdr10plus_preserve: false,
                 mkvpropedit: false,
                 externals,
                 mode: JobMode::Fix(SubsTarget::NewFile),
@@ -1792,6 +2112,7 @@ mod media_tests {
                 scan: Scan::Progressive,
                 video_kbps: None,
                 dv_preserve: false,
+                hdr10plus_preserve: false,
                 mkvpropedit: false,
                 externals: Vec::new(),
                 mode,
@@ -1938,6 +2259,7 @@ mod media_tests {
             scan: Scan::Progressive,
             video_kbps: None,
             dv_preserve: false,
+            hdr10plus_preserve: false,
             mkvpropedit: false,
             externals: Vec::new(),
             mode: JobMode::Fix(SubsTarget::NewFile),
@@ -1971,6 +2293,7 @@ mod media_tests {
             scan: Scan::Progressive,
             video_kbps: None,
             dv_preserve: false,
+            hdr10plus_preserve: false,
             mkvpropedit: false,
             externals: Vec::new(),
             mode: JobMode::Encode,
@@ -2018,6 +2341,7 @@ mod media_tests {
             scan: Scan::Progressive,
             video_kbps: None,
             dv_preserve: false,
+            hdr10plus_preserve: false,
             mkvpropedit: false,
             externals: Vec::new(),
             mode: JobMode::Fix(SubsTarget::NewFile),
@@ -2086,6 +2410,7 @@ mod media_tests {
             scan: Scan::Progressive,
             video_kbps: None,
             dv_preserve: false,
+            hdr10plus_preserve: false,
             mkvpropedit: false,
             externals: Vec::new(),
             mode: JobMode::Encode,
@@ -2297,6 +2622,7 @@ mod media_tests {
             scan: Scan::Progressive,
             video_kbps: None,
             dv_preserve: false,
+            hdr10plus_preserve: false,
             mkvpropedit: false,
             externals: Vec::new(),
             mode: JobMode::Encode,

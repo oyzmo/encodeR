@@ -1,5 +1,7 @@
 //! HDR10 / HLG / HDR10+ / Dolby Vision detection, and the experimental
-//! Dolby Vision preservation pipeline (`dovi_tool`).
+//! metadata preservation pipelines: Dolby Vision (`dovi_tool`) and HDR10+
+//! (`hdr10plus_tool`). Both extract per-frame metadata from the source,
+//! inject it into the raw re-encoded HEVC stream, and mux afterwards.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -202,28 +204,103 @@ pub fn mkvpropedit_args(file: &Path, info: &HdrInfo) -> Vec<OsString> {
 
 // ---- Dolby Vision preservation (experimental) ----
 
-/// Why DV can't be preserved for this job, if it can't.
-pub fn dv_blocker(
-    dovi: Option<Dovi>,
-    codec_is_hevc: bool,
-    ten_bit: bool,
-    scaling: bool,
-    dovi_tool: bool,
-) -> Option<&'static str> {
-    let d = dovi?;
-    if !dovi_tool {
-        Some("dovi_tool is not installed")
-    } else if !codec_is_hevc {
-        Some("Dolby Vision preservation needs HEVC output")
-    } else if !ten_bit {
-        Some("Dolby Vision preservation needs 10-bit output")
-    } else if scaling {
-        Some("Dolby Vision preservation can't be combined with downscaling")
-    } else if !matches!(d.profile, 5 | 7 | 8) {
-        Some("Unsupported Dolby Vision profile")
+/// What the metadata-injection pipelines need to know about a job: the raw
+/// HEVC stream must line up frame for frame with the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InjectJob {
+    pub hevc: bool,
+    pub ten_bit: bool,
+    pub scaling: bool,
+    /// Double-rate deinterlacing or inverse telecine changes the frame count.
+    pub frames_change: bool,
+}
+
+impl InjectJob {
+    pub fn new(
+        settings: &crate::settings::EncodeSettings,
+        probe: &crate::ffmpeg::probe::ProbeInfo,
+        scan: crate::scan::Scan,
+    ) -> Self {
+        Self {
+            hevc: settings.codec == crate::settings::VideoCodec::Hevc,
+            ten_bit: settings.output_ten_bit(),
+            scaling: probe
+                .video
+                .as_ref()
+                .is_some_and(|v| settings.downscale.height().is_some_and(|h| h < v.height)),
+            frames_change: !scan.keeps_frame_count(),
+        }
+    }
+
+    /// Ready for injection.
+    #[cfg(test)]
+    pub const OK: Self = Self {
+        hevc: true,
+        ten_bit: true,
+        scaling: false,
+        frames_change: false,
+    };
+}
+
+#[derive(Clone, Copy)]
+enum InjectBlock {
+    Codec,
+    Depth,
+    Scaling,
+    Frames,
+}
+
+fn inject_blocker(j: InjectJob) -> Option<InjectBlock> {
+    if !j.hevc {
+        Some(InjectBlock::Codec)
+    } else if !j.ten_bit {
+        Some(InjectBlock::Depth)
+    } else if j.scaling {
+        Some(InjectBlock::Scaling)
+    } else if j.frames_change {
+        Some(InjectBlock::Frames)
     } else {
         None
     }
+}
+
+/// Why DV can't be preserved for this job, if it can't.
+pub fn dv_blocker(dovi: Option<Dovi>, job: InjectJob, dovi_tool: bool) -> Option<&'static str> {
+    let d = dovi?;
+    if !dovi_tool {
+        return Some("dovi_tool is not installed");
+    }
+    match inject_blocker(job) {
+        Some(InjectBlock::Codec) => Some("Dolby Vision preservation needs HEVC output"),
+        Some(InjectBlock::Depth) => Some("Dolby Vision preservation needs 10-bit output"),
+        Some(InjectBlock::Scaling) => {
+            Some("Dolby Vision preservation can't be combined with downscaling")
+        }
+        Some(InjectBlock::Frames) => Some(
+            "Dolby Vision preservation can't be combined with deinterlacing to double rate or inverse telecine (they change the frame count); set Scan to Progressive if the source isn't really interlaced",
+        ),
+        None if !matches!(d.profile, 5 | 7 | 8) => Some("Unsupported Dolby Vision profile"),
+        None => None,
+    }
+}
+
+/// Why HDR10+ can't be preserved for this job, if it can't (`None` also when
+/// the source has no HDR10+).
+pub fn hdr10plus_blocker(hdr10plus: bool, job: InjectJob, tool: bool) -> Option<&'static str> {
+    if !hdr10plus {
+        return None;
+    }
+    if !tool {
+        return Some("hdr10plus_tool is not installed");
+    }
+    inject_blocker(job).map(|b| match b {
+        InjectBlock::Codec => "HDR10+ preservation needs HEVC output",
+        InjectBlock::Depth => "HDR10+ preservation needs 10-bit output",
+        InjectBlock::Scaling => "HDR10+ preservation can't be combined with downscaling",
+        InjectBlock::Frames => {
+            "HDR10+ preservation can't be combined with deinterlacing to double rate or inverse telecine (they change the frame count); set Scan to Progressive if the source isn't really interlaced"
+        }
+    })
 }
 
 /// `dovi_tool` conversion mode: profile 7 → 8.1 (`-m 2`); 5 and 8 stay as they are.
@@ -295,6 +372,38 @@ pub fn parse_rpu_frames(summary: &str) -> Option<u64> {
             .or_else(|| l.strip_prefix("Frame count:"))?;
         rest.trim().parse().ok()
     })
+}
+
+// ---- HDR10+ preservation (experimental) ----
+
+/// hdr10plus_tool half of the extraction pipe (stdin from [`extract_video_args`]).
+pub fn extract_hdr10plus_args(json_out: &Path) -> Vec<OsString> {
+    vec!["extract".into(), "-".into(), "-o".into(), json_out.into()]
+}
+
+pub fn inject_hdr10plus_args(video: &Path, json: &Path, out: &Path) -> Vec<OsString> {
+    vec![
+        "inject".into(),
+        "-i".into(),
+        video.into(),
+        "-j".into(),
+        json.into(),
+        "-o".into(),
+        out.into(),
+    ]
+}
+
+/// Frames described by an hdr10plus_tool JSON file: one `SceneInfo` entry
+/// per frame. Reads from a file without building the whole document (a
+/// feature film's metadata runs to ~100 MB).
+pub fn hdr10plus_json_frames(r: impl std::io::Read) -> Option<u64> {
+    #[derive(serde::Deserialize)]
+    struct Doc {
+        #[serde(rename = "SceneInfo")]
+        scenes: Vec<serde::de::IgnoredAny>,
+    }
+    let d: Doc = serde_json::from_reader(std::io::BufReader::new(r)).ok()?;
+    Some(d.scenes.len() as u64)
 }
 
 #[cfg(test)]
@@ -379,13 +488,45 @@ mod tests {
             compat_id: 6,
             el_present: true,
         });
-        assert_eq!(dv_blocker(None, true, true, false, true), None);
-        assert!(dv_blocker(d, true, true, false, false).is_some());
-        assert!(dv_blocker(d, false, true, false, true).is_some());
-        assert!(dv_blocker(d, true, true, true, true).is_some());
+        let ok = InjectJob::OK;
+        assert_eq!(dv_blocker(None, ok, true), None);
+        assert!(dv_blocker(d, ok, false).is_some());
+        assert!(dv_blocker(d, InjectJob { hevc: false, ..ok }, true).is_some());
+        assert!(
+            dv_blocker(
+                d,
+                InjectJob {
+                    scaling: true,
+                    ..ok
+                },
+                true
+            )
+            .is_some()
+        );
         // 8-bit HEVC output can't carry the RPU's 10-bit base layer.
-        assert!(dv_blocker(d, true, false, false, true).is_some());
-        assert_eq!(dv_blocker(d, true, true, false, true), None);
+        assert!(
+            dv_blocker(
+                d,
+                InjectJob {
+                    ten_bit: false,
+                    ..ok
+                },
+                true
+            )
+            .is_some()
+        );
+        assert!(
+            dv_blocker(
+                d,
+                InjectJob {
+                    frames_change: true,
+                    ..ok
+                },
+                true
+            )
+            .is_some()
+        );
+        assert_eq!(dv_blocker(d, ok, true), None);
         assert_eq!(dovi_mode(7), Some("2"));
         assert_eq!(dovi_mode(8), None);
         let a = extract_rpu_args(7, Path::new("/t/rpu.bin"));
@@ -437,5 +578,95 @@ mod tests {
         assert_eq!(&a[..3], ["o.mkv", "--edit", "track:v1"]);
         assert!(a.contains(&"max-content-light=1000".to_string()));
         assert!(a.contains(&"max-luminance=1000.0000".to_string()));
+    }
+
+    #[test]
+    fn hdr10plus_blocker_rules() {
+        let ok = InjectJob::OK;
+        let no = |f: fn(&mut InjectJob)| {
+            let mut j = ok;
+            f(&mut j);
+            hdr10plus_blocker(true, j, true)
+        };
+        assert_eq!(
+            hdr10plus_blocker(false, InjectJob { hevc: false, ..ok }, false),
+            None
+        );
+        assert_eq!(
+            hdr10plus_blocker(true, ok, false),
+            Some("hdr10plus_tool is not installed")
+        );
+        assert_eq!(
+            no(|j| j.hevc = false),
+            Some("HDR10+ preservation needs HEVC output")
+        );
+        assert_eq!(
+            no(|j| j.ten_bit = false),
+            Some("HDR10+ preservation needs 10-bit output")
+        );
+        assert_eq!(
+            no(|j| j.scaling = true),
+            Some("HDR10+ preservation can't be combined with downscaling")
+        );
+        assert!(
+            no(|j| j.frames_change = true)
+                .unwrap()
+                .contains("frame count")
+        );
+        assert_eq!(hdr10plus_blocker(true, ok, true), None);
+    }
+
+    #[test]
+    fn inject_job_from_settings() {
+        use crate::scan::Scan;
+        let p = sample_4k();
+        let s = crate::settings::EncodeSettings::default();
+        assert_eq!(InjectJob::new(&s, &p, Scan::Progressive), InjectJob::OK);
+        let single = Scan::Deinterlace {
+            tff: true,
+            double_rate: false,
+        };
+        assert!(!InjectJob::new(&s, &p, single).frames_change);
+        let double = Scan::Deinterlace {
+            tff: true,
+            double_rate: true,
+        };
+        assert!(InjectJob::new(&s, &p, double).frames_change);
+        assert!(InjectJob::new(&s, &p, Scan::Telecine { tff: true }).frames_change);
+        let small = crate::settings::EncodeSettings {
+            downscale: crate::settings::Downscale::P1080,
+            ..Default::default()
+        };
+        assert!(InjectJob::new(&small, &p, Scan::Progressive).scaling);
+    }
+
+    #[test]
+    fn hdr10plus_tool_arguments() {
+        let s = |v: Vec<OsString>| -> Vec<String> {
+            v.iter().map(|s| s.to_string_lossy().into()).collect()
+        };
+        assert_eq!(
+            s(extract_hdr10plus_args(Path::new("m.json"))),
+            ["extract", "-", "-o", "m.json"]
+        );
+        assert_eq!(
+            s(inject_hdr10plus_args(
+                Path::new("v.hevc"),
+                Path::new("m.json"),
+                Path::new("o.hevc")
+            )),
+            ["inject", "-i", "v.hevc", "-j", "m.json", "-o", "o.hevc"]
+        );
+    }
+
+    #[test]
+    fn hdr10plus_json_counts_frames() {
+        let json = r#"{"JSONInfo":{"HDR10plusProfile":"B","Version":"1.0"},
+            "SceneInfo":[{"SceneFrameIndex":0,"LuminanceParameters":{"MaxScl":[1,2,3]}},
+                         {"SceneFrameIndex":1},{"SceneFrameIndex":2}],
+            "SceneInfoSummary":{"SceneFirstFrameIndex":[0],"SceneFrameNumbers":[3]}}"#;
+        assert_eq!(hdr10plus_json_frames(json.as_bytes()), Some(3));
+        assert_eq!(hdr10plus_json_frames(&b"{}"[..]), None);
+        assert_eq!(hdr10plus_json_frames(&b"not json"[..]), None);
     }
 }

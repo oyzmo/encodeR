@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.15.2
+
+- Hardware run: Keep HDR10+ works with `hevc_vaapi` on the RX 9070, and `hevc_vaapi` uses no B-frames by default there, so the pipelines' `-bf 0` costs nothing unless B-frames are set in Advanced. Tooltips corrected.
+
+## 0.15.1
+
+- The HDR10+ warning now says how to keep it, or why *Keep HDR10+* isn't available for the job.
+- Both metadata pipelines are refused up front when deinterlacing to double rate or inverse telecine would change the frame count (including when the picture analysis wrongly finds interlacing; set Scan to Progressive). Before, this failed only after the whole encode.
+- The extracted metadata is checked against the source's frame count right after extraction, so partial metadata or a damaged source fails in seconds instead of after the encode.
+- After muxing, the output is read back and every frame is checked for the injected metadata, not just the first.
+- Dolby Vision + HDR10+ reads the source once for both extractions.
+- The command view shows the pipeline's actual commands: the raw encode (with `-bf 0`) and the mux.
+- `encoder --encode` / `--print-command` keep Dolby Vision or HDR10+ only with `--keep-dv` / `--keep-hdr10plus`, like the app's switches (off by default), and refuse with the reason when the job rules it out.
+
+## 0.15.0
+
+- **Keep HDR10+** (experimental): the hardware encoder writes static HDR10 but not HDR10+'s scene-by-scene metadata. With `hdr10plus_tool` installed, the new switch under Picture extracts the HDR10+ metadata, re-encodes, injects it back frame for frame and checks the output. Works alongside *Keep Dolby Vision*. Needs HEVC 10-bit without downscaling. The Flatpak bundles hdr10plus_tool 1.7.2.
+- `scripts/install.sh --hdr-tools` (menu item 5) installs pinned, checksum-verified release builds of dovi_tool and hdr10plus_tool to `~/.local/bin` for the native install. The native install now says when they're missing.
+- Dolby Vision and HDR10+ pipelines encode the raw stream without B-frames. ffmpeg 8 can't timestamp reordered frames in raw HEVC, so the mux step fails with "Can't write packet with unknown timestamp" when the encoder uses B-frames.
+
 ## 0.14.0
 
 - **Match source quality** row under Target size: the size that keeps about the source's quality. It starts as an instant estimate from the source's video bitrate and how much more bitrate the chosen codec needs than the source's codec (AV1 → HEVC about 1.5×, H.264 → HEVC about 0.75×), and accounts for downscaling. *Check* measures it instead: it encodes the sample segments at up to five bitrates and scores them with VMAF, keeping the smallest size where the average is ≥ 95 and the worst segment ≥ 93. *Use* sets the target to the measured size if there is one, otherwise the estimate.

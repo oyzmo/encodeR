@@ -63,6 +63,7 @@ pub struct Capabilities {
     /// Filters the app needs that this ffmpeg lacks.
     pub missing_filters: Vec<String>,
     pub dovi_tool: bool,
+    pub hdr10plus_tool: bool,
     pub mkvpropedit: bool,
     /// mpv, for tuning lip-sync live.
     pub mpv: bool,
@@ -305,6 +306,7 @@ pub fn detect(ffmpeg: &str, ffprobe: &str, configured_device: Option<&str>) -> C
     let mut caps = Capabilities {
         ffprobe: runner::which(ffprobe),
         dovi_tool: runner::which("dovi_tool"),
+        hdr10plus_tool: runner::which("hdr10plus_tool"),
         mkvpropedit: runner::which("mkvpropedit"),
         mpv: runner::which("mpv"),
         alass: crate::alass::find(),
